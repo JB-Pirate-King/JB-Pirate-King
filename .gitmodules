@@ -1,0 +1,3 @@
+[submodule "ais_ids_pi/opencpn-libs"]
+	path = ais_ids_pi/opencpn-libs
+	url = https://github.com/OpenCPN/opencpn-libs
