@@ -1,0 +1,1065 @@
+#!/usr/bin/env python3
+"""
+OpenCPN IDS Signal Generator
+Generated AIS patterns + normal NMEA file replay GUI.
+"""
+
+from __future__ import annotations
+
+import math
+import queue
+import random
+import socket
+import threading
+import time
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+
+MODE_OPTIONS = [
+    ("generated", "생성 신호"),
+    ("normal_file", "정상 신호 파일"),
+]
+MODE_LABEL_TO_KEY = {label: key for key, label in MODE_OPTIONS}
+
+ATTACK_OPTIONS = [
+    ("circle", "원형 선단"),
+    ("grid", "격자 선단"),
+    ("spiral", "나선형 선단"),
+    ("random", "무작위 확산"),
+    ("jbu", "JBU 글자"),
+]
+ATTACK_LABEL_TO_KEY = {label: key for key, label in ATTACK_OPTIONS}
+
+DEFAULT_SAMPLE_FILE = Path(__file__).with_name("nmea_data_sample.txt")
+
+log_queue: "queue.Queue[dict[str, str]]" = queue.Queue()
+stop_event = threading.Event()
+
+
+def queue_log(log_q: "queue.Queue[dict[str, str]]", message: str, level: str = "info") -> None:
+    log_q.put({"kind": "log", "message": message, "level": level})
+
+
+def queue_state(log_q: "queue.Queue[dict[str, str]]", state: str) -> None:
+    log_q.put({"kind": "state", "state": state})
+
+
+def sleep_with_stop(seconds: float) -> bool:
+    end_time = time.time() + max(0.0, seconds)
+    while not stop_event.is_set():
+        remaining = end_time - time.time()
+        if remaining <= 0:
+            return True
+        time.sleep(min(0.1, remaining))
+    return False
+
+
+def nmea_checksum(sentence: str) -> str:
+    checksum = 0
+    for ch in sentence:
+        checksum ^= ord(ch)
+    return f"{checksum:02X}"
+
+
+def encode_payload(bits: list[int]) -> str:
+    while len(bits) % 6:
+        bits.append(0)
+
+    payload = []
+    for i in range(0, len(bits), 6):
+        value = 0
+        for bit in bits[i:i + 6]:
+            value = (value << 1) | bit
+        char_code = value + 48
+        if char_code > 87:
+            char_code += 8
+        payload.append(chr(char_code))
+    return "".join(payload)
+
+
+def build_vdm(
+    mmsi: int,
+    lat: float,
+    lon: float,
+    sog: float,
+    cog: float,
+    heading: int,
+    nav_status: int = 0,
+) -> str:
+    bits: list[int] = []
+
+    def push(value: int, width: int) -> None:
+        for i in range(width - 1, -1, -1):
+            bits.append((value >> i) & 1)
+
+    push(1, 6)
+    push(0, 2)
+    push(mmsi, 30)
+    push(nav_status, 4)
+    push(0, 8)
+    push(int(round(sog * 10)) & 0x3FF, 10)
+    push(1, 1)
+    push(int(round(lon * 600000)) & 0xFFFFFFF, 28)
+    push(int(round(lat * 600000)) & 0x7FFFFFF, 27)
+    push(int(round(cog * 10)) & 0xFFF, 12)
+    push(heading % 360, 9)
+    push(int(time.time()) % 60, 6)
+    push(0, 2)
+    push(0, 3)
+    push(0, 1)
+    push(0, 19)
+
+    payload = encode_payload(bits)
+    sentence_body = f"AIVDM,1,1,,A,{payload},0"
+    return f"!{sentence_body}*{nmea_checksum(sentence_body)}\r\n"
+
+
+def build_vsd(mmsi: int, vessel_name: str) -> str:
+    name = vessel_name[:20].upper().ljust(20, "@")
+    bits: list[int] = []
+
+    def push(value: int, width: int) -> None:
+        for i in range(width - 1, -1, -1):
+            bits.append((value >> i) & 1)
+
+    def push_str(value: str, width: int) -> None:
+        for ch in value[:width]:
+            code = ord(ch)
+            if code >= 64:
+                code -= 64
+            push(code, 6)
+
+    push(24, 6)
+    push(0, 2)
+    push(mmsi, 30)
+    push(0, 2)
+    push_str(name, 20)
+    push(0, 8)
+
+    payload = encode_payload(bits)
+    sentence_body = f"AIVDM,1,1,,A,{payload},0"
+    return f"!{sentence_body}*{nmea_checksum(sentence_body)}\r\n"
+
+
+def load_nmea(file_path: str | Path) -> list[str]:
+    path = Path(file_path)
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        messages = [
+            line.strip() + "\r\n"
+            for line in handle
+            if line.strip().startswith("!AIVDM")
+        ]
+    if not messages:
+        raise ValueError("파일에서 !AIVDM 문장을 찾지 못했습니다.")
+    return messages
+
+
+class Vessel:
+    def __init__(self, mmsi: int, name: str, nav_status: int = 0) -> None:
+        self.mmsi = mmsi
+        self.name = name
+        self.nav_status = nav_status
+        self.lat = 0.0
+        self.lon = 0.0
+        self.sog = 0.0
+        self.cog = 0.0
+        self.heading = 0
+
+    def position_message(self) -> str:
+        return build_vdm(
+            self.mmsi,
+            self.lat,
+            self.lon,
+            self.sog,
+            self.cog,
+            self.heading,
+            self.nav_status,
+        )
+
+    def name_message(self) -> str:
+        return build_vsd(self.mmsi, self.name)
+
+
+def make_circle_fleet(cfg: dict[str, float | int | str | bool]) -> list[Vessel]:
+    center_lat = float(cfg["center_lat"])
+    center_lon = float(cfg["center_lon"])
+    count = int(cfg["circle_count"])
+    radius = float(cfg["circle_radius"])
+    speed = float(cfg["circle_speed"])
+
+    fleet: list[Vessel] = []
+    for index in range(count):
+        angle = (2 * math.pi / count) * index
+        vessel = Vessel(990100000 + index, f"GHOST-C{index + 1:02d}")
+        vessel._circle_angle = angle
+        vessel._circle_speed = speed
+        vessel._center_lat = center_lat
+        vessel._center_lon = center_lon
+        vessel._radius = radius
+        fleet.append(vessel)
+    return fleet
+
+
+def update_circle_fleet(fleet: list[Vessel], t: float) -> None:
+    for vessel in fleet:
+        if not hasattr(vessel, "_circle_angle"):
+            continue
+        angle = vessel._circle_angle + t * vessel._circle_speed
+        vessel.lat = vessel._center_lat + vessel._radius * math.sin(angle)
+        vessel.lon = vessel._center_lon + vessel._radius * math.cos(angle) * 1.2
+        vessel.cog = (math.degrees(angle + math.pi / 2)) % 360
+        vessel.heading = int(vessel.cog)
+        vessel.sog = 8.0 + 2.0 * math.sin(angle * 3)
+
+
+def make_grid_fleet(cfg: dict[str, float | int | str | bool]) -> list[Vessel]:
+    center_lat = float(cfg["center_lat"])
+    center_lon = float(cfg["center_lon"])
+    rows = int(cfg["grid_rows"])
+    cols = int(cfg["grid_cols"])
+    spacing = float(cfg["grid_spacing"])
+    speed = float(cfg["grid_speed"])
+    heading = float(cfg["grid_heading"])
+
+    fleet: list[Vessel] = []
+    idx = 0
+    for row in range(rows):
+        for col in range(cols):
+            dlat = (row - rows / 2) * spacing
+            dlon = (col - cols / 2) * spacing * 1.2
+            vessel = Vessel(990500000 + idx, f"GHOST-G{idx + 1:02d}")
+            vessel.lat = center_lat + dlat
+            vessel.lon = center_lon + dlon
+            vessel.sog = speed
+            vessel.cog = heading
+            vessel.heading = int(heading)
+            vessel._drift_lat = random.uniform(-0.0002, 0.0002)
+            vessel._drift_lon = random.uniform(-0.0002, 0.0002)
+            fleet.append(vessel)
+            idx += 1
+    return fleet
+
+
+def update_grid_fleet(fleet: list[Vessel], dt: float) -> None:
+    for vessel in fleet:
+        if not hasattr(vessel, "_drift_lat"):
+            continue
+        radians = math.radians(vessel.cog)
+        step = vessel.sog * dt * 0.000154 / 3600 * 1852 / 111000
+        vessel.lat += math.cos(radians) * step + vessel._drift_lat * dt * 0.1
+        vessel.lon += math.sin(radians) * step + vessel._drift_lon * dt * 0.1
+
+
+def make_spiral_fleet(cfg: dict[str, float | int | str | bool]) -> list[Vessel]:
+    center_lat = float(cfg["center_lat"])
+    center_lon = float(cfg["center_lon"])
+    count = int(cfg["spiral_count"])
+    turns = float(cfg["spiral_turns"])
+    max_radius = float(cfg["spiral_max_radius"])
+    speed = float(cfg["spiral_speed"])
+
+    fleet: list[Vessel] = []
+    for index in range(count):
+        ratio = index / max(count - 1, 1)
+        angle = 2 * math.pi * turns * ratio
+        radius = max_radius * ratio
+        vessel = Vessel(990600000 + index, f"GHOST-S{index + 1:02d}")
+        vessel.lat = center_lat + radius * math.sin(angle)
+        vessel.lon = center_lon + radius * math.cos(angle) * 1.2
+        vessel._idx = index
+        vessel._count = count
+        vessel._turns = turns
+        vessel._center_lat = center_lat
+        vessel._center_lon = center_lon
+        vessel._max_radius = max_radius
+        vessel._spiral_speed = speed
+        fleet.append(vessel)
+    return fleet
+
+
+def update_spiral_fleet(fleet: list[Vessel], t: float) -> None:
+    for vessel in fleet:
+        if not hasattr(vessel, "_idx"):
+            continue
+        ratio = vessel._idx / max(vessel._count - 1, 1)
+        angle = 2 * math.pi * vessel._turns * ratio + t * vessel._spiral_speed
+        radius = vessel._max_radius * ratio
+        vessel.lat = vessel._center_lat + radius * math.sin(angle)
+        vessel.lon = vessel._center_lon + radius * math.cos(angle) * 1.2
+        vessel.cog = (math.degrees(angle + math.pi / 2)) % 360
+        vessel.heading = int(vessel.cog)
+        vessel.sog = 5.0 + radius * 20
+
+
+def make_random_fleet(cfg: dict[str, float | int | str | bool]) -> list[Vessel]:
+    center_lat = float(cfg["center_lat"])
+    center_lon = float(cfg["center_lon"])
+    count = int(cfg["random_count"])
+    spread = float(cfg["random_spread"])
+
+    fleet: list[Vessel] = []
+    for index in range(count):
+        vessel = Vessel(990700000 + index, f"GHOST-R{index + 1:02d}")
+        vessel.lat = center_lat + random.uniform(-spread, spread)
+        vessel.lon = center_lon + random.uniform(-spread * 1.2, spread * 1.2)
+        vessel.sog = random.uniform(2.0, 15.0)
+        vessel.cog = random.uniform(0, 360)
+        vessel.heading = int(vessel.cog)
+        vessel._drift_lat = random.uniform(-0.001, 0.001)
+        vessel._drift_lon = random.uniform(-0.001, 0.001)
+        fleet.append(vessel)
+    return fleet
+
+
+def update_random_fleet(fleet: list[Vessel], dt: float) -> None:
+    for vessel in fleet:
+        if not hasattr(vessel, "_drift_lat"):
+            continue
+        vessel.cog = (vessel.cog + random.uniform(-5, 5)) % 360
+        vessel.heading = int(vessel.cog)
+        radians = math.radians(vessel.cog)
+        step = vessel.sog * dt * 0.000154 / 3600 * 1852 / 111000
+        vessel.lat += math.cos(radians) * step
+        vessel.lon += math.sin(radians) * step
+
+
+def make_jbu_fleet(cfg: dict[str, float | int | str | bool]) -> list[Vessel]:
+    center_lat = float(cfg["center_lat"])
+    center_lon = float(cfg["center_lon"])
+    scale = float(cfg["jbu_scale"])
+
+    j_points = [
+        (0.08, 0.04),
+        (0.05, 0.04),
+        (0.02, 0.04),
+        (-0.01, 0.04),
+        (-0.04, 0.03),
+        (-0.06, 0.01),
+        (-0.06, -0.02),
+    ]
+    b_points = [
+        (0.08, 0.0),
+        (0.04, 0.0),
+        (0.0, 0.0),
+        (-0.04, 0.0),
+        (-0.08, 0.0),
+        (-0.06, 0.025),
+        (-0.04, 0.04),
+        (-0.02, 0.025),
+        (0.0, 0.0),
+        (0.02, 0.025),
+        (0.04, 0.04),
+        (0.06, 0.025),
+        (0.08, 0.0),
+    ]
+    u_points = [
+        (0.08, 0.0),
+        (0.04, 0.0),
+        (0.0, 0.0),
+        (-0.04, 0.005),
+        (-0.07, 0.02),
+        (-0.07, 0.05),
+        (-0.04, 0.06),
+        (0.0, 0.06),
+        (0.04, 0.05),
+        (0.08, 0.02),
+    ]
+
+    j_offset = (-0.12 * scale, -0.28 * scale)
+    b_offset = (-0.12 * scale, -0.06 * scale)
+    u_offset = (-0.12 * scale, 0.16 * scale)
+
+    fleet: list[Vessel] = []
+
+    def make_letter(
+        points: list[tuple[float, float]],
+        offset: tuple[float, float],
+        prefix: str,
+        start_mmsi: int,
+    ) -> list[Vessel]:
+        ships: list[Vessel] = []
+        for index, (dlat, dlon) in enumerate(points):
+            vessel = Vessel(start_mmsi + index, f"{prefix}{index + 1:02d}")
+            vessel.lat = center_lat + offset[0] + dlat * scale
+            vessel.lon = center_lon + offset[1] + dlon * scale
+            vessel._waypoints = [
+                (center_lat + offset[0] + lat * scale, center_lon + offset[1] + lon * scale)
+                for lat, lon in points
+            ]
+            vessel._wp_idx = index % len(points)
+            vessel._wp_progress = 0.0
+            vessel.sog = 3.0 + random.uniform(-0.5, 0.5)
+            ships.append(vessel)
+        return ships
+
+    fleet.extend(make_letter(j_points, j_offset, "GHOST-J", 990200000))
+    fleet.extend(make_letter(b_points, b_offset, "GHOST-B", 990300000))
+    fleet.extend(make_letter(u_points, u_offset, "GHOST-U", 990400000))
+    return fleet
+
+
+def update_jbu_fleet(fleet: list[Vessel], dt: float) -> None:
+    for vessel in fleet:
+        if not hasattr(vessel, "_waypoints") or len(vessel._waypoints) < 2:
+            continue
+
+        waypoints = vessel._waypoints
+        current = vessel._wp_idx % len(waypoints)
+        nxt = (current + 1) % len(waypoints)
+        clat, clon = waypoints[current]
+        nlat, nlon = waypoints[nxt]
+
+        distance = math.sqrt((nlat - clat) ** 2 + (nlon - clon) ** 2)
+        if distance < 1e-9:
+            vessel._wp_idx = nxt
+            continue
+
+        step = vessel.sog * 0.000154 * dt / 3600 * 1852 / 111000
+        vessel._wp_progress += step / distance
+        if vessel._wp_progress >= 1.0:
+            vessel._wp_progress = 0.0
+            vessel._wp_idx = nxt
+            current, nxt = nxt, (nxt + 1) % len(waypoints)
+            clat, clon = waypoints[current]
+            nlat, nlon = waypoints[nxt]
+
+        progress = vessel._wp_progress
+        vessel.lat = clat + (nlat - clat) * progress
+        vessel.lon = clon + (nlon - clon) * progress
+        dx = nlon - clon
+        dy = nlat - clat
+        vessel.cog = math.degrees(math.atan2(dx, dy)) % 360
+        vessel.heading = int(vessel.cog)
+
+
+def make_anchor_vessel(cfg: dict[str, float | int | str | bool]) -> Vessel:
+    anchor = Vessel(440123456, "BUSAN ANCHOR", nav_status=1)
+    anchor.lat = float(cfg["center_lat"])
+    anchor.lon = float(cfg["center_lon"])
+    anchor.sog = 0.0
+    anchor.cog = 0.0
+    anchor.heading = 45
+    return anchor
+
+
+def build_generated_fleet(cfg: dict[str, float | int | str | bool]) -> list[Vessel]:
+    attack_key = str(cfg["attack_key"])
+    if attack_key == "circle":
+        fleet = make_circle_fleet(cfg)
+    elif attack_key == "grid":
+        fleet = make_grid_fleet(cfg)
+    elif attack_key == "spiral":
+        fleet = make_spiral_fleet(cfg)
+    elif attack_key == "random":
+        fleet = make_random_fleet(cfg)
+    elif attack_key == "jbu":
+        fleet = make_jbu_fleet(cfg)
+    else:
+        raise ValueError(f"지원하지 않는 패턴입니다: {attack_key}")
+
+    if cfg.get("add_anchor"):
+        fleet.append(make_anchor_vessel(cfg))
+    return fleet
+
+
+def update_generated_fleet(
+    fleet: list[Vessel],
+    attack_key: str,
+    tick: float,
+    interval: float,
+) -> None:
+    if attack_key == "circle":
+        update_circle_fleet(fleet, tick)
+    elif attack_key == "grid":
+        update_grid_fleet(fleet, interval)
+    elif attack_key == "spiral":
+        update_spiral_fleet(fleet, tick)
+    elif attack_key == "random":
+        update_random_fleet(fleet, interval)
+    elif attack_key == "jbu":
+        update_jbu_fleet(fleet, interval)
+
+
+def send_generated_loop(cfg: dict[str, float | int | str | bool], log_q: "queue.Queue[dict[str, str]]") -> bool:
+    host = str(cfg["host"])
+    port = int(cfg["port"])
+    interval = float(cfg["interval"])
+    attack_key = str(cfg["attack_key"])
+    attack_label = str(cfg["attack_label"])
+
+    fleet = build_generated_fleet(cfg)
+    name_sent: set[int] = set()
+    tick = 0.0
+    iteration = 0
+
+    queue_log(log_q, f"[시작] 생성 신호 모드 | 패턴: {attack_label} | 선박 {len(fleet)}척", "start")
+    queue_log(log_q, f"[전송] {host}:{port} | 주기 {interval:.2f}s", "info")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        while not stop_event.is_set():
+            iteration += 1
+            cycle_start = time.time()
+            update_generated_fleet(fleet, attack_key, tick, interval)
+
+            sent = 0
+            for vessel in fleet:
+                if stop_event.is_set():
+                    return False
+
+                if vessel.mmsi not in name_sent:
+                    sock.sendto(vessel.name_message().encode("ascii"), (host, port))
+                    name_sent.add(vessel.mmsi)
+                    if not sleep_with_stop(0.01):
+                        return False
+
+                sock.sendto(vessel.position_message().encode("ascii"), (host, port))
+                sent += 1
+                if not sleep_with_stop(0.005):
+                    return False
+
+            elapsed = time.time() - cycle_start
+            tick += interval
+
+            if iteration == 1 or iteration % 5 == 0:
+                queue_log(
+                    log_q,
+                    f"[생성] {iteration}회차 | 위치 {sent}건 전송 | 처리시간 {elapsed:.2f}s",
+                    "info",
+                )
+
+            if not sleep_with_stop(max(0.0, interval - elapsed)):
+                return False
+
+    return False
+
+
+def send_file_loop(cfg: dict[str, float | int | str | bool], log_q: "queue.Queue[dict[str, str]]") -> bool:
+    host = str(cfg["host"])
+    port = int(cfg["port"])
+    file_path = Path(str(cfg["file_path"]))
+    interval = float(cfg["file_interval"])
+    repeat = bool(cfg["file_repeat"])
+    messages = load_nmea(file_path)
+
+    queue_log(log_q, "[시작] 정상 신호 파일 모드", "start")
+    queue_log(log_q, f"[파일] {file_path} | AIVDM 문장 {len(messages)}개", "info")
+    queue_log(log_q, f"[전송] {host}:{port} | 문장 간격 {interval:.2f}s | 반복 {'켜짐' if repeat else '꺼짐'}", "info")
+
+    sent_count = 0
+    cycle = 0
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        while not stop_event.is_set():
+            cycle += 1
+            for index, message in enumerate(messages, start=1):
+                if stop_event.is_set():
+                    return False
+
+                sock.sendto(message.encode("ascii"), (host, port))
+                sent_count += 1
+                queue_log(log_q, f"[파일 {index:04d}] {message.strip()}", "info")
+
+                if not sleep_with_stop(interval):
+                    return False
+
+            if not repeat:
+                queue_log(log_q, f"[완료] 파일 1회 송신 완료 | 총 {sent_count}건", "start")
+                return True
+
+            queue_log(log_q, f"[반복] 파일 송신 {cycle}회차 완료 | 누적 {sent_count}건", "info")
+
+    return False
+
+
+def sender_worker(cfg: dict[str, float | int | str | bool], log_q: "queue.Queue[dict[str, str]]") -> None:
+    completed = False
+    try:
+        if cfg["mode_key"] == "generated":
+            completed = send_generated_loop(cfg, log_q)
+        else:
+            completed = send_file_loop(cfg, log_q)
+    except Exception as exc:
+        queue_log(log_q, f"[오류] {exc}", "error")
+    finally:
+        if stop_event.is_set():
+            queue_log(log_q, "[종료] 송신 중단", "start")
+        elif completed:
+            queue_log(log_q, "[종료] 송신 완료", "start")
+        else:
+            queue_log(log_q, "[종료] 송신 스레드 종료", "start")
+        queue_state(log_q, "finished")
+
+
+class App(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("OpenCPN IDS Signal Generator")
+        self.configure(bg="#09111d")
+        self.minsize(980, 720)
+        self.resizable(True, True)
+        self.worker_thread: threading.Thread | None = None
+
+        self._setup_styles()
+        self._build_ui()
+        self._set_running_state(False)
+        self._on_attack_change()
+        self._on_mode_change()
+        self._poll_log()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _setup_styles(self) -> None:
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        bg = "#09111d"
+        accent = "#35d0ff"
+        fg = "#edf4ff"
+        fg_sub = "#9db0c7"
+        entry_bg = "#172334"
+        highlight = "#24354d"
+
+        style.configure(".", background=bg, foreground=fg, font=("Consolas", 10))
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", background=bg, foreground=fg, font=("Consolas", 10))
+        style.configure("Header.TLabel", background=bg, foreground=accent, font=("Consolas", 13, "bold"))
+        style.configure("Sub.TLabel", background=bg, foreground=fg_sub, font=("Consolas", 9))
+        style.configure("TEntry", fieldbackground=entry_bg, foreground="#ffffff", insertcolor=accent, borderwidth=0)
+        style.configure("TSpinbox", fieldbackground=entry_bg, foreground="#ffffff", background=entry_bg, arrowcolor=accent, borderwidth=0)
+        style.configure("TCombobox", fieldbackground=entry_bg, foreground="#ffffff", selectbackground=accent, selectforeground=bg)
+        style.map("TCombobox", fieldbackground=[("readonly", entry_bg)], foreground=[("readonly", "#ffffff")])
+        style.configure("TCheckbutton", background=bg, foreground=fg, font=("Consolas", 10))
+        style.map("TCheckbutton", background=[("active", bg)])
+        style.configure("TSeparator", background=highlight)
+
+    def _section(self, parent: tk.Misc, title: str) -> None:
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", padx=10, pady=(10, 2))
+        ttk.Label(frame, text=title, style="Header.TLabel").pack(anchor="w")
+        tk.Frame(parent, height=1, bg="#24354d").pack(fill="x", padx=10, pady=(0, 6))
+
+    def _row(self, parent: tk.Misc, label: str, widget_factory, **kwargs):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=16, pady=2)
+        ttk.Label(row, text=label, width=22, anchor="w", style="Sub.TLabel").pack(side="left")
+        widget = widget_factory(row, **kwargs)
+        widget.pack(side="left", fill="x", expand=True)
+        return widget
+
+    def _entry(self, parent: tk.Misc, default: str = "", **kwargs):
+        var = tk.StringVar(value=str(default))
+        entry = ttk.Entry(parent, textvariable=var, **kwargs)
+        entry._var = var
+        return entry
+
+    def _spin(self, parent: tk.Misc, from_: float, to: float, default: float, step: float = 1.0):
+        var = tk.DoubleVar(value=default)
+        spin = ttk.Spinbox(parent, from_=from_, to=to, increment=step, textvariable=var, font=("Consolas", 10))
+        spin._var = var
+        return spin
+
+    def _build_ui(self) -> None:
+        title_bar = ttk.Frame(self)
+        title_bar.pack(fill="x")
+        tk.Label(
+            title_bar,
+            text="  OPENCPN IDS SIGNAL GENERATOR",
+            bg="#35d0ff",
+            fg="#08101a",
+            font=("Consolas", 14, "bold"),
+            padx=10,
+            pady=8,
+        ).pack(fill="x")
+        tk.Label(
+            title_bar,
+            text="  AIS NMEA 0183 UDP Sender  |  Generated Patterns + Normal File Replay",
+            bg="#112033",
+            fg="#8aa1bb",
+            font=("Consolas", 9),
+            padx=10,
+            pady=3,
+        ).pack(fill="x")
+
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True)
+
+        left = ttk.Frame(main)
+        left.pack(side="left", fill="both", expand=False)
+
+        separator = tk.Frame(main, width=1, bg="#24354d")
+        separator.pack(side="left", fill="y")
+
+        right = ttk.Frame(main)
+        right.pack(side="right", fill="both", expand=True)
+
+        canvas = tk.Canvas(left, bg="#09111d", highlightthickness=0, width=460)
+        scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        self.scroll_frame = ttk.Frame(canvas)
+        self.scroll_frame.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        canvas.bind_all("<MouseWheel>", lambda event: canvas.yview_scroll(-1 * (event.delta // 120), "units"))
+
+        sf = self.scroll_frame
+        self._build_network_section(sf)
+        self._build_mode_section(sf)
+
+        self.generated_panel = ttk.Frame(sf)
+        self.generated_panel.pack(fill="x")
+        self._build_center_section(self.generated_panel)
+        self._build_attack_section(self.generated_panel)
+        self._build_circle_section(self.generated_panel)
+        self._build_grid_section(self.generated_panel)
+        self._build_spiral_section(self.generated_panel)
+        self._build_random_section(self.generated_panel)
+        self._build_jbu_section(self.generated_panel)
+        self._build_extra_section(self.generated_panel)
+
+        self.file_panel = ttk.Frame(sf)
+        self.file_panel.pack(fill="x")
+        self._build_file_section(self.file_panel)
+
+        self.control_panel = self._build_control_section(sf)
+
+        tk.Label(
+            right,
+            text="  LIVE TRANSMISSION LOG",
+            bg="#09111d",
+            fg="#35d0ff",
+            font=("Consolas", 11, "bold"),
+            padx=12,
+            pady=8,
+        ).pack(fill="x")
+
+        self.log_box = scrolledtext.ScrolledText(
+            right,
+            bg="#051019",
+            fg="#dff7ff",
+            font=("Consolas", 9),
+            insertbackground="#35d0ff",
+            selectbackground="#1b3555",
+            relief="flat",
+            borderwidth=0,
+            wrap="word",
+        )
+        self.log_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.log_box.tag_config("info", foreground="#c6d6ea")
+        self.log_box.tag_config("start", foreground="#35d0ff")
+        self.log_box.tag_config("error", foreground="#ff6b6b")
+
+    def _build_network_section(self, parent: tk.Misc) -> None:
+        self._section(parent, "네트워크")
+        self.host_entry = self._row(parent, "대상 IP", self._entry, default="127.0.0.1")
+        self.port_entry = self._row(parent, "UDP 포트", self._entry, default="1111")
+        self.interval_spin = self._row(parent, "생성 신호 주기(초)", self._spin, from_=0.2, to=30.0, default=2.0, step=0.1)
+
+    def _build_mode_section(self, parent: tk.Misc) -> None:
+        self._section(parent, "송신 모드")
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=16, pady=4)
+        self.mode_var = tk.StringVar(value=MODE_OPTIONS[0][1])
+        combo = ttk.Combobox(
+            row,
+            textvariable=self.mode_var,
+            values=[label for _, label in MODE_OPTIONS],
+            state="readonly",
+            font=("Consolas", 11),
+        )
+        combo.pack(fill="x")
+        combo.bind("<<ComboboxSelected>>", self._on_mode_change)
+
+    def _build_center_section(self, parent: tk.Misc) -> None:
+        self._section(parent, "기준 좌표")
+        self.lat_entry = self._row(parent, "중심 위도 (N)", self._entry, default="35.05")
+        self.lon_entry = self._row(parent, "중심 경도 (E)", self._entry, default="129.15")
+
+    def _build_attack_section(self, parent: tk.Misc) -> None:
+        self._section(parent, "생성 패턴")
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=16, pady=4)
+        self.attack_var = tk.StringVar(value=ATTACK_OPTIONS[0][1])
+        combo = ttk.Combobox(
+            row,
+            textvariable=self.attack_var,
+            values=[label for _, label in ATTACK_OPTIONS],
+            state="readonly",
+            font=("Consolas", 11),
+        )
+        combo.pack(fill="x")
+        combo.bind("<<ComboboxSelected>>", self._on_attack_change)
+
+    def _build_circle_section(self, parent: tk.Misc) -> None:
+        self.circle_frame = ttk.Frame(parent)
+        self.circle_frame.pack(fill="x")
+        self._section(self.circle_frame, "원형 선단 설정")
+        self.circle_count = self._row(self.circle_frame, "선박 수", self._spin, from_=1, to=50, default=15, step=1)
+        self.circle_radius = self._row(self.circle_frame, "반지름 (도)", self._spin, from_=0.01, to=2.0, default=0.22, step=0.01)
+        self.circle_speed = self._row(self.circle_frame, "각속도 (rad/tick)", self._spin, from_=0.001, to=0.1, default=0.008, step=0.001)
+
+    def _build_grid_section(self, parent: tk.Misc) -> None:
+        self.grid_frame = ttk.Frame(parent)
+        self.grid_frame.pack(fill="x")
+        self._section(self.grid_frame, "격자 선단 설정")
+        self.grid_rows = self._row(self.grid_frame, "행 수", self._spin, from_=1, to=20, default=5, step=1)
+        self.grid_cols = self._row(self.grid_frame, "열 수", self._spin, from_=1, to=20, default=5, step=1)
+        self.grid_spacing = self._row(self.grid_frame, "간격 (도)", self._spin, from_=0.005, to=0.5, default=0.05, step=0.005)
+        self.grid_speed = self._row(self.grid_frame, "속도 (kn)", self._spin, from_=0, to=30, default=5.0, step=0.5)
+        self.grid_heading = self._row(self.grid_frame, "진행 방향 (도)", self._spin, from_=0, to=359, default=0, step=5)
+
+    def _build_spiral_section(self, parent: tk.Misc) -> None:
+        self.spiral_frame = ttk.Frame(parent)
+        self.spiral_frame.pack(fill="x")
+        self._section(self.spiral_frame, "나선형 선단 설정")
+        self.spiral_count = self._row(self.spiral_frame, "선박 수", self._spin, from_=3, to=60, default=20, step=1)
+        self.spiral_turns = self._row(self.spiral_frame, "회전 수", self._spin, from_=0.5, to=5.0, default=2.0, step=0.5)
+        self.spiral_max_r = self._row(self.spiral_frame, "최대 반지름 (도)", self._spin, from_=0.05, to=1.5, default=0.30, step=0.01)
+        self.spiral_speed = self._row(self.spiral_frame, "회전 속도 (rad/tick)", self._spin, from_=0.001, to=0.05, default=0.005, step=0.001)
+
+    def _build_random_section(self, parent: tk.Misc) -> None:
+        self.random_frame = ttk.Frame(parent)
+        self.random_frame.pack(fill="x")
+        self._section(self.random_frame, "무작위 확산 설정")
+        self.random_count = self._row(self.random_frame, "선박 수", self._spin, from_=1, to=100, default=30, step=1)
+        self.random_spread = self._row(self.random_frame, "확산 반경 (도)", self._spin, from_=0.05, to=2.0, default=0.30, step=0.05)
+
+    def _build_jbu_section(self, parent: tk.Misc) -> None:
+        self.jbu_frame = ttk.Frame(parent)
+        self.jbu_frame.pack(fill="x")
+        self._section(self.jbu_frame, "JBU 글자 설정")
+        self.jbu_scale = self._row(self.jbu_frame, "글자 크기 배율", self._spin, from_=0.5, to=5.0, default=1.0, step=0.1)
+
+    def _build_extra_section(self, parent: tk.Misc) -> None:
+        self._section(parent, "추가 옵션")
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=16, pady=4)
+        self.anchor_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="중앙 정박선 추가 (MMSI: 440123456)", variable=self.anchor_var).pack(anchor="w")
+
+    def _build_file_section(self, parent: tk.Misc) -> None:
+        self._section(parent, "정상 신호 파일")
+
+        file_row = ttk.Frame(parent)
+        file_row.pack(fill="x", padx=16, pady=2)
+        ttk.Label(file_row, text="NMEA 파일", width=22, anchor="w", style="Sub.TLabel").pack(side="left")
+
+        default_path = str(DEFAULT_SAMPLE_FILE if DEFAULT_SAMPLE_FILE.exists() else "")
+        self.file_path_var = tk.StringVar(value=default_path)
+        ttk.Entry(file_row, textvariable=self.file_path_var).pack(side="left", fill="x", expand=True)
+        tk.Button(
+            file_row,
+            text="찾기",
+            bg="#172334",
+            fg="#edf4ff",
+            relief="flat",
+            activebackground="#24354d",
+            command=self._browse_file,
+            padx=12,
+            pady=4,
+        ).pack(side="left", padx=(6, 0))
+
+        self.file_interval_spin = self._row(parent, "문장 간격(초)", self._spin, from_=0.01, to=5.0, default=0.1, step=0.01)
+
+        repeat_row = ttk.Frame(parent)
+        repeat_row.pack(fill="x", padx=16, pady=4)
+        self.file_repeat_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(repeat_row, text="파일 끝까지 전송 후 반복", variable=self.file_repeat_var).pack(anchor="w")
+
+    def _build_control_section(self, parent: tk.Misc) -> ttk.Frame:
+        wrapper = ttk.Frame(parent)
+        wrapper.pack(fill="x")
+        ttk.Separator(wrapper, orient="horizontal").pack(fill="x", padx=10, pady=10)
+        ctrl = ttk.Frame(wrapper)
+        ctrl.pack(fill="x", padx=10, pady=(0, 16))
+
+        self.start_btn = tk.Button(
+            ctrl,
+            text="송신 시작",
+            bg="#35d0ff",
+            fg="#08101a",
+            font=("Consolas", 12, "bold"),
+            activebackground="#67ddff",
+            relief="flat",
+            cursor="hand2",
+            padx=20,
+            pady=8,
+            command=self.start_sender,
+        )
+        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        self.stop_btn = tk.Button(
+            ctrl,
+            text="중단",
+            bg="#172334",
+            fg="#ff7c7c",
+            font=("Consolas", 12, "bold"),
+            activebackground="#24354d",
+            relief="flat",
+            cursor="hand2",
+            padx=20,
+            pady=8,
+            command=self.stop_sender,
+        )
+        self.stop_btn.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        return wrapper
+
+    def _browse_file(self) -> None:
+        initial_dir = DEFAULT_SAMPLE_FILE.parent if DEFAULT_SAMPLE_FILE.exists() else Path.cwd()
+        selected = filedialog.askopenfilename(
+            title="NMEA 파일 선택",
+            initialdir=str(initial_dir),
+            filetypes=[
+                ("NMEA files", "*.txt *.nmea *.log"),
+                ("All files", "*.*"),
+            ],
+        )
+        if selected:
+            self.file_path_var.set(selected)
+
+    def _on_mode_change(self, event=None) -> None:
+        mode_key = MODE_LABEL_TO_KEY[self.mode_var.get()]
+        if mode_key == "generated":
+            if self.file_panel.winfo_manager():
+                self.file_panel.pack_forget()
+            if not self.generated_panel.winfo_manager():
+                self.generated_panel.pack(fill="x", before=self.control_panel)
+        else:
+            if self.generated_panel.winfo_manager():
+                self.generated_panel.pack_forget()
+            if not self.file_panel.winfo_manager():
+                self.file_panel.pack(fill="x", before=self.control_panel)
+
+    def _on_attack_change(self, event=None) -> None:
+        attack_key = ATTACK_LABEL_TO_KEY[self.attack_var.get()]
+        frames = {
+            "circle": self.circle_frame,
+            "grid": self.grid_frame,
+            "spiral": self.spiral_frame,
+            "random": self.random_frame,
+            "jbu": self.jbu_frame,
+        }
+        for key, frame in frames.items():
+            if key == attack_key:
+                if not frame.winfo_manager():
+                    frame.pack(fill="x")
+            elif frame.winfo_manager():
+                frame.pack_forget()
+
+    def _get_cfg(self) -> dict[str, float | int | str | bool] | None:
+        try:
+            host = self.host_entry._var.get().strip()
+            if not host:
+                raise ValueError("대상 IP를 입력하세요.")
+
+            port = int(self.port_entry._var.get())
+            if not 1 <= port <= 65535:
+                raise ValueError("UDP 포트는 1~65535 범위여야 합니다.")
+
+            mode_label = self.mode_var.get()
+            mode_key = MODE_LABEL_TO_KEY[mode_label]
+
+            cfg: dict[str, float | int | str | bool] = {
+                "host": host,
+                "port": port,
+                "mode_key": mode_key,
+                "mode_label": mode_label,
+            }
+
+            if mode_key == "generated":
+                interval = float(self.interval_spin._var.get())
+                if interval <= 0:
+                    raise ValueError("생성 신호 주기는 0보다 커야 합니다.")
+
+                attack_label = self.attack_var.get()
+                cfg.update(
+                    {
+                        "interval": interval,
+                        "center_lat": float(self.lat_entry._var.get()),
+                        "center_lon": float(self.lon_entry._var.get()),
+                        "attack_key": ATTACK_LABEL_TO_KEY[attack_label],
+                        "attack_label": attack_label,
+                        "add_anchor": self.anchor_var.get(),
+                        "circle_count": min(200, max(1, int(float(self.circle_count._var.get())))),
+                        "circle_radius": float(self.circle_radius._var.get()),
+                        "circle_speed": float(self.circle_speed._var.get()),
+                        "grid_rows": min(30, max(1, int(float(self.grid_rows._var.get())))),
+                        "grid_cols": min(30, max(1, int(float(self.grid_cols._var.get())))),
+                        "grid_spacing": float(self.grid_spacing._var.get()),
+                        "grid_speed": float(self.grid_speed._var.get()),
+                        "grid_heading": float(self.grid_heading._var.get()),
+                        "spiral_count": min(200, max(3, int(float(self.spiral_count._var.get())))),
+                        "spiral_turns": float(self.spiral_turns._var.get()),
+                        "spiral_max_radius": float(self.spiral_max_r._var.get()),
+                        "spiral_speed": float(self.spiral_speed._var.get()),
+                        "random_count": min(300, max(1, int(float(self.random_count._var.get())))),
+                        "random_spread": float(self.random_spread._var.get()),
+                        "jbu_scale": float(self.jbu_scale._var.get()),
+                    }
+                )
+            else:
+                file_path = Path(self.file_path_var.get().strip())
+                if not file_path.exists():
+                    raise ValueError("정상 신호 파일 경로를 확인하세요.")
+
+                file_interval = float(self.file_interval_spin._var.get())
+                if file_interval <= 0:
+                    raise ValueError("문장 간격은 0보다 커야 합니다.")
+
+                cfg.update(
+                    {
+                        "file_path": str(file_path),
+                        "file_interval": file_interval,
+                        "file_repeat": self.file_repeat_var.get(),
+                    }
+                )
+
+            return cfg
+        except ValueError as exc:
+            messagebox.showerror("입력 오류", str(exc))
+            return None
+
+    def _set_running_state(self, is_running: bool) -> None:
+        if is_running:
+            self.start_btn.config(state="disabled", bg="#172334", fg="#5f738c")
+            self.stop_btn.config(state="normal")
+        else:
+            self.start_btn.config(state="normal", bg="#35d0ff", fg="#08101a")
+            self.stop_btn.config(state="disabled")
+
+    def start_sender(self) -> None:
+        cfg = self._get_cfg()
+        if cfg is None:
+            return
+
+        stop_event.clear()
+        self._set_running_state(True)
+        self.log("[대기] 송신 스레드 시작", "start")
+        self.worker_thread = threading.Thread(target=sender_worker, args=(cfg, log_queue), daemon=True)
+        self.worker_thread.start()
+
+    def stop_sender(self) -> None:
+        stop_event.set()
+        self.log("[중단] 사용자 중단 요청", "error")
+
+    def log(self, message: str, level: str = "info") -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_box.insert("end", f"[{timestamp}] {message}\n", level)
+        self.log_box.see("end")
+
+    def _poll_log(self) -> None:
+        while not log_queue.empty():
+            item = log_queue.get_nowait()
+            if item.get("kind") == "state" and item.get("state") == "finished":
+                self._set_running_state(False)
+                continue
+            self.log(item["message"], item.get("level", "info"))
+        self.after(200, self._poll_log)
+
+    def _on_close(self) -> None:
+        stop_event.set()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    App().mainloop()
