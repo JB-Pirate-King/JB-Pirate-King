@@ -4,6 +4,8 @@
 
 #include "tpControlDialogImpl.h"
 
+
+// debug windows
 tpControlDialogImpl::tpControlDialogImpl( wxWindow* parent )
     : tpControlDialogDef( parent, wxID_ANY, _("AIS Log") )
 {
@@ -16,12 +18,11 @@ tpControlDialogImpl::tpControlDialogImpl( wxWindow* parent )
     SetSize(wxSize(800, 600));
     Layout();
 }
-
-void tpControlDialogImpl::AppendAisSentence(const wxString &sentence)
+void tpControlDialogImpl::SendMessage(const wxString &message)
 {
     if(!m_aisLogText) return;
-    m_aisLogText->AppendText(sentence);
-    if(!sentence.EndsWith("\n")) {
+    m_aisLogText->AppendText(message);
+    if(!message.EndsWith("\n")) {
         m_aisLogText->AppendText("\n");
     }
 }
