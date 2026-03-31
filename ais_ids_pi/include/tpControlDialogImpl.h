@@ -89,7 +89,6 @@ class tpControlDialogImpl : public tpControlDialogDef
         void        SetDialogSize( void );
         void        SetLatLon( double lat, double lon );
         void        SetPanels(void);
-        void        AppendAisSentence(const wxString &sentence);
         wxString    GetJSONSaveFile( void );
         void        SetJSONSaveFile( wxString SaveFile );
         wxString    GetJSONInputFile( void );
@@ -98,6 +97,7 @@ class tpControlDialogImpl : public tpControlDialogDef
         void        SetIncommingJSONMessages(bool IncommingJSONMessages);
         void        SetAppendToSaveFile(bool AppendToSaveFile);
         void        SetCloseFileAfterEachWrite(bool CloseFileAfterEachWrite);
+        void        SendMessage(const wxString &message);
 
         bool m_bOK;
         int  m_iSelection;

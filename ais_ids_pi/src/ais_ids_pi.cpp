@@ -50,6 +50,7 @@
 
 #include <wx/aui/aui.h>
 
+
 #include "ais_ids_pi.h"
 #include "version.h"
 #include "wxWTranslateCatalog.h"
@@ -58,7 +59,6 @@
 #include "tpJSON.h"
 #include "tpicons.h"
 #include "tpControlDialogImpl.h"
-
 #include "wx/jsonwriter.h"
 
 
@@ -295,8 +295,8 @@ int ais_ids_pi::Init(void)
         WANTS_PLUGIN_MESSAGING    |
         WANTS_LATE_INIT           |
         WANTS_MOUSE_EVENTS        |
-        WANTS_KEYBOARD_EVENTS     |
-        WANTS_AIS_SENTENCES
+        WANTS_KEYBOARD_EVENTS     
+        // WANTS_AIS_SENTENCES
     );
 }
 
@@ -803,29 +803,12 @@ void ais_ids_pi::UpdateAppendToFile(bool bAppendToFile)
 {
 }
 
-void ais_ids_pi::SetAISSentence(wxString &sentence) 
-{
-}
 
-
-static bool IsRealMmsi(int mmsi)
+bool ais_ids_pi::RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp)
 {
-    // MMSI is 9 digits; MID (first 3 digits) typically 200-799
-    if (mmsi < 100000000 || mmsi > 999999999) return false;
-    int mid = mmsi / 1000000;
-    if (mid < 200 || mid > 799) return false;
-    return true;
-}
-
-bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
-                                          int canvas_ix, int priority)
-{
-    (void)canvas_ix;
-    if (!vp) return false;
+    if (!vp || !vp->bValid) return false;
 
     ArrayOfPlugIn_AIS_Targets *targets = GetAISTargetArray();
-    if (!targets) return false;
-
     wxPen oldPen = dc.GetPen();
     wxBrush oldBrush = dc.GetBrush();
     dc.SetPen(wxPen(*wxRED, 1));
@@ -834,7 +817,6 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
     for (size_t i = 0; i < targets->GetCount(); ++i) {
         PlugIn_AIS_Target *t = targets->Item(i);
         if (!t) continue;
-        if (IsRealMmsi(t->MMSI)) continue; // only mark non-real MMSI
         wxPoint p;
         GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
         dc.DrawCircle(p, 3);
@@ -842,16 +824,5 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
 
     dc.SetPen(oldPen);
     dc.SetBrush(oldBrush);
-
-    for (size_t i = 0; i < targets->GetCount(); ++i) {
-        delete targets->Item(i);
-    }
-    delete targets;
-
     return true;
-}
-
-bool ais_ids_pi::RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp)
-{
-    return RenderOverlayMultiCanvas(dc, vp, 0, -1);
 }

@@ -202,8 +202,6 @@ public:
     bool MouseEventHook( wxMouseEvent &event );
     void SetCursorLatLon(double lat, double lon);
     bool RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp);
-    bool RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
-                                  int canvas_ix, int priority);
 
     // OD Methods
     void ProcessTimerEvent(wxTimerEvent& ev);
@@ -227,7 +225,7 @@ public:
     void UpdateCloseAfterSave(bool bCloseAfterSave);
     void UpdateAppendToFile(bool bAppendToFile);
     void GetGUIDList(GUIDList_t *pGL);
-    void SetAISSentence(wxString &sentence);
+
 
     wxGLContext     *m_pcontext;
     wxMemoryDC      *pmdc;
