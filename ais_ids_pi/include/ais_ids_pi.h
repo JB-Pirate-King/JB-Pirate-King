@@ -225,7 +225,7 @@ public:
     void UpdateCloseAfterSave(bool bCloseAfterSave);
     void UpdateAppendToFile(bool bAppendToFile);
     void GetGUIDList(GUIDList_t *pGL);
-
+    void SetAISSentence(wxString &sentence);
 
     wxGLContext     *m_pcontext;
     wxMemoryDC      *pmdc;

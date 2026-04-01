@@ -295,8 +295,8 @@ int ais_ids_pi::Init(void)
         WANTS_PLUGIN_MESSAGING    |
         WANTS_LATE_INIT           |
         WANTS_MOUSE_EVENTS        |
-        WANTS_KEYBOARD_EVENTS     
-        // WANTS_AIS_SENTENCES
+        WANTS_KEYBOARD_EVENTS     |
+        WANTS_AIS_SENTENCES
     );
 }
 
@@ -804,6 +804,11 @@ void ais_ids_pi::UpdateAppendToFile(bool bAppendToFile)
 }
 
 
+void ais_ids_pi::SetAISSentence(wxString &sentence) {
+    if (m_tpControlDialogImpl)
+        m_tpControlDialogImpl->SendMessage(sentence);
+}
+
 bool ais_ids_pi::RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp)
 {
     if (!vp || !vp->bValid) return false;
@@ -813,7 +818,7 @@ bool ais_ids_pi::RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp)
     wxBrush oldBrush = dc.GetBrush();
     dc.SetPen(wxPen(*wxRED, 1));
     dc.SetBrush(wxBrush(*wxRED));
-
+    
     for (size_t i = 0; i < targets->GetCount(); ++i) {
         PlugIn_AIS_Target *t = targets->Item(i);
         if (!t) continue;
