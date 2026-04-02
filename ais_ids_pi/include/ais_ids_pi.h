@@ -227,6 +227,8 @@ public:
     void SetAISSentence(wxString &sentence);
     bool RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
                                           int canvasIndex, int priority);
+    bool RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPort *vp,
+                                         int canvasIndex, int priority);
     wxGLContext     *m_pcontext;
     wxMemoryDC      *pmdc;
 //    wxGLCanvas      *m_glcc;
