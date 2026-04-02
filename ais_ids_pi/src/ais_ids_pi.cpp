@@ -295,8 +295,8 @@ int ais_ids_pi::Init(void)
         WANTS_PLUGIN_MESSAGING    |
         WANTS_LATE_INIT           |
         WANTS_MOUSE_EVENTS        |
-        WANTS_KEYBOARD_EVENTS     
-        // WANTS_AIS_SENTENCES
+        WANTS_KEYBOARD_EVENTS     |
+        WANTS_AIS_SENTENCES
     );
 }
 
@@ -804,25 +804,64 @@ void ais_ids_pi::UpdateAppendToFile(bool bAppendToFile)
 }
 
 
-bool ais_ids_pi::RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp)
-{
+void ais_ids_pi::SetAISSentence(wxString &sentence) {
+    if (m_tpControlDialogImpl)
+        m_tpControlDialogImpl->SendMessage(sentence);
+}
+
+// bool ais_ids_pi::RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp)
+// {
+//     if (!vp || !vp->bValid) return false;
+
+//     ArrayOfPlugIn_AIS_Targets *targets = GetAISTargetArray();
+//     wxPen oldPen = dc.GetPen();
+//     wxBrush oldBrush = dc.GetBrush();
+//     dc.SetPen(wxPen(*wxRED, 1));
+//     dc.SetBrush(wxBrush(*wxRED));
+    
+//     for (size_t i = 0; i < targets->GetCount(); ++i) {
+//         PlugIn_AIS_Target *t = targets->Item(i);
+//         if (!t) continue;
+//         wxPoint p;
+//         GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
+//         dc.DrawCircle(p, 3);
+//     }
+
+//     dc.SetPen(oldPen);
+//     dc.SetBrush(oldBrush);
+//     return true;
+// }
+
+bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
+                                          int canvasIndex, int priority) {
+    // Check if viewport is valid
     if (!vp || !vp->bValid) return false;
 
-    ArrayOfPlugIn_AIS_Targets *targets = GetAISTargetArray();
-    wxPen oldPen = dc.GetPen();
-    wxBrush oldBrush = dc.GetBrush();
-    dc.SetPen(wxPen(*wxRED, 1));
-    dc.SetBrush(wxBrush(*wxRED));
+    // Different drawing for different priorities
+    if (priority == OVERLAY_LEGACY) {
+        // Legacy drawing (for backward compatibility)
+    } else if (priority == OVERLAY_OVER_SHIPS) {
+        // Draw content that should appear over ship icons
+        if (!vp || !vp->bValid) return false;
 
-    for (size_t i = 0; i < targets->GetCount(); ++i) {
-        PlugIn_AIS_Target *t = targets->Item(i);
-        if (!t) continue;
-        wxPoint p;
-        GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
-        dc.DrawCircle(p, 3);
+        ArrayOfPlugIn_AIS_Targets *targets = GetAISTargetArray();   
+        wxPen oldPen = dc.GetPen();
+        wxBrush oldBrush = dc.GetBrush();
+        dc.SetPen(wxPen(*wxRED, 1));
+        dc.SetBrush(wxBrush(*wxRED));
+    
+        for (size_t i = 0; i < targets->GetCount(); ++i) {
+            PlugIn_AIS_Target *t = targets->Item(i);
+            if (!t) continue;
+            wxPoint p;
+            GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
+            dc.DrawCircle(p, 3);
+        }
+
+        dc.SetPen(oldPen);
+        dc.SetBrush(oldBrush);
+    } else if (priority == OVERLAY_OVER_UI) {
+        // UI 위에 그리는 경우 (필요 시 추가)
     }
-
-    dc.SetPen(oldPen);
-    dc.SetBrush(oldBrush);
     return true;
 }

@@ -186,6 +186,7 @@ set(SRCS src/tpControlDialogDef.cpp src/tpControlDialogImpl.cpp src/tpicons.cpp
 
 set(HDRS
     include/ais_ids_pi.h
+    include/ais_ids.h
     include/tpicons.h
     include/tpControlDialogDef.h
     include/tpControlDialogImpl.h

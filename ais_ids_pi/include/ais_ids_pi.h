@@ -201,7 +201,7 @@ public:
     bool KeyboardEventHook( wxKeyEvent &event );
     bool MouseEventHook( wxMouseEvent &event );
     void SetCursorLatLon(double lat, double lon);
-    bool RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp);
+    // bool RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp);
 
     // OD Methods
     void ProcessTimerEvent(wxTimerEvent& ev);
@@ -216,7 +216,7 @@ public:
     bool CreateBoundaryPoint(CreateBoundaryPoint_t *pCBP);
     bool CreateBoundary(CreateBoundary_t *pCB);
     bool CreateTextPoint(CreateTextPoint_t *pCTP);
-    bool DeleteBoundaryPoint(DeleteBoundaryPoint_t *pDBP);
+    bool DeleteBoundaryPoint(DeleteBoundaryPoint_t *pDBP);;
     bool DeleteBoundary(DeleteBoundary_t *pDB);
     bool DeleteTextPoint(DeleteTextPoint_t *pDTP);
     void AddPointIcon(AddPointIcon_t *API);
@@ -225,8 +225,9 @@ public:
     void UpdateCloseAfterSave(bool bCloseAfterSave);
     void UpdateAppendToFile(bool bAppendToFile);
     void GetGUIDList(GUIDList_t *pGL);
-
-
+    void SetAISSentence(wxString &sentence);
+    bool RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
+                                          int canvasIndex, int priority);
     wxGLContext     *m_pcontext;
     wxMemoryDC      *pmdc;
 //    wxGLCanvas      *m_glcc;
