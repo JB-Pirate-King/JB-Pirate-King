@@ -201,7 +201,6 @@ public:
     bool KeyboardEventHook( wxKeyEvent &event );
     bool MouseEventHook( wxMouseEvent &event );
     void SetCursorLatLon(double lat, double lon);
-    // bool RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp);
 
     // OD Methods
     void ProcessTimerEvent(wxTimerEvent& ev);
