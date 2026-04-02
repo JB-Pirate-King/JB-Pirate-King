@@ -48,6 +48,8 @@
 #include <unordered_map>
 #include <cmath>
 
+#include <GL/gl.h>
+
 #include <wx/aui/aui.h>
 
 
@@ -287,6 +289,7 @@ int ais_ids_pi::Init(void)
         INSTALLS_TOOLBOX_PAGE     |
         INSTALLS_CONTEXTMENU_ITEMS  |
         WANTS_OVERLAY_CALLBACK    |
+        WANTS_OPENGL_OVERLAY_CALLBACK |
 //        WANTS_NMEA_EVENTS         |
 //        WANTS_NMEA_SENTENCES        |
         //    USES_AUI_MANAGER            |
@@ -809,29 +812,6 @@ void ais_ids_pi::SetAISSentence(wxString &sentence) {
         m_tpControlDialogImpl->SendMessage(sentence);
 }
 
-// bool ais_ids_pi::RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp)
-// {
-//     if (!vp || !vp->bValid) return false;
-
-//     ArrayOfPlugIn_AIS_Targets *targets = GetAISTargetArray();
-//     wxPen oldPen = dc.GetPen();
-//     wxBrush oldBrush = dc.GetBrush();
-//     dc.SetPen(wxPen(*wxRED, 1));
-//     dc.SetBrush(wxBrush(*wxRED));
-    
-//     for (size_t i = 0; i < targets->GetCount(); ++i) {
-//         PlugIn_AIS_Target *t = targets->Item(i);
-//         if (!t) continue;
-//         wxPoint p;
-//         GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
-//         dc.DrawCircle(p, 3);
-//     }
-
-//     dc.SetPen(oldPen);
-//     dc.SetBrush(oldBrush);
-//     return true;
-// }
-
 bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
                                           int canvasIndex, int priority) {
     // Check if viewport is valid
@@ -855,7 +835,7 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
             if (!t) continue;
             wxPoint p;
             GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
-            dc.DrawCircle(p, 3);
+            dc.DrawCircle(p, 8);
         }
 
         dc.SetPen(oldPen);
@@ -863,5 +843,50 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
     } else if (priority == OVERLAY_OVER_UI) {
         // UI 위에 그리는 경우 (필요 시 추가)
     }
+    return true;
+}
+
+bool ais_ids_pi::RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPort *vp,
+                                         int canvasIndex, int priority)
+{
+    if (!vp || !vp->bValid) return false;
+    if (priority != OVERLAY_OVER_SHIPS) return false;
+
+    ArrayOfPlugIn_AIS_Targets* targets = GetAISTargetArray();
+    if (!targets || targets->GetCount() == 0) return false;
+
+    glPushAttrib(GL_COLOR_BUFFER_BIT | GL_ENABLE_BIT |
+                 GL_LINE_BIT        | GL_HINT_BIT);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_TEXTURE_2D);
+
+    const float radius   = 8.0f;
+    const int   segments = 32;
+
+    for (size_t i = 0; i < targets->GetCount(); ++i) {
+        PlugIn_AIS_Target* t = targets->Item(i);
+        if (!t) continue;
+
+        wxPoint p;
+        GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
+
+        const float cx = static_cast<float>(p.x);
+        const float cy = static_cast<float>(p.y);
+
+        // 채워진 빨간 원
+        glColor4f(1.0f, 0.0f, 0.0f, 0.9f);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex2f(cx, cy);
+            for (int j = 0; j <= segments; ++j) {
+                float angle = 2.0f * M_PI * j / segments;
+                glVertex2f(cx + radius * std::cos(angle),
+                           cy + radius * std::sin(angle));
+            }
+        glEnd();
+    }
+
+    glPopAttrib();
     return true;
 }

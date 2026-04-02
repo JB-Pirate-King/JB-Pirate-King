@@ -201,7 +201,6 @@ public:
     bool KeyboardEventHook( wxKeyEvent &event );
     bool MouseEventHook( wxMouseEvent &event );
     void SetCursorLatLon(double lat, double lon);
-    // bool RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp);
 
     // OD Methods
     void ProcessTimerEvent(wxTimerEvent& ev);
@@ -228,6 +227,8 @@ public:
     void SetAISSentence(wxString &sentence);
     bool RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
                                           int canvasIndex, int priority);
+    bool RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPort *vp,
+                                         int canvasIndex, int priority);
     wxGLContext     *m_pcontext;
     wxMemoryDC      *pmdc;
 //    wxGLCanvas      *m_glcc;
