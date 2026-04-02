@@ -181,7 +181,7 @@ add_definitions(-DUSE_S57)
 # ---- Section Below - Add your project SET(SRCS and SET(HDRS  etc..
 
 set(SRCS src/tpControlDialogDef.cpp src/tpControlDialogImpl.cpp src/tpicons.cpp
-         src/tpJSON.cpp src/ais_ids_pi.cpp src/tpUtils.cpp
+         src/tpJSON.cpp src/ais_ids_pi.cpp src/ais_ids.cpp src/tpUtils.cpp
 )
 
 set(HDRS

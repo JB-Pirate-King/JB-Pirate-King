@@ -1,3 +1,8 @@
+#pragma once
+
+#include "ais_ids.h"
+#include "ocpn_plugin.h"
+
 class ais_ids {
     public:
         ais_ids();
