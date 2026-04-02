@@ -107,6 +107,7 @@ wxJSONValue             g_ReceivedODAPIJSONMsg;
 wxString                g_ReceivedJSONMessage;
 wxJSONValue             g_ReceivedJSONJSONMsg;
 
+
 // Needed for ocpndc.cpp to compile. Normally would be in glChartCanvas.cpp
 float g_GLMinSymbolLineWidth;
 
@@ -141,6 +142,9 @@ extern "C" DECL_EXP void destroy_pi(opencpn_plugin* p)
 ais_ids_pi::ais_ids_pi(void *ppimgr)
 :opencpn_plugin_118(ppimgr)
 {
+    // Initialize the AIS IDS class
+    aisIds = new ais_ids();
+
     // Create the PlugIn icons
     g_ppimgr = ppimgr;
 //    g_tp_pi_manager = (PlugInManager *) ppimgr;
@@ -833,6 +837,8 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
         for (size_t i = 0; i < targets->GetCount(); ++i) {
             PlugIn_AIS_Target *t = targets->Item(i);
             if (!t) continue;
+            // Check if the target is an anomaly before drawing
+            if (!aisIds->detect_anomaly_ais(t)) continue;
             wxPoint p;
             GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
             dc.DrawCircle(p, 8);
@@ -868,7 +874,8 @@ bool ais_ids_pi::RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPo
     for (size_t i = 0; i < targets->GetCount(); ++i) {
         PlugIn_AIS_Target* t = targets->Item(i);
         if (!t) continue;
-
+        // Check if the target is an anomaly before drawing
+        if (!aisIds->detect_anomaly_ais(t)) continue;
         wxPoint p;
         GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
 

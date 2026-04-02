@@ -145,6 +145,8 @@ std::cout << x  << std::endl ; } while (0)
 #include "ODAPI.h"
 #include "globals.h"
 
+#include "ais_ids.h"
+
 //----------------------------------------------------------------------------------------------------------
 //    The PlugIn Class Definition
 //----------------------------------------------------------------------------------------------------------
@@ -157,6 +159,8 @@ public:
 
     ais_ids_pi(void *ppimgr);
     ~ais_ids_pi();
+
+    ais_ids             *aisIds;
 
     wxWindow            *m_parent_window;
     wxFileConfig        *m_pTPConfig;
