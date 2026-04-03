@@ -45,7 +45,8 @@ bool ais_ids::detect_anomaly_ais(PlugIn_AIS_Target *target)
             return true;
 
         int    mmsi = target->MMSI;
-        time_t now  = wxDateTime::Now().GetTicks();
+        // 실제 AIS 메시지 수신 시간으로 들어가는지 확인해야함
+        time_t now  = wxDateTime::Now().GetTicks(); 
 
         // ── 0. 위치 데이터 없음 체크  ──────────────
         if (target->Lat >= 91.0 || target->Lon >= 181.0)
@@ -90,23 +91,7 @@ bool ais_ids::detect_anomaly_ais(PlugIn_AIS_Target *target)
             return true;
         }
 
-        // ── 이전 기록 없으면 저장만 하고 리턴 ────────────────────────
-        if (ais_history.find(mmsi) == ais_history.end()) {
-            to_snapshot(target);
-            return false;
-        }
-
-        AISSnapshot &last = ais_history[mmsi].back();
-        time_t dt = now - last.timestamp; // 현재와 마지막 기록 간 시간 간격 (초)
-
-        // ── 4. 급격한 속도 변화  ─────────────────────
-        if (target->SOG < 102.2 && last.sog < 102.2 && dt > 0 && dt <= 60) {
-            double delta = std::abs(target->SOG - last.sog);
-            if (delta > 10.0)
-                return true;
-        }
-
-        // ── 5. COG/HDG 불일치  ─────────────────────
+        // ── 4. COG/HDG 불일치  ─────────────────────
         if (target->COG < 360.0 && target->HDG < 360.0) {
             double diff = std::abs(target->COG - target->HDG);
             if (diff > 180.0) diff = 360.0 - diff;
@@ -114,25 +99,41 @@ bool ais_ids::detect_anomaly_ais(PlugIn_AIS_Target *target)
                 return true;
         }
 
-        // ── 6. 위치 점프  ────────────────────────────
-        if (dt > 0 && dt <= 60) {
-            double dLat = (target->Lat - last.lat) * M_PI / 180.0;
-            double dLon = (target->Lon - last.lon) * M_PI / 180.0;
-            double a    = std::sin(dLat/2) * std::sin(dLat/2)
-                        + std::cos(last.lat * M_PI/180.0)
-                        * std::cos(target->Lat * M_PI/180.0)
-                        * std::sin(dLon/2) * std::sin(dLon/2);
-            double dist_km = 6371.0 * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1-a));
-            if (dist_km > 5.0)
-                return true;
+        // ── 이전 기록 없으면 저장만 하고 리턴 ────────────────────────
+        if (ais_history.find(mmsi) == ais_history.end()) {
+            to_snapshot(target);
+            return false;
         }
+        // // ── 이전 기록과 비교하여 이상 탐지  ────────────────────────
+        // AISSnapshot &last = ais_history[mmsi].back();
+        // time_t dt = now - last.timestamp; // 현재와 마지막 기록 간 시간 간격 (초)
 
-        // ── 7. 신호 소실 후 재등장 ──────────────────
-        if (dt > 300)
-            return true;
+        // // ── 5. 급격한 속도 변화  ─────────────────────
+        // if (target->SOG < 102.2 && last.sog < 102.2 && dt > 0 && dt <= 60) {
+        //     double delta = std::abs(target->SOG - last.sog);
+        //     if (delta > 10.0)
+        //         return true;
+        // }
 
-        // 현재 타겟의 상태 스냅샷 저장
-        to_snapshot(target);
+        // // ── 6. 위치 점프  ────────────────────────────
+        // if (dt > 0 && dt <= 60) {
+        //     double dLat = (target->Lat - last.lat) * M_PI / 180.0;
+        //     double dLon = (target->Lon - last.lon) * M_PI / 180.0;
+        //     double a    = std::sin(dLat/2) * std::sin(dLat/2)
+        //                 + std::cos(last.lat * M_PI/180.0)
+        //                 * std::cos(target->Lat * M_PI/180.0)
+        //                 * std::sin(dLon/2) * std::sin(dLon/2);
+        //     double dist_km = 6371.0 * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1-a));
+        //     if (dist_km > 5.0)
+        //         return true;
+        // }
+
+        // // ── 7. 신호 소실 후 재등장 ──────────────────
+        // if (dt > 300)
+        //     return true;
+
+        // // 현재 타겟의 상태 스냅샷 저장
+        // to_snapshot(target);
     }
 
     return false;
