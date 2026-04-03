@@ -144,7 +144,6 @@ ais_ids_pi::ais_ids_pi(void *ppimgr)
 {
     // Initialize the AIS IDS class
     aisIds = new ais_ids();
-
     // Create the PlugIn icons
     g_ppimgr = ppimgr;
 //    g_tp_pi_manager = (PlugInManager *) ppimgr;
@@ -179,6 +178,9 @@ ais_ids_pi::ais_ids_pi(void *ppimgr)
 
 ais_ids_pi::~ais_ids_pi()
 {
+    delete aisIds;
+    aisIds = NULL;
+
     delete g_SData_Locn;
     g_SData_Locn = NULL;
 
@@ -195,6 +197,7 @@ ais_ids_pi::~ais_ids_pi()
 
 int ais_ids_pi::Init(void)
 {
+    m_bShowRedDots = false;
     g_tplocale = NULL;
     m_bReadyForRequests = false;
     m_bDoneODAPIVersionCall = false;
@@ -477,10 +480,12 @@ void ais_ids_pi::ToggleToolbarIcon( void )
 {
     if(m_btpDialog) {
         m_btpDialog = false;
+        m_bShowRedDots = false;
         SetToolbarItemState( m_ais_ids_button_id, false );
         m_tpControlDialogImpl->Hide();
     } else {
         m_btpDialog = true;
+        m_bShowRedDots = true;
         SetToolbarItemState( m_ais_ids_button_id, true  );
         if(!m_bDoneODAPIVersionCall) GetODAPI();
         m_tpControlDialogImpl->SetPanels();
@@ -817,9 +822,12 @@ void ais_ids_pi::SetAISSentence(wxString &sentence) {
 }
 
 bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
-                                          int canvasIndex, int priority) {
+                                          int canvasIndex, int priority) 
+{
+    if (!m_bShowRedDots) return false;
     // Check if viewport is valid
     if (!vp || !vp->bValid) return false;
+   
 
     // Different drawing for different priorities
     if (priority == OVERLAY_LEGACY) {
@@ -855,6 +863,7 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
 bool ais_ids_pi::RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPort *vp,
                                          int canvasIndex, int priority)
 {
+    if (!m_bShowRedDots) return false;
     if (!vp || !vp->bValid) return false;
     if (priority != OVERLAY_OVER_SHIPS) return false;
 

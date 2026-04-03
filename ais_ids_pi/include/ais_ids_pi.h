@@ -276,6 +276,8 @@ public:
     bool    m_bAppendToSaveFile;
     std::unordered_set<int> m_invalidMidMmsi;
 
+    bool    m_bShowRedDots;
+
 
 private:
     void    OnTimer(wxTimerEvent& ev);

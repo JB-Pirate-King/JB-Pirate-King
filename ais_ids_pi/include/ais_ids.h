@@ -4,6 +4,7 @@
 class ais_ids {
 public:
     ais_ids();
+    ~ais_ids();
     bool detect_anomaly_ais(PlugIn_AIS_Target *target);
 
     // AIS 타겟 클래스 정의
