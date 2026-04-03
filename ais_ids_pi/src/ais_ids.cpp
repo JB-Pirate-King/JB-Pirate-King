@@ -5,6 +5,11 @@ ais_ids::ais_ids()
 
 }
 
+ais_ids::~ais_ids() 
+{
+
+}
+
 bool ais_ids::detect_anomaly_ais(PlugIn_AIS_Target *target) 
 {
     if (!target) return true;

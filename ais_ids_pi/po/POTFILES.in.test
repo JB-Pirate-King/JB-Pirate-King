@@ -3,8 +3,10 @@ src/tpControlDialogImpl.cpp
 src/tpicons.cpp
 src/tpJSON.cpp
 src/ais_ids_pi.cpp
+src/ais_ids.cpp
 src/tpUtils.cpp
 include/ais_ids_pi.h
+include/ais_ids.h
 include/tpicons.h
 include/tpControlDialogDef.h
 include/tpControlDialogImpl.h
