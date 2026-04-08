@@ -823,10 +823,10 @@ void ais_ids_pi::SetAISSentence(wxString &sentence)
     aisIds->ais_parser->Parse(sentence, t);
     aisIds->to_snapshot(t);
 
-    if (m_tpControlDialogImpl) {
+    // if (m_tpControlDialogImpl) {
 
-        m_tpControlDialogImpl->SendMessage(aisIds->ais_parser->parse_ais_string(t));
-    }
+    //     m_tpControlDialogImpl->SendMessage(aisIds->ais_parser->parse_ais_string(t));
+    // }
 }
 
 bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
@@ -838,7 +838,7 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
    
 
     // Different drawing for different priorities
-    if (priority == OVERLAY_LEGACY) {
+    if (priority == OVERLAY_LEGACY) { 
         // Legacy drawing (for backward compatibility)
     } else if (priority == OVERLAY_OVER_SHIPS) {
         // Draw content that should appear over ship icons
@@ -877,7 +877,6 @@ bool ais_ids_pi::RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPo
 
     ArrayOfPlugIn_AIS_Targets* targets = GetAISTargetArray();
     if (!targets || targets->GetCount() == 0) return false;
-    wxLogMessage("RenderGL: 타겟 수 %zu", targets->GetCount());  // 추가
     glPushAttrib(GL_COLOR_BUFFER_BIT | GL_ENABLE_BIT |
                  GL_LINE_BIT        | GL_HINT_BIT);
 
@@ -889,10 +888,12 @@ bool ais_ids_pi::RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPo
     const int   segments = 32;
 
     for (size_t i = 0; i < targets->GetCount(); ++i) {
-        PlugIn_AIS_Target* t = targets->Item(i);
+        PlugIn_AIS_Target* t = targets->Item(i); 
         if (!t) continue;
         // Check if the target is an anomaly before drawing
-        if (!aisIds->detect_anomaly_ais(t->MMSI)) continue;
+        wxString anomaly = aisIds->detect_anomaly_ais(t->MMSI);
+        m_tpControlDialogImpl->SendMessage(anomaly);
+        if (anomaly.IsEmpty()) continue;
         wxPoint p;
         GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
 
