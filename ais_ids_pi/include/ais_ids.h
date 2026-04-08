@@ -20,7 +20,7 @@ public:
     void to_snapshot(AISTarget &target);
 
     // 이상 탐지
-    bool detect_anomaly_ais(int mmsi);
+    wxString detect_anomaly_ais(int mmsi);
 
     // 전체 타겟 맵 반환 (렌더링용)
     const std::unordered_map<int, std::vector<AISTarget>> &get_history() const { return ais_history; }
