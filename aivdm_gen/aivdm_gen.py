@@ -31,13 +31,10 @@ MODE_OPTIONS = [
 MODE_LABEL_TO_KEY = {label: key for key, label in MODE_OPTIONS}
 
 ATTACK_OPTIONS = [
-    ("circle",  "원형 선단"),
-    ("grid",    "격자 선단"),
-    ("spiral",  "나선형 선단"),
-    ("random",  "무작위 확산"),
-    ("jbu",     "JBU 글자"),
-    ("pincer",  "집게 협공"),
-    ("wave",    "파상 대형"),
+    ("speed_spike",      "속도 이상"),
+    ("anchor_move",      "정박 이동 이상"),
+    ("course_mismatch",  "COG/HDG 불일치"),
+    ("position_jump",    "위치 점프 이상"),
 ]
 ATTACK_LABEL_TO_KEY = {label: key for key, label in ATTACK_OPTIONS}
 
@@ -188,15 +185,9 @@ def translation_offset(cfg: dict, elapsed: float) -> tuple[float, float]:
     move_speed = float(cfg.get("move_speed", 0.0))   # kn
     move_heading = float(cfg.get("move_heading", 0.0))  # 도 (진북 기준)
     move_accel = float(cfg.get("move_accel", 0.0))   # kn/min 가속
-    move_wave_amp = float(cfg.get("move_wave_amp", 0.0))  # kn 진폭
-    move_wave_period = float(cfg.get("move_wave_period", 60.0))  # 초 주기
 
     # 가속도 적용
     effective_speed = move_speed + move_accel * (elapsed / 60.0)
-    # 사인파 진동
-    if move_wave_period > 0:
-        effective_speed += move_wave_amp * math.sin(2 * math.pi * elapsed / move_wave_period)
-
     # 이동 방향(헤딩)에 따른 위경도 변화
     rad = math.radians(move_heading)
     speed_dps = effective_speed * _KN_TO_DEG_PER_SEC  # deg/s
@@ -231,231 +222,184 @@ class Vessel:
 
 
 # ──────────────────────────────────────────────────
-# 원형 선단
+# 속도 이상
 # ──────────────────────────────────────────────────
 
-def make_circle_fleet(cfg):
+
+def make_speed_spike_fleet(cfg):
     center_lat = float(cfg["center_lat"])
     center_lon = float(cfg["center_lon"])
-    count = int(cfg["circle_count"])
-    radius = float(cfg["circle_radius"])
-    speed = float(cfg["circle_speed"])
-    mode = str(cfg.get("circle_mode", "rotate"))  # rotate / converge / diverge
+    count = int(cfg["speed_count"])
+    base_speed = float(cfg["speed_base"])
+    spike_speed = float(cfg["speed_spike"])
+    mode = str(cfg.get("speed_mode", "intermittent"))
+    interval = max(1.0, float(cfg.get("speed_interval", 10.0)))
 
     fleet = []
     for index in range(count):
-        angle = (2 * math.pi / count) * index
-        vessel = Vessel(990100000 + index, f"GHOST-C{index + 1:02d}")
-        vessel._circle_angle = angle
-        vessel._circle_speed = speed
-        vessel._center_lat = center_lat
-        vessel._center_lon = center_lon
-        vessel._radius = radius
-        vessel._base_radius = radius
-        vessel._circle_mode = mode
-        fleet.append(vessel)
-    return fleet
-
-
-def update_circle_fleet(fleet, t: float, cfg: dict) -> None:
-    dlat, dlon = translation_offset(cfg, t)
-    converge_rate = float(cfg.get("circle_converge_rate", 0.0))  # deg/tick 반지름 변화
-
-    for vessel in fleet:
-        if not hasattr(vessel, "_circle_angle"):
-            continue
-        angle = vessel._circle_angle + t * vessel._circle_speed
-        mode = vessel._circle_mode
-
-        if mode == "converge":
-            vessel._radius = max(0.001, vessel._base_radius - converge_rate * t)
-        elif mode == "diverge":
-            vessel._radius = vessel._base_radius + converge_rate * t
-
-        cx = vessel._center_lat + dlat
-        cy = vessel._center_lon + dlon
-        vessel.lat = cx + vessel._radius * math.sin(angle)
-        vessel.lon = cy + vessel._radius * math.cos(angle) * 1.2
-        vessel.cog = (math.degrees(angle + math.pi / 2)) % 360
-        vessel.heading = int(vessel.cog)
-        vessel.sog = 8.0 + 2.0 * math.sin(angle * 3)
-
-
-# ──────────────────────────────────────────────────
-# 격자 선단
-# ──────────────────────────────────────────────────
-
-def make_grid_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    rows = int(cfg["grid_rows"])
-    cols = int(cfg["grid_cols"])
-    spacing = float(cfg["grid_spacing"])
-    speed = float(cfg["grid_speed"])
-    heading = float(cfg["grid_heading"])
-
-    fleet = []
-    idx = 0
-    for row in range(rows):
-        for col in range(cols):
-            dlat = (row - rows / 2) * spacing
-            dlon = (col - cols / 2) * spacing * 1.2
-            vessel = Vessel(990500000 + idx, f"GHOST-G{idx + 1:02d}")
-            vessel._init_lat = center_lat + dlat
-            vessel._init_lon = center_lon + dlon
-            vessel.lat = vessel._init_lat
-            vessel.lon = vessel._init_lon
-            vessel.sog = speed
-            vessel.cog = heading
-            vessel.heading = int(heading)
-            vessel._drift_lat = random.uniform(-0.0002, 0.0002)
-            vessel._drift_lon = random.uniform(-0.0002, 0.0002)
-            fleet.append(vessel)
-            idx += 1
-    return fleet
-
-
-def update_grid_fleet(fleet, dt: float, cfg: dict, elapsed: float) -> None:
-    dlat, dlon = translation_offset(cfg, elapsed)
-    grid_rotate = float(cfg.get("grid_rotate", 0.0))  # 도/분 선단 회전
-
-    # 선단 회전 각도 (elapsed 기반)
-    rot_angle = math.radians(grid_rotate * elapsed / 60.0)
-    cos_r, sin_r = math.cos(rot_angle), math.sin(rot_angle)
-
-    for vessel in fleet:
-        if not hasattr(vessel, "_drift_lat"):
-            continue
-        radians = math.radians(vessel.cog)
-        step = vessel.sog * dt * 0.000154 / 3600 * 1852 / 111000
-
-        # 개별 이동
-        vessel._init_lat += math.cos(radians) * step + vessel._drift_lat * dt * 0.1
-        vessel._init_lon += math.sin(radians) * step + vessel._drift_lon * dt * 0.1
-
-        # 선단 회전 적용 (중심 기준 회전)
-        if grid_rotate != 0:
-            y = vessel._init_lat - float(cfg["center_lat"])
-            x = vessel._init_lon - float(cfg["center_lon"])
-            ny = y * cos_r - x * sin_r
-            nx = y * sin_r + x * cos_r
-            vessel.lat = float(cfg["center_lat"]) + ny + dlat
-            vessel.lon = float(cfg["center_lon"]) + nx + dlon
-        else:
-            vessel.lat = vessel._init_lat + dlat
-            vessel.lon = vessel._init_lon + dlon
-
-
-# ──────────────────────────────────────────────────
-# 나선형 선단
-# ──────────────────────────────────────────────────
-
-def make_spiral_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg["spiral_count"])
-    turns = float(cfg["spiral_turns"])
-    max_radius = float(cfg["spiral_max_radius"])
-    speed = float(cfg["spiral_speed"])
-
-    fleet = []
-    for index in range(count):
-        ratio = index / max(count - 1, 1)
-        angle = 2 * math.pi * turns * ratio
-        radius = max_radius * ratio
-        vessel = Vessel(990600000 + index, f"GHOST-S{index + 1:02d}")
-        vessel.lat = center_lat + radius * math.sin(angle)
-        vessel.lon = center_lon + radius * math.cos(angle) * 1.2
-        vessel._idx = index
-        vessel._count = count
-        vessel._turns = turns
-        vessel._center_lat = center_lat
-        vessel._center_lon = center_lon
-        vessel._max_radius = max_radius
-        vessel._base_max_radius = max_radius
-        vessel._spiral_speed = speed
-        fleet.append(vessel)
-    return fleet
-
-
-def update_spiral_fleet(fleet, t: float, cfg: dict) -> None:
-    dlat, dlon = translation_offset(cfg, t)
-    expand_rate = float(cfg.get("spiral_expand_rate", 0.0))  # 반지름 팽창 비율/분
-
-    for vessel in fleet:
-        if not hasattr(vessel, "_idx"):
-            continue
-        ratio = vessel._idx / max(vessel._count - 1, 1)
-        angle = 2 * math.pi * vessel._turns * ratio + t * vessel._spiral_speed
-
-        # 나선 팽창/수축
-        effective_max = vessel._base_max_radius * (1 + expand_rate * t / 60.0)
-        effective_max = max(0.001, effective_max)
-        radius = effective_max * ratio
-
-        cx = vessel._center_lat + dlat
-        cy = vessel._center_lon + dlon
-        vessel.lat = cx + radius * math.sin(angle)
-        vessel.lon = cy + radius * math.cos(angle) * 1.2
-        vessel.cog = (math.degrees(angle + math.pi / 2)) % 360
-        vessel.heading = int(vessel.cog)
-        vessel.sog = 5.0 + radius * 20
-
-
-# ──────────────────────────────────────────────────
-# 무작위 확산
-# ──────────────────────────────────────────────────
-
-def make_random_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg["random_count"])
-    spread = float(cfg["random_spread"])
-
-    fleet = []
-    for index in range(count):
-        vessel = Vessel(990700000 + index, f"GHOST-R{index + 1:02d}")
-        vessel.lat = center_lat + random.uniform(-spread, spread)
-        vessel.lon = center_lon + random.uniform(-spread * 1.2, spread * 1.2)
-        vessel.sog = random.uniform(2.0, 15.0)
+        vessel = Vessel(990100000 + index, f"GHOST-S{index + 1:03d}")
+        vessel.lat = center_lat + random.uniform(-0.03, 0.03)
+        vessel.lon = center_lon + random.uniform(-0.03 * 1.2, 0.03 * 1.2)
+        vessel.sog = base_speed
         vessel.cog = random.uniform(0, 360)
         vessel.heading = int(vessel.cog)
-        vessel._drift_lat = random.uniform(-0.001, 0.001)
-        vessel._drift_lon = random.uniform(-0.001, 0.001)
+        vessel.nav_status = 0
+        vessel._base_speed = base_speed
+        vessel._spike_speed = spike_speed
+        vessel._speed_mode = mode
+        vessel._spike_interval = interval
+        vessel._last_spike = 0.0
+        vessel._spike_state = False
         fleet.append(vessel)
     return fleet
 
 
-def update_random_fleet(fleet, dt: float, cfg: dict, elapsed: float) -> None:
-    dlat_t, dlon_t = translation_offset(cfg, elapsed)
-    converge_lat = cfg.get("random_converge_lat", None)
-    converge_lon = cfg.get("random_converge_lon", None)
-    converge_strength = float(cfg.get("random_converge_strength", 0.0))
-
+def update_speed_spike_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
     for vessel in fleet:
-        if not hasattr(vessel, "_drift_lat"):
+        if not hasattr(vessel, "_spike_interval"):
             continue
-        vessel.cog = (vessel.cog + random.uniform(-5, 5)) % 360
+        if elapsed - vessel._last_spike >= vessel._spike_interval:
+            vessel._last_spike = elapsed
+            if vessel._speed_mode == "간헐":
+                vessel._spike_state = not vessel._spike_state
+            else:
+                vessel._spike_state = True
 
-        # 수렴 포인트로 당기기
-        if converge_strength > 0 and converge_lat is not None:
-            target_lat = float(converge_lat) + dlat_t
-            target_lon = float(converge_lon) + dlon_t
-            diff_lat = target_lat - vessel.lat
-            diff_lon = target_lon - vessel.lon
-            dist = math.sqrt(diff_lat ** 2 + diff_lon ** 2) + 1e-9
-            pull = converge_strength * dt * 0.0001
-            vessel.lat += (diff_lat / dist) * pull
-            vessel.lon += (diff_lon / dist) * pull
+        if vessel._spike_state:
+            vessel.sog = vessel._spike_speed
+            if vessel._speed_mode == "순간":
+                vessel._spike_state = False
         else:
-            radians = math.radians(vessel.cog)
-            step = vessel.sog * dt * 0.000154 / 3600 * 1852 / 111000
-            vessel.lat += math.cos(radians) * step
-            vessel.lon += math.sin(radians) * step
+            vessel.sog = vessel._base_speed
 
-        # 집단 드리프트 (이동)
-        vessel.lat += dlat_t * dt * 0.0001
-        vessel.lon += dlon_t * dt * 0.0001
+        if random.random() < 0.2:
+            vessel.cog = (vessel.cog + random.uniform(-30, 30)) % 360
+
+        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
+        vessel.lat += math.cos(math.radians(vessel.cog)) * step
+        vessel.lon += math.sin(math.radians(vessel.cog)) * step
+        vessel.heading = int(vessel.cog)
+
+
+# ──────────────────────────────────────────────────
+# 정박 이동 이상
+# ──────────────────────────────────────────────────
+
+def make_anchor_move_fleet(cfg):
+    center_lat = float(cfg["center_lat"])
+    center_lon = float(cfg["center_lon"])
+    count = int(cfg["anchor_count"])
+    radius = float(cfg["anchor_radius"])
+    speed = float(cfg["anchor_speed"])
+    cog = float(cfg.get("anchor_cog", 90.0))
+    drift = float(cfg.get("anchor_drift", 0.0))
+    lon_offset = float(cfg.get("anchor_lon_offset", 0.0))
+
+    fleet = []
+    for index in range(count):
+        vessel = Vessel(990500000 + index, f"GHOST-A{index + 1:03d}", nav_status=1)
+        vessel.lat = center_lat + random.uniform(-radius, radius)
+        vessel.lon = center_lon + random.uniform(-radius * 1.2, radius * 1.2) + lon_offset
+        vessel.sog = max(0.2, speed)
+        vessel.cog = (cog + random.uniform(-30, 30)) % 360
+        vessel.heading = int((vessel.cog + 120) % 360)
+        vessel._drift = drift
+        fleet.append(vessel)
+    return fleet
+
+
+def update_anchor_move_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
+    for vessel in fleet:
+        if not hasattr(vessel, "_drift"):
+            continue
+        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
+        vessel.lat += math.cos(math.radians(vessel.cog)) * step
+        vessel.lon += math.sin(math.radians(vessel.cog)) * step
+        vessel.lat += vessel._drift * dt * 0.00001
+        vessel.lon += vessel._drift * dt * 0.00001
+        vessel.heading = int((vessel.cog + 120) % 360)
+
+
+# ──────────────────────────────────────────────────
+# COG/HDG 불일치
+# ──────────────────────────────────────────────────
+
+def make_course_mismatch_fleet(cfg):
+    center_lat = float(cfg["center_lat"])
+    center_lon = float(cfg["center_lon"])
+    count = int(cfg["course_count"])
+    mismatch = float(cfg["course_mismatch"])
+    speed = float(cfg["course_speed"])
+    drift = float(cfg.get("course_drift", 5.0))
+    offset = float(cfg.get("course_offset", 120.0))
+
+    fleet = []
+    for index in range(count):
+        vessel = Vessel(990600000 + index, f"GHOST-CM{index + 1:03d}")
+        vessel.lat = center_lat + random.uniform(-0.05, 0.05)
+        vessel.lon = center_lon + random.uniform(-0.05 * 1.2, 0.05 * 1.2)
+        vessel.sog = max(0.5, speed)
+        vessel.cog = random.uniform(0, 360)
+        vessel.heading = int((vessel.cog + mismatch + offset) % 360)
+        vessel._drift = drift
+        fleet.append(vessel)
+    return fleet
+
+
+def update_course_mismatch_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
+    for vessel in fleet:
+        if not hasattr(vessel, "_drift"):
+            continue
+        if random.random() < 0.15:
+            vessel.cog = (vessel.cog + random.uniform(-vessel._drift, vessel._drift)) % 360
+        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
+        vessel.lat += math.cos(math.radians(vessel.cog)) * step
+        vessel.lon += math.sin(math.radians(vessel.cog)) * step
+        vessel.heading = int((vessel.cog + float(cfg.get("course_mismatch", 150.0)) + float(cfg.get("course_offset", 120.0))) % 360)
+
+
+# ──────────────────────────────────────────────────
+# 위치 점프 이상
+# ──────────────────────────────────────────────────
+
+def make_position_jump_fleet(cfg):
+    center_lat = float(cfg.get("jump_center_lat", cfg["center_lat"]))
+    center_lon = float(cfg.get("jump_center_lon", cfg["center_lon"]))
+    count = int(cfg["jump_count"])
+    radius = float(cfg["jump_radius"])
+    interval = max(1.0, float(cfg.get("jump_interval", 10.0)))
+
+    fleet = []
+    for index in range(count):
+        vessel = Vessel(990700000 + index, f"GHOST-P{index + 1:03d}")
+        vessel.lat = center_lat + random.uniform(-radius, radius)
+        vessel.lon = center_lon + random.uniform(-radius * 1.2, radius * 1.2)
+        vessel.sog = random.uniform(2.0, 10.0)
+        vessel.cog = random.uniform(0, 360)
+        vessel.heading = int(vessel.cog)
+        vessel._jump_radius = radius
+        vessel._jump_interval = interval
+        vessel._last_jump = 0.0
+        fleet.append(vessel)
+    return fleet
+
+
+def update_position_jump_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
+    for vessel in fleet:
+        if not hasattr(vessel, "_jump_interval"):
+            continue
+        if elapsed - vessel._last_jump >= vessel._jump_interval:
+            vessel._last_jump = elapsed
+            jump_lat = random.choice([-1, 1]) * random.uniform(0.08, 0.20)
+            jump_lon = random.choice([-1, 1]) * random.uniform(0.08, 0.20)
+            vessel.lat += jump_lat
+            vessel.lon += jump_lon
+            vessel.cog = random.uniform(0, 360)
+            vessel.heading = int(vessel.cog)
+
+        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
+        vessel.lat += math.cos(math.radians(vessel.cog)) * step
+        vessel.lon += math.sin(math.radians(vessel.cog)) * step
         vessel.heading = int(vessel.cog)
 
 
@@ -536,7 +480,7 @@ def update_jbu_fleet(fleet, dt: float, cfg: dict, elapsed: float) -> None:
             vessel._wp_idx = nxt
             continue
 
-        step = vessel.sog * 0.000154 * dt / 3600 * 1852 / 111000
+        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
         vessel._wp_progress += step / distance
         if vessel._wp_progress >= 1.0:
             vessel._wp_progress = 0.0
@@ -693,13 +637,10 @@ def make_anchor_vessel(cfg) -> Vessel:
 def build_generated_fleet(cfg) -> list[Vessel]:
     attack_key = str(cfg["attack_key"])
     builders = {
-        "circle":  make_circle_fleet,
-        "grid":    make_grid_fleet,
-        "spiral":  make_spiral_fleet,
-        "random":  make_random_fleet,
-        "jbu":     make_jbu_fleet,
-        "pincer":  make_pincer_fleet,
-        "wave":    make_wave_fleet,
+        "speed_spike":     make_speed_spike_fleet,
+        "anchor_move":     make_anchor_move_fleet,
+        "course_mismatch": make_course_mismatch_fleet,
+        "position_jump":   make_position_jump_fleet,
     }
     if attack_key not in builders:
         raise ValueError(f"지원하지 않는 패턴입니다: {attack_key}")
@@ -710,20 +651,14 @@ def build_generated_fleet(cfg) -> list[Vessel]:
 
 
 def update_generated_fleet(fleet, attack_key: str, tick: float, interval: float, cfg: dict) -> None:
-    if attack_key == "circle":
-        update_circle_fleet(fleet, tick, cfg)
-    elif attack_key == "grid":
-        update_grid_fleet(fleet, interval, cfg, tick)
-    elif attack_key == "spiral":
-        update_spiral_fleet(fleet, tick, cfg)
-    elif attack_key == "random":
-        update_random_fleet(fleet, interval, cfg, tick)
-    elif attack_key == "jbu":
-        update_jbu_fleet(fleet, interval, cfg, tick)
-    elif attack_key == "pincer":
-        update_pincer_fleet(fleet, interval, cfg, tick)
-    elif attack_key == "wave":
-        update_wave_fleet(fleet, tick, cfg)
+    if attack_key == "speed_spike":
+        update_speed_spike_fleet(fleet, tick, interval, cfg)
+    elif attack_key == "anchor_move":
+        update_anchor_move_fleet(fleet, tick, interval, cfg)
+    elif attack_key == "course_mismatch":
+        update_course_mismatch_fleet(fleet, tick, interval, cfg)
+    elif attack_key == "position_jump":
+        update_position_jump_fleet(fleet, tick, interval, cfg)
 
 
 # ──────────────────────────────────────────────────
@@ -967,9 +902,6 @@ class App(tk.Tk):
         self._build_grid_section(self.generated_panel)
         self._build_spiral_section(self.generated_panel)
         self._build_random_section(self.generated_panel)
-        self._build_jbu_section(self.generated_panel)
-        self._build_pincer_section(self.generated_panel)
-        self._build_wave_section(self.generated_panel)
         self._build_extra_section(self.generated_panel)
 
         self.file_panel = ttk.Frame(sf)
@@ -1012,10 +944,6 @@ class App(tk.Tk):
                                        from_=0, to=359, default=0, step=5)
         self.move_accel = self._row(parent, "가속도 (kn/분)", self._spin,
                                      from_=0.0, to=5.0, default=0.0, step=0.1)
-        self.move_wave_amp = self._row(parent, "사인파 진폭 (kn)", self._spin,
-                                        from_=0.0, to=10.0, default=0.0, step=0.5)
-        self.move_wave_period = self._row(parent, "사인파 주기 (초)", self._spin,
-                                           from_=10.0, to=600.0, default=60.0, step=5.0)
 
     def _build_attack_section(self, parent) -> None:
         self._section(parent, "생성 패턴")
@@ -1031,62 +959,62 @@ class App(tk.Tk):
     def _build_circle_section(self, parent) -> None:
         self.circle_frame = ttk.Frame(parent)
         self.circle_frame.pack(fill="x")
-        self._section(self.circle_frame, "원형 선단 설정")
+        self._section(self.circle_frame, "속도 이상 설정")
         self.circle_count = self._row(self.circle_frame, "선박 수", self._spin,
-                                       from_=1, to=50, default=15, step=1)
-        self.circle_radius = self._row(self.circle_frame, "반지름 (도)", self._spin,
-                                        from_=0.01, to=2.0, default=0.22, step=0.01)
-        self.circle_speed = self._row(self.circle_frame, "각속도 (rad/tick)", self._spin,
-                                       from_=0.001, to=0.1, default=0.008, step=0.001)
-        self.circle_mode = self._row(self.circle_frame, "모드", self._combo,
-                                      values=["rotate", "converge", "diverge"], default="rotate")
-        self.circle_converge_rate = self._row(self.circle_frame, "수렴/발산 속도 (도/tick)", self._spin,
-                                               from_=0.0, to=0.01, default=0.001, step=0.0005)
+                                       from_=1, to=100, default=25, step=1)
+        self.circle_radius = self._row(self.circle_frame, "기본 속도 (kn)", self._spin,
+                                        from_=0.0, to=40.0, default=8.0, step=0.5)
+        self.circle_speed = self._row(self.circle_frame, "스파이크 속도 (kn)", self._spin,
+                                       from_=0.0, to=60.0, default=30.0, step=1.0)
+        self.circle_mode = self._row(self.circle_frame, "스파이크 방식", self._combo,
+                                      values=["간헐", "순간"], default="간헐")
+        self.circle_converge_rate = self._row(self.circle_frame, "스파이크 주기 (초)", self._spin,
+                                               from_=1.0, to=120.0, default=10.0, step=1.0)
 
     def _build_grid_section(self, parent) -> None:
         self.grid_frame = ttk.Frame(parent)
         self.grid_frame.pack(fill="x")
-        self._section(self.grid_frame, "격자 선단 설정")
-        self.grid_rows = self._row(self.grid_frame, "행 수", self._spin,
-                                    from_=1, to=20, default=5, step=1)
-        self.grid_cols = self._row(self.grid_frame, "열 수", self._spin,
-                                    from_=1, to=20, default=5, step=1)
-        self.grid_spacing = self._row(self.grid_frame, "간격 (도)", self._spin,
-                                       from_=0.005, to=0.5, default=0.05, step=0.005)
-        self.grid_speed = self._row(self.grid_frame, "속도 (kn)", self._spin,
-                                     from_=0, to=30, default=5.0, step=0.5)
-        self.grid_heading = self._row(self.grid_frame, "진행 방향 (도)", self._spin,
-                                       from_=0, to=359, default=0, step=5)
-        self.grid_rotate = self._row(self.grid_frame, "선단 회전 (도/분)", self._spin,
-                                      from_=-30.0, to=30.0, default=0.0, step=1.0)
+        self._section(self.grid_frame, "정박 이동 이상 설정")
+        self.grid_rows = self._row(self.grid_frame, "선박 수", self._spin,
+                                    from_=1, to=100, default=30, step=1)
+        self.grid_cols = self._row(self.grid_frame, "클러스터 반경 (도)", self._spin,
+                                    from_=0.01, to=1.0, default=0.10, step=0.01)
+        self.grid_spacing = self._row(self.grid_frame, "이상 이동 속도 (kn)", self._spin,
+                                       from_=0.0, to=10.0, default=3.0, step=0.1)
+        self.grid_speed = self._row(self.grid_frame, "COG 방향 (도)", self._spin,
+                                     from_=0, to=359, default=90, step=5)
+        self.grid_heading = self._row(self.grid_frame, "경도 오프셋 (도)", self._spin,
+                                       from_=-1.0, to=1.0, default=0.0, step=0.01)
+        self.grid_rotate = self._row(self.grid_frame, "드리프트 강도", self._spin,
+                                      from_=-1.0, to=1.0, default=0.0, step=0.05)
 
     def _build_spiral_section(self, parent) -> None:
         self.spiral_frame = ttk.Frame(parent)
         self.spiral_frame.pack(fill="x")
-        self._section(self.spiral_frame, "나선형 선단 설정")
+        self._section(self.spiral_frame, "COG/HDG 불일치 설정")
         self.spiral_count = self._row(self.spiral_frame, "선박 수", self._spin,
                                        from_=3, to=60, default=20, step=1)
-        self.spiral_turns = self._row(self.spiral_frame, "회전 수", self._spin,
-                                       from_=0.5, to=5.0, default=2.0, step=0.5)
-        self.spiral_max_r = self._row(self.spiral_frame, "최대 반지름 (도)", self._spin,
-                                       from_=0.05, to=1.5, default=0.30, step=0.01)
-        self.spiral_speed = self._row(self.spiral_frame, "회전 속도 (rad/tick)", self._spin,
-                                       from_=0.001, to=0.05, default=0.005, step=0.001)
-        self.spiral_expand = self._row(self.spiral_frame, "반지름 팽창율 (%/분)", self._spin,
-                                        from_=-50.0, to=100.0, default=0.0, step=5.0)
+        self.spiral_turns = self._row(self.spiral_frame, "불일치 각도 (도)", self._spin,
+                                       from_=90.0, to=180.0, default=150.0, step=5.0)
+        self.spiral_max_r = self._row(self.spiral_frame, "기본 속도 (kn)", self._spin,
+                                       from_=0.0, to=30.0, default=10.0, step=0.5)
+        self.spiral_speed = self._row(self.spiral_frame, "COG 변화 속도 (도/초)", self._spin,
+                                       from_=0.0, to=20.0, default=5.0, step=0.5)
+        self.spiral_expand = self._row(self.spiral_frame, "HDG 편차 (도)", self._spin,
+                                        from_=0.0, to=180.0, default=120.0, step=5.0)
 
     def _build_random_section(self, parent) -> None:
         self.random_frame = ttk.Frame(parent)
         self.random_frame.pack(fill="x")
-        self._section(self.random_frame, "무작위 확산 설정")
+        self._section(self.random_frame, "위치 점프 이상 설정")
         self.random_count = self._row(self.random_frame, "선박 수", self._spin,
                                        from_=1, to=100, default=30, step=1)
-        self.random_spread = self._row(self.random_frame, "확산 반경 (도)", self._spin,
+        self.random_spread = self._row(self.random_frame, "점프 반경 (도)", self._spin,
                                         from_=0.05, to=2.0, default=0.30, step=0.05)
-        self.random_converge_strength = self._row(self.random_frame, "수렴 강도 (0=없음)", self._spin,
-                                                   from_=0.0, to=10.0, default=0.0, step=0.5)
-        self.random_converge_lat = self._row(self.random_frame, "수렴 위도", self._entry, default="37.00")
-        self.random_converge_lon = self._row(self.random_frame, "수렴 경도", self._entry, default="21.00")
+        self.random_converge_strength = self._row(self.random_frame, "점프 간격 (초)", self._spin,
+                                                   from_=1.0, to=60.0, default=10.0, step=0.5)
+        self.random_converge_lat = self._row(self.random_frame, "점프 기준 위도", self._entry, default="37.00")
+        self.random_converge_lon = self._row(self.random_frame, "점프 기준 경도", self._entry, default="21.00")
 
     def _build_jbu_section(self, parent) -> None:
         self.jbu_frame = ttk.Frame(parent)
@@ -1214,13 +1142,10 @@ class App(tk.Tk):
     def _on_attack_change(self, event=None) -> None:
         attack_key = ATTACK_LABEL_TO_KEY[self.attack_var.get()]
         frames = {
-            "circle":  self.circle_frame,
-            "grid":    self.grid_frame,
-            "spiral":  self.spiral_frame,
-            "random":  self.random_frame,
-            "jbu":     self.jbu_frame,
-            "pincer":  self.pincer_frame,
-            "wave":    self.wave_frame,
+            "speed_spike":     self.circle_frame,
+            "anchor_move":     self.grid_frame,
+            "course_mismatch": self.spiral_frame,
+            "position_jump":   self.random_frame,
         }
         for key, frame in frames.items():
             if key == attack_key:
@@ -1265,47 +1190,31 @@ class App(tk.Tk):
             "move_speed":       float(self.move_speed._var.get()),
             "move_heading":     float(self.move_heading._var.get()),
             "move_accel":       float(self.move_accel._var.get()),
-            "move_wave_amp":    float(self.move_wave_amp._var.get()),
-            "move_wave_period": float(self.move_wave_period._var.get()),
             # 원형
-            "circle_count":         min(200, max(1, int(float(self.circle_count._var.get())))),
-            "circle_radius":        float(self.circle_radius._var.get()),
-            "circle_speed":         float(self.circle_speed._var.get()),
-            "circle_mode":          self.circle_mode._var.get(),
-            "circle_converge_rate": float(self.circle_converge_rate._var.get()),
-            # 격자
-            "grid_rows":    min(30, max(1, int(float(self.grid_rows._var.get())))),
-            "grid_cols":    min(30, max(1, int(float(self.grid_cols._var.get())))),
-            "grid_spacing": float(self.grid_spacing._var.get()),
-            "grid_speed":   float(self.grid_speed._var.get()),
-            "grid_heading": float(self.grid_heading._var.get()),
-            "grid_rotate":  float(self.grid_rotate._var.get()),
-            # 나선
-            "spiral_count":       min(200, max(3, int(float(self.spiral_count._var.get())))),
-            "spiral_turns":       float(self.spiral_turns._var.get()),
-            "spiral_max_radius":  float(self.spiral_max_r._var.get()),
-            "spiral_speed":       float(self.spiral_speed._var.get()),
-            "spiral_expand_rate": float(self.spiral_expand._var.get()) / 100.0,
-            # 무작위
-            "random_count":             min(300, max(1, int(float(self.random_count._var.get())))),
-            "random_spread":            float(self.random_spread._var.get()),
-            "random_converge_strength": float(self.random_converge_strength._var.get()),
-            "random_converge_lat":      rcl,
-            "random_converge_lon":      rcn,
-            # JBU
-            "jbu_scale": float(self.jbu_scale._var.get()),
-            # 집게
-            "pincer_count": min(160, max(4, int(float(self.pincer_count._var.get())))),
-            "pincer_width": float(self.pincer_width._var.get()),
-            "pincer_depth": float(self.pincer_depth._var.get()),
-            "pincer_speed": float(self.pincer_speed._var.get()),
-            # 파상
-            "wave_count":     min(120, max(3, int(float(self.wave_count._var.get())))),
-            "wave_lanes":     max(1, int(float(self.wave_lanes._var.get()))),
-            "wave_width":     float(self.wave_width._var.get()),
-            "wave_amplitude": float(self.wave_amplitude._var.get()),
-            "wave_speed":     float(self.wave_speed._var.get()),
-            "wave_freq":      float(self.wave_freq._var.get()),
+            "speed_count":         min(200, max(1, int(float(self.circle_count._var.get())))),
+            "speed_base":          float(self.circle_radius._var.get()),
+            "speed_spike":         float(self.circle_speed._var.get()),
+            "speed_mode":          self.circle_mode._var.get(),
+            "speed_interval":      float(self.circle_converge_rate._var.get()),
+            # 정박 이동 이상
+            "anchor_count":        min(300, max(1, int(float(self.grid_rows._var.get())))),
+            "anchor_radius":       float(self.grid_cols._var.get()),
+            "anchor_speed":        float(self.grid_spacing._var.get()),
+            "anchor_cog":          float(self.grid_speed._var.get()),
+            "anchor_lon_offset":   float(self.grid_heading._var.get()),
+            "anchor_drift":        float(self.grid_rotate._var.get()),
+            # COG/HDG 불일치
+            "course_count":        min(200, max(3, int(float(self.spiral_count._var.get())))),
+            "course_mismatch":     float(self.spiral_turns._var.get()),
+            "course_speed":        float(self.spiral_max_r._var.get()),
+            "course_drift":        float(self.spiral_speed._var.get()),
+            "course_offset":       float(self.spiral_expand._var.get()),
+            # 위치 점프 이상
+            "jump_count":          min(300, max(1, int(float(self.random_count._var.get())))),
+            "jump_radius":         float(self.random_spread._var.get()),
+            "jump_interval":       float(self.random_converge_strength._var.get()),
+            "jump_center_lat":     rcl,
+            "jump_center_lon":     rcn,
         })
         return cfg
 
