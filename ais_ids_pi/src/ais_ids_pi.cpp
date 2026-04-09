@@ -854,7 +854,9 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
             PlugIn_AIS_Target *t = targets->Item(i);
             if (!t) continue;
             // Check if the target is an anomaly before drawing
-            if (!aisIds->detect_anomaly_ais(t->MMSI)) continue;
+            wxString anomaly = aisIds->detect_anomaly_ais(t->MMSI);
+            m_tpControlDialogImpl->SendMessage(anomaly);
+            if (anomaly.IsEmpty()) continue;
             wxPoint p;
             GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
             dc.DrawCircle(p, 8);
