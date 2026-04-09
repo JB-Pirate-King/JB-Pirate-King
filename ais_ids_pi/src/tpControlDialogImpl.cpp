@@ -18,13 +18,14 @@ tpControlDialogImpl::tpControlDialogImpl( wxWindow* parent )
     SetSize(wxSize(800, 600));
     Layout();
 }
+
 void tpControlDialogImpl::SendMessage(const wxString &message)
 {
-    if(!m_aisLogText) return;
-    m_aisLogText->AppendText(message);
-    if(!message.EndsWith("\n")) {
-        m_aisLogText->AppendText("\n");
-    }
+    if (!m_aisLogText) return;
+    wxString line = message;
+    line.Trim();
+    if (line.IsEmpty()) return;
+    m_aisLogText->AppendText(line + "\n");
 }
 
 void tpControlDialogImpl::SetDialogSize( void )
