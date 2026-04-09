@@ -35,14 +35,19 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     AISTarget &latest = history.back();
     time_t now = wxDateTime::Now().GetTicks();
 
+    // 마지막 수신 후 600초 이상 경과 시 정상 처리
+    if (now - latest.rxTime > 600) {
+        return wxEmptyString;
+    }
+
     // ── 0. 위치 데이터 없음 ───────────────────────────────────
     if (latest.lat >= 91.0 || latest.lon >= 181.0)
-        return wxString::Format("Invalid position data (MMSI: %d)", mmsi);
+        return wxString::Format("Invalid position data (MMSI: %d) (LAT: %.5f) (LON: %.5f)", mmsi, latest.lat, latest.lon);
 
     // ── 1. MMSI 국가코드 유효성 ───────────────────────────────
     int mid = mmsi / 1000000;
     if (!(201 <= mid && mid <= 775))
-        return wxString::Format("Invalid MMSI country code (MMSI: %d)", mmsi);
+        return wxString::Format("Invalid MMSI country code (MMSI: %d) (MID: %d)", mmsi, mid);
 
     // ── 2. 선종별 최대 속도 초과 ──────────────────────────────
     if (latest.sog < 102.2) {
@@ -59,22 +64,22 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
         else if (st >= 80 && st <= 89)      maxSOG = 18.0;  // 탱커
 
         if (latest.sog > maxSOG)
-            return wxString::Format("Speed limit exceeded (MMSI: %d)", mmsi);
+            return wxString::Format("Speed limit exceeded (MMSI: %d) (SOG: %.1f kn) (Max: %.1f kn) (ShipType: %d)", mmsi, latest.sog, maxSOG, st);
     }
 
     // ── 3. 정박/계류 중인데 SOG 0 아님 ───────────────────────
-if (latest.sog >= 0.5 &&
-    (latest.navStatus == 1 ||   // 정박
-     latest.navStatus == 5 ||   // 계류
-     latest.navStatus == 6))    // 좌초
-    return wxString::Format("Invalid navigation status (MMSI: %d) (Nav Status: %d), (sog: %f)", mmsi, latest.navStatus, latest.sog);
+    if (latest.sog >= 0.5 &&
+        (latest.navStatus == 1 ||   // 정박
+         latest.navStatus == 5 ||   // 계류
+         latest.navStatus == 6))    // 좌초
+        return wxString::Format("Invalid navigation status (MMSI: %d) (Nav Status: %d), (sog: %f)", mmsi, latest.navStatus, latest.sog);
 
     // ── 4. COG/HDG 불일치 ─────────────────────────────────────
     if (latest.cog < 360.0 && latest.hdg < 360.0) {
         double diff = std::abs(latest.cog - latest.hdg);
         if (diff > 180.0) diff = 360.0 - diff;
         if (diff > 100.0)
-            return wxString::Format("COG/HDG mismatch (MMSI: %d)", mmsi);
+            return wxString::Format("COG/HDG mismatch (MMSI: %d) (COG: %.1f) (HDG: %d) (Diff: %.1f)", mmsi, latest.cog, latest.hdg, diff);
     }
 
     // ── 이전 기록 없으면 정상 ─────────────────────────────────
@@ -87,7 +92,7 @@ if (latest.sog >= 0.5 &&
     if (latest.sog < 102.2 && last.sog < 102.2 && dt > 0 && dt <= 60) {
         double delta = std::abs(latest.sog - last.sog);
         if (delta > 10.0)
-            return wxString::Format("Sudden speed change detected (MMSI: %d)", mmsi);
+            return wxString::Format("Sudden speed change detected (MMSI: %d) (SOG: %.1f kn -> %.1f kn) (Delta: %.1f kn)", mmsi, last.sog, latest.sog, delta);
     }
 
     // ── 6. 위치 점프 ───────────────────────────────────────────
@@ -100,12 +105,12 @@ if (latest.sog >= 0.5 &&
                     * std::sin(dLon/2) * std::sin(dLon/2);
         double dist_km = 6371.0 * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1-a));
         if (dist_km > 5.0)
-            return wxString::Format("Position jump detected (MMSI: %d)", mmsi);
+            return wxString::Format("Position jump detected (MMSI: %d) (Dist: %.2f km) (%.5f,%.5f -> %.5f,%.5f)", mmsi, dist_km, last.lat, last.lon, latest.lat, latest.lon);
     }
 
     // ── 7. 신호 소실 후 재등장 ─────────────────────────────────
     if (dt > 300)
-        return wxString::Format("Signal loss detected (MMSI: %d)", mmsi);
+        return wxString::Format("Signal loss detected (MMSI: %d) (Gap: %lld sec)", mmsi, (long long)dt);
 
     return wxEmptyString;
 }

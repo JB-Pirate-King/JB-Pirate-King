@@ -822,11 +822,6 @@ void ais_ids_pi::SetAISSentence(wxString &sentence)
     AISTarget t;
     aisIds->ais_parser->Parse(sentence, t);
     aisIds->to_snapshot(t);
-
-    // if (m_tpControlDialogImpl) {
-
-    //     m_tpControlDialogImpl->SendMessage(aisIds->ais_parser->parse_ais_string(t));
-    // }
 }
 
 bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
