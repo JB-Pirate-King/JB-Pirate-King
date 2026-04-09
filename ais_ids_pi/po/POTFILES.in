@@ -4,7 +4,9 @@ src/tpicons.cpp
 src/tpJSON.cpp
 src/ais_ids_pi.cpp
 src/ais_ids.cpp
+src/aisParser.cpp
 src/tpUtils.cpp
+include/aisParser.h
 include/ais_ids_pi.h
 include/ais_ids.h
 include/tpicons.h
