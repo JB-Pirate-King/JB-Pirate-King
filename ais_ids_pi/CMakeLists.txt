@@ -59,6 +59,10 @@ endif (COMMAND cmake_policy)
 
 # set for vscode/vscodium
 set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+set(CMAKE_INSTALL_RPATH "$ORIGIN:${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/lib")
+set(CMAKE_BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/lib")
+set(CMAKE_SKIP_BUILD_RPATH OFF)
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 
 # define plugin name, owner and versions
 set(VERBOSE_NAME "Ais_ids")
@@ -122,7 +126,12 @@ set(XML_DESCRIPTION ${LONG_DESCRIPTION})
 
 option(PLUGIN_USE_SVG "Use SVG graphics" ON)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ONNX Runtime 설정
+set(ONNXRUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime")
+include_directories(${ONNXRUNTIME_DIR}/include)
 
 # Use local version of GLU library requires libs/glu directory
 set(USE_LOCAL_GLU FALSE)
@@ -181,13 +190,14 @@ add_definitions(-DUSE_S57)
 # ---- Section Below - Add your project SET(SRCS and SET(HDRS  etc..
 
 set(SRCS src/tpControlDialogDef.cpp src/tpControlDialogImpl.cpp src/tpicons.cpp
-         src/tpJSON.cpp src/ais_ids_pi.cpp src/ais_ids.cpp src/aisParser.cpp src/tpUtils.cpp
+         src/tpJSON.cpp src/ais_ids_pi.cpp src/ais_ids.cpp src/ais_ml.cpp src/aisParser.cpp src/tpUtils.cpp
 )
 
 set(HDRS
     include/aisParser.h
     include/ais_ids_pi.h
     include/ais_ids.h
+    include/ais_ml.h
     include/tpicons.h
     include/tpControlDialogDef.h
     include/tpControlDialogImpl.h
@@ -282,6 +292,17 @@ if (NOT OCPN_FLATPAK_CONFIG)
 
   add_subdirectory(opencpn-libs/plugin_dc)
   target_link_libraries(${PACKAGE_NAME} ocpn::plugin-dc)
+
+  # ONNX Runtime
+  target_link_libraries(${PACKAGE_NAME} ${ONNXRUNTIME_DIR}/lib/libonnxruntime.so)
+  target_include_directories(${PACKAGE_NAME} PRIVATE ${ONNXRUNTIME_DIR}/include)
+
+  # ONNX Runtime .so 파일을 플러그인과 함께 설치
+  install(FILES
+      ${ONNXRUNTIME_DIR}/lib/libonnxruntime.so.1.20.1
+      ${ONNXRUNTIME_DIR}/lib/libonnxruntime.so
+      DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/opencpn
+  )
 
 endif (NOT OCPN_FLATPAK_CONFIG)
 
