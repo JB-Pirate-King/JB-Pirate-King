@@ -7,7 +7,6 @@
 #include <array>
 #include <unordered_map>
 #include <fstream>
-#include <wx/string.h>
 
 // 피처 순서: sog, cog, dt, dist_km
 #define ML_FEATURE_COUNT 4
@@ -31,7 +30,8 @@ public:
 
     bool Load(const std::string &model_path,
               const std::string &scaler_path,
-              const std::string &threshold_path);
+              const std::string &threshold_path,
+              std::string &error_msg);
 
     void PushFeature(int mmsi, float sog, float cog,
                      float dt, float dist_km);
@@ -50,6 +50,6 @@ private:
 
     std::unordered_map<int, std::deque<std::array<float, ML_FEATURE_COUNT>>> m_sequences;
 
-    bool LoadScaler(const std::string &path);
-    bool LoadThreshold(const std::string &path);
+    bool LoadScaler(const std::string &path, std::string &error_msg);
+    bool LoadThreshold(const std::string &path, std::string &error_msg);
 };

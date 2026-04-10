@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 #include <cmath>
+#include <string>
 #include <wx/datetime.h>
 
 class ais_ids {
@@ -13,7 +14,7 @@ private:
     static const int MAX_HISTORY = 100;
 
 public:
-    ais_ids();
+    ais_ids(const std::string &data_dir = "");
     ~ais_ids();
 
     void to_snapshot(AISTarget &target);
@@ -33,8 +34,5 @@ public:
 
     AIS_Parser *ais_parser;
     AIS_ML     *ais_ml;
-
-    bool LoadML(const std::string &model_path,
-                const std::string &scaler_path,
-                const std::string &threshold_path);
+    std::string ml_error_msg;
 };

@@ -142,11 +142,8 @@ extern "C" DECL_EXP void destroy_pi(opencpn_plugin* p)
 ais_ids_pi::ais_ids_pi(void *ppimgr)
 :opencpn_plugin_118(ppimgr)
 {
-    // Initialize the AIS IDS class
-    aisIds = new ais_ids();
     // Create the PlugIn icons
     g_ppimgr = ppimgr;
-//    g_tp_pi_manager = (PlugInManager *) ppimgr;
     g_ais_ids_pi = this;
 
     wxString *l_pDir = new wxString(*GetpPrivateApplicationDataLocation());
@@ -170,6 +167,9 @@ ais_ids_pi::ais_ids_pi(void *ppimgr)
     g_pLayerDir->Append(*l_pDir);
     g_pLayerDir->Append( wxT("Layers") );
     appendOSDirSlash( g_pLayerDir );
+
+    // g_pData 설정 후 ais_ids 초기화 (ML 모델 로드)
+    aisIds = new ais_ids(std::string(g_pData->mb_str()));
 
     m_ptpicons = new tpicons();
 
@@ -312,13 +312,6 @@ int ais_ids_pi::Init(void)
 
 void ais_ids_pi::LateInit(void)
 {
-    // ML 모델 로드 (data/ 폴더에서)
-    std::string dataDir = std::string(g_pData->mb_str());
-    bool mlLoaded = aisIds->LoadML(
-        dataDir + "model.onnx",
-        dataDir + "scaler.json",
-        dataDir + "threshold.txt"
-    );
     SendPluginMessage(wxS("AIS_IDS_PI_READY_FOR_REQUESTS"), wxS("TRUE"));
     m_bReadyForRequests = true;
     return;

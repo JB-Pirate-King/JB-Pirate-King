@@ -2,7 +2,6 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <stdexcept>
-#include <numeric>
 
 using json = nlohmann::json;
 
@@ -22,28 +21,33 @@ AIS_ML::~AIS_ML()
 
 bool AIS_ML::Load(const std::string &model_path,
                   const std::string &scaler_path,
-                  const std::string &threshold_path)
+                  const std::string &threshold_path,
+                  std::string &error_msg)
 {
     try {
-        // 모델 로드
         m_session = new Ort::Session(m_env,
             model_path.c_str(), m_session_options);
 
-        if (!LoadScaler(scaler_path))    return false;
-        if (!LoadThreshold(threshold_path)) return false;
+        if (!LoadScaler(scaler_path, error_msg))    return false;
+        if (!LoadThreshold(threshold_path, error_msg)) return false;
 
         m_loaded = true;
+        error_msg = "ML load success | model: " + model_path;
         return true;
     } catch (const std::exception &e) {
+        error_msg = "ML exception: " + std::string(e.what()) + " | path: " + model_path;
         return false;
     }
 }
 
-bool AIS_ML::LoadScaler(const std::string &path)
+bool AIS_ML::LoadScaler(const std::string &path, std::string &error_msg)
 {
     try {
         std::ifstream f(path);
-        if (!f.is_open()) return false;
+        if (!f.is_open()) {
+            error_msg = "scaler file not found: " + path;
+            return false;
+        }
 
         json j;
         f >> j;
@@ -56,19 +60,24 @@ bool AIS_ML::LoadScaler(const std::string &path)
             m_scaler.max_[i] = max_arr[i].get<float>();
         }
         return true;
-    } catch (...) {
+    } catch (const std::exception &e) {
+        error_msg = "scaler parse error: " + std::string(e.what());
         return false;
     }
 }
 
-bool AIS_ML::LoadThreshold(const std::string &path)
+bool AIS_ML::LoadThreshold(const std::string &path, std::string &error_msg)
 {
     try {
         std::ifstream f(path);
-        if (!f.is_open()) return false;
+        if (!f.is_open()) {
+            error_msg = "threshold file not found: " + path;
+            return false;
+        }
         f >> m_threshold;
         return true;
-    } catch (...) {
+    } catch (const std::exception &e) {
+        error_msg = "threshold parse error: " + std::string(e.what());
         return false;
     }
 }
@@ -93,7 +102,6 @@ bool AIS_ML::DetectAnomaly(int mmsi, float &out_error)
 
     auto &seq = it->second;
 
-    // 정규화 후 입력 데이터 생성 [1, SEQ_LEN, FEATURE_COUNT]
     std::vector<float> input_data;
     input_data.reserve(ML_SEQ_LEN * ML_FEATURE_COUNT);
     for (auto &feat : seq) {
@@ -102,7 +110,6 @@ bool AIS_ML::DetectAnomaly(int mmsi, float &out_error)
         }
     }
 
-    // 입력 텐서 생성
     std::vector<int64_t> input_shape = {1, ML_SEQ_LEN, ML_FEATURE_COUNT};
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtArenaAllocator, OrtMemTypeDefault);
@@ -113,9 +120,8 @@ bool AIS_ML::DetectAnomaly(int mmsi, float &out_error)
         input_shape.data(), input_shape.size()
     );
 
-    // 추론
-    const char *input_names[]  = {"input"};
-    const char *output_names[] = {"output"};
+    const char *input_names[]  = {"x"};
+    const char *output_names[] = {"linear"};
 
     auto output_tensors = m_session->Run(
         Ort::RunOptions{nullptr},
@@ -123,7 +129,6 @@ bool AIS_ML::DetectAnomaly(int mmsi, float &out_error)
         output_names, 1
     );
 
-    // 재구성 오차 (MSE)
     float *output_data = output_tensors[0].GetTensorMutableData<float>();
     float mse = 0.0f;
     int n = ML_SEQ_LEN * ML_FEATURE_COUNT;

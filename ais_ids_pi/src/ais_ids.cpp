@@ -2,23 +2,25 @@
 
 #include "ais_ids.h"
 
-ais_ids::ais_ids()
+ais_ids::ais_ids(const std::string &data_dir)
 {
     ais_parser = new AIS_Parser();
     ais_ml     = new AIS_ML();
+
+    if (!data_dir.empty()) {
+        ais_ml->Load(
+            data_dir + "model.onnx",
+            data_dir + "scaler.json",
+            data_dir + "threshold.txt",
+            ml_error_msg
+        );
+    }
 }
 
 ais_ids::~ais_ids()
 {
     delete ais_parser;
     delete ais_ml;
-}
-
-bool ais_ids::LoadML(const std::string &model_path,
-                     const std::string &scaler_path,
-                     const std::string &threshold_path)
-{
-    return ais_ml->Load(model_path, scaler_path, threshold_path);
 }
 
 void ais_ids::to_snapshot(AISTarget &target)
@@ -62,8 +64,9 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     AISTarget &latest = history.back();
     time_t now = wxDateTime::Now().GetTicks();
 
-    if (now - latest.rxTime > 600)
-        return wxEmptyString;
+    // 마지막 수신 후 600초 이상 경과 시 정상 처리
+    // if (now - latest.rxTime > 600)
+    //     return wxEmptyString;
 
     // ── 0. 위치 데이터 없음 ───────────────────────────────────
     // if (latest.lat >= 91.0 || latest.lon >= 181.0)
@@ -78,21 +81,23 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     // if (latest.sog < 102.2) {
     //     double maxSOG = 30.0;
     //     int    st     = latest.shipType;
-    //     if      (st == 30)             maxSOG = 15.0;
-    //     else if (st == 31 || st == 32) maxSOG = 12.0;
-    //     else if (st == 33 || st == 34) maxSOG =  8.0;
-    //     else if (st == 35)             maxSOG = 35.0;
-    //     else if (st == 36 || st == 37) maxSOG = 20.0;
-    //     else if (st >= 60 && st <= 69) maxSOG = 30.0;
-    //     else if (st >= 70 && st <= 79) maxSOG = 25.0;
-    //     else if (st >= 80 && st <= 89) maxSOG = 18.0;
+    //     if      (st == 30)                  maxSOG = 15.0;  // 어선
+    //     else if (st == 31 || st == 32)      maxSOG = 12.0;  // 예인선
+    //     else if (st == 33 || st == 34)      maxSOG =  8.0;  // 준설/잠수
+    //     else if (st == 35)                  maxSOG = 35.0;  // 군함
+    //     else if (st == 36 || st == 37)      maxSOG = 20.0;  // 요트/레저
+    //     else if (st >= 60 && st <= 69)      maxSOG = 30.0;  // 여객선
+    //     else if (st >= 70 && st <= 79)      maxSOG = 25.0;  // 화물선
+    //     else if (st >= 80 && st <= 89)      maxSOG = 18.0;  // 탱커
     //     if (latest.sog > maxSOG)
     //         return wxString::Format("Speed limit exceeded (MMSI: %d) (SOG: %.1f kn) (Max: %.1f kn) (ShipType: %d)", mmsi, latest.sog, maxSOG, st);
     // }
 
     // ── 3. 정박/계류 중인데 SOG 0 아님 ───────────────────────
     // if (latest.sog >= 0.5 &&
-    //     (latest.navStatus == 1 || latest.navStatus == 5 || latest.navStatus == 6))
+    //     (latest.navStatus == 1 ||   // 정박
+    //      latest.navStatus == 5 ||   // 계류
+    //      latest.navStatus == 6))    // 좌초
     //     return wxString::Format("Invalid navigation status (MMSI: %d) (Nav Status: %d), (sog: %f)", mmsi, latest.navStatus, latest.sog);
 
     // ── 4. COG/HDG 불일치 ─────────────────────────────────────
@@ -103,7 +108,8 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     //         return wxString::Format("COG/HDG mismatch (MMSI: %d) (COG: %.1f) (HDG: %d) (Diff: %.1f)", mmsi, latest.cog, latest.hdg, diff);
     // }
 
-    if (history.size() < 2) return wxEmptyString;
+    // ── 이전 기록 없으면 정상 ─────────────────────────────────
+    // if (history.size() < 2) return wxEmptyString;
 
     AISTarget &last = history[history.size() - 2];
     time_t dt = latest.rxTime - last.rxTime;
@@ -138,6 +144,6 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
         if (ais_ml->DetectAnomaly(mmsi, ml_error))
             return wxString::Format("ML anomaly detected (MMSI: %d) (Error: %.6f)", mmsi, ml_error);
     }
-    return wxString::Format("ML fuck");
+
     return wxEmptyString;
 }
