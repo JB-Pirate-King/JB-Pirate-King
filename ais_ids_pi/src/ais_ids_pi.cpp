@@ -312,6 +312,13 @@ int ais_ids_pi::Init(void)
 
 void ais_ids_pi::LateInit(void)
 {
+    // ML 모델 로드 (data/ 폴더에서)
+    std::string dataDir = std::string(g_pData->mb_str());
+    bool mlLoaded = aisIds->LoadML(
+        dataDir + "model.onnx",
+        dataDir + "scaler.json",
+        dataDir + "threshold.txt"
+    );
     SendPluginMessage(wxS("AIS_IDS_PI_READY_FOR_REQUESTS"), wxS("TRUE"));
     m_bReadyForRequests = true;
     return;
