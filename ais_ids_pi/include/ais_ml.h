@@ -8,8 +8,8 @@
 #include <unordered_map>
 #include <fstream>
 
-// 피처 순서: sog, cog, dt, dist_km
-#define ML_FEATURE_COUNT 4
+// 피처 순서: sog, cog, heading, status, dt, dist_km
+#define ML_FEATURE_COUNT 6
 #define ML_SEQ_LEN       10
 
 struct MLScaler {
@@ -33,8 +33,8 @@ public:
               const std::string &threshold_path,
               std::string &error_msg);
 
-    void PushFeature(int mmsi, float sog, float cog,
-                     float dt, float dist_km);
+    void PushFeature(int mmsi, float sog, float cog, float heading,
+                     float status, float dt, float dist_km);
 
     bool DetectAnomaly(int mmsi, float &out_error);
 

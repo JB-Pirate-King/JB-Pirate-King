@@ -16,8 +16,8 @@ import subprocess
 from datetime import datetime
 
 # ── 설정 ──────────────────────────────────────────────────────────
-INPUT_FILE  = "./ais-2025-12-31.csv"
-OUTPUT_FILE = "./ais_preprocessed.csv"
+INPUT_FILE  = "ais-2025-12-31.csv"
+OUTPUT_FILE = "ais_preprocessed.csv"
 
 MIN_SEQ_LEN = 10
 
@@ -164,30 +164,28 @@ def main():
     print(f"      총 {total:,} 행 저장")
 
     print("[2/5] MMSI 기준 정렬 중...")
-    import subprocess
-    # 헤더 제외하고 정렬
-    header_line = None
+    # 헤더 읽기
     with open(TEMP_FILE, "r", encoding="utf-8") as f:
         header_line = f.readline()
-    # 헤더 없이 임시 파일 생성
-    TEMP_NOHEADER = TEMP_FILE + ".noheader"
-    with open(TEMP_FILE, "r", encoding="utf-8") as fin, \
-         open(TEMP_NOHEADER, "w", encoding="utf-8") as fout:
-        fin.readline()  # 헤더 스킵
-        for line in fin:
-            fout.write(line)
-    subprocess.run(
-        ["sort", "-t,", "-k1,1n", "-k2,2", "--buffer-size=512M", "-o", TEMP_NOHEADER, TEMP_NOHEADER],
-        check=True
-    )
-    # 헤더 다시 붙이기
-    with open(TEMP_NOHEADER, "r", encoding="utf-8") as fin, \
-         open(TEMP_FILE, "w", encoding="utf-8") as fout:
-        fout.write(header_line)
-        for line in fin:
-            fout.write(line)
-    import os
-    os.remove(TEMP_NOHEADER)
+        rows = f.readlines()
+
+    # MMSI(숫자) → base_date_time 순 정렬
+    def sort_key(line):
+        parts = line.split(",", 2)
+        try:
+            mmsi = int(parts[0])
+        except ValueError:
+            mmsi = 0
+        dt = parts[1] if len(parts) > 1 else ""
+        return (mmsi, dt)
+
+    rows.sort(key=sort_key)
+
+    with open(TEMP_FILE, "w", encoding="utf-8") as f:
+        f.write(header_line)
+        f.writelines(rows)
+
+    del rows
     print("      정렬 완료")
 
     print("[3/5] MMSI별 전처리 및 출력 저장 중...")

@@ -51,6 +51,7 @@ void ais_ids::to_snapshot(AISTarget &target)
 
         ais_ml->PushFeature(target.mmsi,
             (float)cur.sog, (float)cur.cog,
+            (float)cur.hdg, (float)cur.navStatus,
             dt, dist_km);
     }
 }
@@ -65,8 +66,8 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     time_t now = wxDateTime::Now().GetTicks();
 
     // 마지막 수신 후 600초 이상 경과 시 정상 처리
-    // if (now - latest.rxTime > 600)
-    //     return wxEmptyString;
+    if (now - latest.rxTime > 600)
+        return wxEmptyString;
 
     // ── 0. 위치 데이터 없음 ───────────────────────────────────
     // if (latest.lat >= 91.0 || latest.lon >= 181.0)
@@ -109,7 +110,7 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     // }
 
     // ── 이전 기록 없으면 정상 ─────────────────────────────────
-    // if (history.size() < 2) return wxEmptyString;
+    if (history.size() < 2) return wxEmptyString;
 
     AISTarget &last = history[history.size() - 2];
     time_t dt = latest.rxTime - last.rxTime;

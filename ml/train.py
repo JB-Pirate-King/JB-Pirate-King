@@ -2,12 +2,11 @@
 AIS LSTM Autoencoder 학습 스크립트
 
 입력: ais_preprocessed.csv
-출력: model.pt, scaler.pkl, threshold.txt
+출력: model.onnx, scaler.json, threshold.txt
 """
 
 import csv
 import math
-import pickle
 import json
 from collections import defaultdict
 
@@ -17,12 +16,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 # ── 설정 ──────────────────────────────────────────────────────────
-INPUT_FILE   = "ais_preprocessed.csv"
-MODEL_FILE   = "model.pt"
-SCALER_FILE  = "scaler.pkl"
+INPUT_FILE     = "ais_preprocessed.csv"
 THRESHOLD_FILE = "threshold.txt"
 
-FEATURES     = ["sog", "cog", "dt", "dist_km"]
+FEATURES     = ["sog", "cog", "heading", "status", "dt", "dist_km"]
 SEQ_LEN      = 10
 HIDDEN_SIZE  = 64
 NUM_LAYERS   = 2
@@ -30,7 +27,7 @@ BATCH_SIZE   = 256
 EPOCHS       = 10
 LR           = 0.001
 THRESHOLD_PERCENTILE = 95
-SAMPLE_MMSI  = 100
+SAMPLE_MMSI  = 500
 SEQ_BREAK_DT = 3600  # dt가 1시간 이상이면 시퀀스 끊기
 
 # ── 정규화 (Min-Max Scaler) ───────────────────────────────────────
@@ -157,10 +154,6 @@ def main():
     scaler.fit(flat)
     scaled_sequences = [scaler.transform(seq) for seq in sequences]
 
-    with open(SCALER_FILE, "wb") as f:
-        pickle.dump(scaler, f)
-    print(f"  스케일러 저장: {SCALER_FILE}")
-
     # C++ 추론용 스케일러 JSON 저장
     SCALER_JSON_FILE = "scaler.json"
     scaler_json = {
@@ -205,16 +198,6 @@ def main():
 
         avg_loss = total_loss / len(loader)
         pbar.set_postfix(avg_loss=f"{avg_loss:.6f}")
-
-    torch.save(model.state_dict(), MODEL_FILE)
-    print(f"  모델 저장: {MODEL_FILE}")
-
-    # TorchScript 변환 및 저장
-    TORCHSCRIPT_FILE = "model_scripted.pt"
-    model.eval()
-    scripted = torch.jit.script(model)
-    scripted.save(TORCHSCRIPT_FILE)
-    print(f"  TorchScript 모델 저장: {TORCHSCRIPT_FILE}")
 
     # ONNX 변환 및 저장
     ONNX_FILE = "model.onnx"
