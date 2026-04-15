@@ -1,2 +1,13 @@
 ais_ids_pi/build
 ais_ids_pi/po
+
+ml/threshold.txt
+ml/scaler.json
+ml/model.onnx
+ml/*.csv
+
+ais_ids_pi/data/model.onnx
+ais_ids_pi/data/scaler.json
+ais_ids_pi/data/threshold.txt
+
+aivdm_gen/*.csv

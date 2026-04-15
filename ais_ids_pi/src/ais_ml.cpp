@@ -82,10 +82,10 @@ bool AIS_ML::LoadThreshold(const std::string &path, std::string &error_msg)
     }
 }
 
-void AIS_ML::PushFeature(int mmsi, float sog, float cog,
-                         float dt, float dist_km)
+void AIS_ML::PushFeature(int mmsi, float sog, float cog, float heading,
+                         float status, float dt, float dist_km)
 {
-    std::array<float, ML_FEATURE_COUNT> feat = {sog, cog, dt, dist_km};
+    std::array<float, ML_FEATURE_COUNT> feat = {sog, cog, heading, status, dt, dist_km};
     auto &seq = m_sequences[mmsi];
     seq.push_back(feat);
     if ((int)seq.size() > ML_SEQ_LEN)
