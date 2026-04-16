@@ -8,8 +8,9 @@
 #include <unordered_map>
 #include <fstream>
 
-// 피처 순서: sog, cog, heading, status, dt, dist_km, expected_dist_km, bearing_cog_diff, cog_hdg_diff
-#define ML_FEATURE_COUNT 9
+// 피처 순서: sog, cog, heading, status, dt, dist_km, expected_dist_km, bearing_cog_diff,
+//           cog_hdg_diff, sog_change, cog_change, status_sog_product, dist_expected_ratio
+#define ML_FEATURE_COUNT 13
 #define ML_SEQ_LEN       10
 
 struct MLScaler {
