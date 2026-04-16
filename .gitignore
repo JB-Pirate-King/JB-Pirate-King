@@ -6,8 +6,4 @@ ml/scaler.json
 ml/model.onnx
 ml/*.csv
 
-ais_ids_pi/data/model.onnx
-ais_ids_pi/data/scaler.json
-ais_ids_pi/data/threshold.txt
-
 aivdm_gen/*.csv
