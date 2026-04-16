@@ -33,6 +33,9 @@ struct AISTarget {
 
     // 수신 시간
     time_t   rxTime    = 0;
+
+    // 수신 시 계산된 파생값
+    float    dist_km   = 0.0f;
 };
 
 class AIS_Parser

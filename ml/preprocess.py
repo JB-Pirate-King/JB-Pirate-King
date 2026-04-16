@@ -12,7 +12,6 @@ AIS 데이터 전처리 스크립트
 import csv
 import math
 import os
-import subprocess
 from datetime import datetime
 
 # ── 설정 ──────────────────────────────────────────────────────────
@@ -55,9 +54,15 @@ def fill_missing(rows: list) -> list:
 def add_derived_features(rows: list) -> list:
     for i, row in enumerate(rows):
         if i == 0:
-            row["dt"] = 0.0
-            row["dist_km"] = 0.0
-            row["cog_hdg_diff"] = 0.0
+            row["dt"]               = 0.0
+            row["dist_km"]          = 0.0
+            row["cog_hdg_diff"]     = 0.0
+            row["expected_dist_km"]   = 0.0
+            row["bearing_cog_diff"]   = -1.0
+            row["sog_change"]         = 0.0
+            row["cog_change"]         = 0.0
+            row["status_sog_product"] = 0.0
+            row["dist_expected_ratio"]= 1.0
             continue
         prev = rows[i - 1]
 
@@ -93,6 +98,65 @@ def add_derived_features(rows: list) -> list:
         except Exception:
             row["cog_hdg_diff"] = -1.0
 
+        # expected_dist_km: sog(knot) x dt(sec) / 3600 x 1.852
+        try:
+            sog = float(row["sog"])
+            dt  = float(row["dt"])
+            row["expected_dist_km"] = round(sog * dt / 3600.0 * 1.852, 4)
+        except Exception:
+            row["expected_dist_km"] = 0.0
+
+        # bearing_cog_diff: 실제 GPS 이동 방향 vs COG 차이
+        # sog < 0.5 이면 노이즈가 크므로 -1 처리
+        try:
+            sog = float(row["sog"])
+            if sog < 0.5:
+                row["bearing_cog_diff"] = -1.0
+            else:
+                lat1 = math.radians(float(prev["latitude"]))
+                lat2 = math.radians(float(row["latitude"]))
+                dlon = math.radians(float(row["longitude"]) - float(prev["longitude"]))
+                bearing = math.degrees(math.atan2(
+                    math.sin(dlon) * math.cos(lat2),
+                    math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+                )) % 360.0
+                diff = abs(bearing - float(row["cog"]))
+                if diff > 180.0:
+                    diff = 360.0 - diff
+                row["bearing_cog_diff"] = round(diff, 1)
+        except Exception:
+            row["bearing_cog_diff"] = -1.0
+
+        # sog_change: 이전 대비 SOG 변화량
+        try:
+            row["sog_change"] = round(abs(float(row["sog"]) - float(prev["sog"])), 4)
+        except Exception:
+            row["sog_change"] = 0.0
+
+        # cog_change: 이전 대비 COG 변화량 (0~180 범위)
+        try:
+            diff = abs(float(row["cog"]) - float(prev["cog"]))
+            if diff > 180.0:
+                diff = 360.0 - diff
+            row["cog_change"] = round(diff, 4)
+        except Exception:
+            row["cog_change"] = 0.0
+
+        # status_sog_product: 정박 상태(status=1)이면서 이동 시 큰 값
+        try:
+            row["status_sog_product"] = round(float(row["status"]) * float(row["sog"]), 4)
+        except Exception:
+            row["status_sog_product"] = 0.0
+
+        # dist_expected_ratio: 실제 이동거리 / 예상 이동거리
+        # 1에 가까우면 정상, 크게 벗어나면 이상
+        try:
+            expected = float(row["expected_dist_km"])
+            actual   = float(row["dist_km"])
+            row["dist_expected_ratio"] = round(actual / (expected + 1e-6), 4)
+        except Exception:
+            row["dist_expected_ratio"] = 1.0
+
     return rows
 
 # ── 위치 점프 필터 ────────────────────────────────────────────────
@@ -107,6 +171,7 @@ def has_position_jump(rows: list) -> bool:
         except (ValueError, KeyError):
             pass
     return False
+
 def has_invalid(rows: list) -> bool:
     for row in rows:
         try:
@@ -124,11 +189,13 @@ def has_invalid(rows: list) -> bool:
 def main():
     print("[1/5] CSV 파싱 및 임시 파일 저장 중 (스트리밍)...")
     TEMP_FILE = "ais_temp_sorted.csv"
-    out_cols = USE_COLS + ["dt", "dist_km", "cog_hdg_diff"]
+    out_cols  = USE_COLS + ["dt", "dist_km", "cog_hdg_diff",
+                            "expected_dist_km", "bearing_cog_diff",
+                            "sog_change", "cog_change",
+                            "status_sog_product", "dist_expected_ratio"]
     header = None
-    total = 0
+    total  = 0
 
-    # 임시 파일에 파싱된 데이터 저장 (mmsi 기준 정렬 위해)
     with open(TEMP_FILE, "w", newline="", encoding="utf-8") as tmp:
         writer = csv.DictWriter(tmp, fieldnames=USE_COLS, extrasaction="ignore")
         writer.writeheader()
@@ -142,18 +209,17 @@ def main():
             values = line.split(",")
             if len(values) != len(header):
                 continue
-            row = {header[i]: values[i].strip() for i in range(len(header))}
+            row  = {header[i]: values[i].strip() for i in range(len(header))}
             mmsi = row.get("mmsi", "")
             if not mmsi:
                 continue
-            # 이상값 빠른 필터
             try:
                 lat = float(row.get("latitude", ""))
                 lon = float(row.get("longitude", ""))
                 sog = float(row.get("sog", "0") or "0")
-                if not (-90 <= lat <= 90): continue
+                if not (-90 <= lat <= 90):   continue
                 if not (-180 <= lon <= 180): continue
-                if sog < 0: continue
+                if sog < 0:                  continue
             except ValueError:
                 continue
             writer.writerow({col: row.get(col, "") for col in USE_COLS})
@@ -164,12 +230,10 @@ def main():
     print(f"      총 {total:,} 행 저장")
 
     print("[2/5] MMSI 기준 정렬 중...")
-    # 헤더 읽기
     with open(TEMP_FILE, "r", encoding="utf-8") as f:
         header_line = f.readline()
         rows = f.readlines()
 
-    # MMSI(숫자) → base_date_time 순 정렬
     def sort_key(line):
         parts = line.split(",", 2)
         try:
@@ -189,11 +253,11 @@ def main():
     print("      정렬 완료")
 
     print("[3/5] MMSI별 전처리 및 출력 저장 중...")
-    skipped = 0
+    skipped      = 0
     output_count = 0
     current_mmsi = None
     current_rows = []
-    skip_log = []  # (mmsi, 이유) 목록
+    skip_log     = []
 
     def process_and_write(rows, writer, mmsi):
         if len(rows) < MIN_SEQ_LEN:
@@ -231,7 +295,6 @@ def main():
             else:
                 current_rows.append(row)
 
-        # 마지막 MMSI 처리
         if current_rows:
             n = process_and_write(current_rows, writer, current_mmsi)
             if n == 0:
@@ -239,19 +302,29 @@ def main():
             else:
                 output_count += n
 
-    import os
     os.remove(TEMP_FILE)
 
-    # 제거 로그 저장
     SKIP_LOG_FILE = "ais_skip_log.csv"
     with open(SKIP_LOG_FILE, "w", newline="", encoding="utf-8") as f:
         log_writer = csv.writer(f)
         log_writer.writerow(["mmsi", "reason"])
         log_writer.writerows(skip_log)
 
-    print(f"      제거된 MMSI: {skipped:,}")
-    print(f"      출력 행 수: {output_count:,}")
-    print(f"      제거 로그: {SKIP_LOG_FILE}")
+    total_mmsi   = skipped + (output_count > 0 and 1 or 0)  # 근사치 대신 직접 카운트
+    # 실제 출력 MMSI 수 카운트
+    output_mmsi = 0
+    with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        seen = set()
+        for row in reader:
+            seen.add(row.get("mmsi", ""))
+        output_mmsi = len(seen)
+
+    print(f"      전체 MMSI:    {output_mmsi + skipped:,}")
+    print(f"      출력 MMSI:    {output_mmsi:,}")
+    print(f"      제거된 MMSI:  {skipped:,}")
+    print(f"      출력 행 수:   {output_count:,}")
+    print(f"      제거 로그:    {SKIP_LOG_FILE}")
     print(f"[4/5] 저장 완료: {OUTPUT_FILE}")
     print("[5/5] 완료!")
 

@@ -49,10 +49,58 @@ void ais_ids::to_snapshot(AISTarget &target)
                     * std::sin(dLon/2)  * std::sin(dLon/2);
         float dist_km = (float)(6371.0 * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1-a)));
 
+        // expected_dist_km: SOG(knot) x dt(sec) / 3600 x 1.852
+        float expected_dist_km = (float)(cur.sog * dt / 3600.0 * 1.852);
+
+        // bearing_cog_diff: 실제 GPS 이동 방향 vs COG 차이
+        // SOG < 0.5 이면 노이즈가 크므로 -1 처리
+        float bearing_cog_diff = -1.0f;
+        if (cur.sog >= 0.5) {
+            double lat1r = prev.lat * M_PI / 180.0;
+            double lat2r = cur.lat  * M_PI / 180.0;
+            double dLonr = (cur.lon - prev.lon) * M_PI / 180.0;
+            double bearing = std::fmod(
+                std::atan2(
+                    std::sin(dLonr) * std::cos(lat2r),
+                    std::cos(lat1r) * std::sin(lat2r)
+                        - std::sin(lat1r) * std::cos(lat2r) * std::cos(dLonr)
+                ) * 180.0 / M_PI + 360.0,
+                360.0
+            );
+            double diff = std::abs(bearing - cur.cog);
+            if (diff > 180.0) diff = 360.0 - diff;
+            bearing_cog_diff = (float)diff;
+        }
+
+        // cog_hdg_diff: COG vs HDG 차이 (HDG=511이면 미정의 → -1)
+        float cog_hdg_diff = -1.0f;
+        if (cur.hdg < 511) {
+            double diff = std::abs(cur.cog - (double)cur.hdg);
+            if (diff > 180.0) diff = 360.0 - diff;
+            cog_hdg_diff = (float)diff;
+        }
+
+        // sog_change
+        float sog_change = std::abs((float)cur.sog - (float)prev.sog);
+
+        // cog_change
+        float cog_diff_val = std::abs(cur.cog - prev.cog);
+        if (cog_diff_val > 180.0) cog_diff_val = 360.0 - cog_diff_val;
+        float cog_change = (float)cog_diff_val;
+
+        // status_sog_product
+        float status_sog_product = (float)cur.navStatus * (float)cur.sog;
+
+        // dist_expected_ratio
+        float dist_expected_ratio = dist_km / (expected_dist_km + 1e-6f);
+
         ais_ml->PushFeature(target.mmsi,
             (float)cur.sog, (float)cur.cog,
             (float)cur.hdg, (float)cur.navStatus,
-            dt, dist_km);
+            dt, dist_km,
+            expected_dist_km, bearing_cog_diff,
+            cog_hdg_diff, sog_change, cog_change,
+            status_sog_product, dist_expected_ratio);
     }
 }
 
