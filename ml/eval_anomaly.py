@@ -205,6 +205,129 @@ def make_position_jump_seq():
     return seq
 
 
+# ── FN 시나리오 (aivdm_gen 회피 케이스) ─────────────
+def make_fn_dt_jump_seq():
+    """[FN-1] dt 구간 점프: 전송 간격 61~299초로 위치/속도 급변
+    → 룰 기반 Check 5/6/7 모두 회피."""
+    sog = random.uniform(5.0, 12.0)
+    cog = random.uniform(0, 360)
+    seq = []
+    lat, lon = 37.0, 126.0
+    prev_sog, prev_cog = sog, cog
+    for i in range(SEQ_LEN):
+        dt = random.uniform(61, 299)
+        direction = random.uniform(0, 360)
+        jump = random.uniform(0.08, 0.20)
+        dist_km = jump * 111.0
+        lat += math.cos(math.radians(direction)) * jump
+        lon += math.sin(math.radians(direction)) * jump
+        sog = random.choice([2.0, 18.0, 3.0, 20.0])
+        cog = random.uniform(0, 360)
+        hdg = int(cog)
+        cog_hdg_diff = 0.0
+        expected_dist = sog * dt / 3600 * 1.852
+        sog_change = abs(sog - prev_sog)
+        cog_change = 0.0
+        status_sog_product = 0.0
+        dist_expected_ratio = dist_km / (expected_dist + 1e-6)
+        seq.append([sog, cog, hdg, 0, dt, dist_km, expected_dist, 0.0, cog_hdg_diff,
+                    sog_change, cog_change, status_sog_product, dist_expected_ratio])
+        prev_sog, prev_cog = sog, cog
+    return seq
+
+
+def make_fn_speed_ramp_seq():
+    """[FN-2] 속도 단계 상승: 매번 9.5kn씩 증가 → Check 5(Δ>10) 회피"""
+    ramp_start = 2.0
+    ramp_step  = 9.5
+    ramp_max   = 29.0
+    cog = random.uniform(0, 360)
+    sog = ramp_start
+    seq = []
+    lat, lon = 37.0, 126.0
+    prev_sog = sog
+    for i in range(SEQ_LEN):
+        dt = random.uniform(30, 55)
+        dist_km = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist_km / 111.0
+        lon += math.sin(math.radians(cog)) * dist_km / 111.0
+        hdg = int(cog)
+        cog_hdg_diff = 0.0
+        expected_dist = sog * dt / 3600 * 1.852
+        sog_change = abs(sog - prev_sog)
+        cog_change = 0.0
+        status_sog_product = 0.0
+        dist_expected_ratio = dist_km / (expected_dist + 1e-6)
+        seq.append([sog, cog, hdg, 0, dt, dist_km, expected_dist, 0.0, cog_hdg_diff,
+                    sog_change, cog_change, status_sog_product, dist_expected_ratio])
+        prev_sog = sog
+        sog = min(sog + ramp_step, ramp_max)
+        if sog >= ramp_max:
+            sog = ramp_start
+    return seq
+
+
+def make_fn_cog_border_seq():
+    """[FN-3] COG/HDG 경계값: 불일치 91~99도 → Check 4(>100) 회피"""
+    sog = random.uniform(3.0, 10.0)
+    cog = random.uniform(0, 360)
+    mismatch = random.uniform(91, 99)
+    seq = []
+    lat, lon = 37.0, 126.0
+    prev_sog, prev_cog = sog, cog
+    for i in range(SEQ_LEN):
+        dt = random.uniform(10, 30)
+        dist_km = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist_km / 111.0
+        lon += math.sin(math.radians(cog)) * dist_km / 111.0
+        hdg = int((cog + mismatch) % 360)
+        cog_hdg_diff = abs(cog - hdg)
+        if cog_hdg_diff > 180: cog_hdg_diff = 360 - cog_hdg_diff
+        expected_dist = sog * dt / 3600 * 1.852
+        sog_change = abs(sog - prev_sog)
+        cog_diff = abs(cog - prev_cog)
+        if cog_diff > 180: cog_diff = 360 - cog_diff
+        status_sog_product = 0.0
+        dist_expected_ratio = dist_km / (expected_dist + 1e-6)
+        seq.append([sog, cog, hdg, 0, dt, dist_km, expected_dist, 0.0, cog_hdg_diff,
+                    sog_change, cog_diff, status_sog_product, dist_expected_ratio])
+        prev_sog, prev_cog = sog, cog
+        if random.random() < 0.1:
+            cog = (cog + random.uniform(-10, 10)) % 360
+    return seq
+
+
+def make_fn_nav_status_seq():
+    """[FN-4] navStatus 회피: status=2/3/7/8/11/12 이면서 이동
+    → Check 3은 status=1/5/6만 검사 → 탐지 안됨."""
+    unchecked = [2, 3, 7, 8, 11, 12]
+    status = random.choice(unchecked)
+    sog = random.uniform(0.5, 5.0)
+    cog = random.uniform(0, 360)
+    seq = []
+    lat, lon = 37.0, 126.0
+    prev_sog, prev_cog = sog, cog
+    for i in range(SEQ_LEN):
+        dt = random.uniform(10, 30)
+        dist_km = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist_km / 111.0
+        lon += math.sin(math.radians(cog)) * dist_km / 111.0
+        hdg = int(cog)
+        cog_hdg_diff = 0.0
+        expected_dist = sog * dt / 3600 * 1.852
+        sog_change = abs(sog - prev_sog)
+        cog_diff = abs(cog - prev_cog)
+        if cog_diff > 180: cog_diff = 360 - cog_diff
+        status_sog_product = status * sog
+        dist_expected_ratio = dist_km / (expected_dist + 1e-6)
+        seq.append([sog, cog, hdg, status, dt, dist_km, expected_dist, 0.0, cog_hdg_diff,
+                    sog_change, cog_diff, status_sog_product, dist_expected_ratio])
+        prev_sog, prev_cog = sog, cog
+        if random.random() < 0.05:
+            cog = (cog + random.uniform(-15, 15)) % 360
+    return seq
+
+
 # ── 메인 ─────────────────────────────────────────
 
 
@@ -229,6 +352,10 @@ def main():
         ("정박 이동",       [make_anchor_move_seq()       for _ in range(N)]),
         ("속도 이상",       [make_speed_spike_seq()       for _ in range(N)]),
         ("위치 점프",       [make_position_jump_seq()     for _ in range(N)]),
+        ("FN1-dt점프",     [make_fn_dt_jump_seq()        for _ in range(N)]),
+        ("FN2-속도단계",   [make_fn_speed_ramp_seq()     for _ in range(N)]),
+        ("FN3-COG경계",   [make_fn_cog_border_seq()     for _ in range(N)]),
+        ("FN4-status회피", [make_fn_nav_status_seq()     for _ in range(N)]),
     ]
 
     ne = np.array(normal_errors)

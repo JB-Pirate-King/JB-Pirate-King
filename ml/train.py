@@ -14,6 +14,7 @@ AIS LSTM Autoencoder 학습 스크립트
 import csv
 import json
 import random
+import time
 from collections import defaultdict
 
 import torch
@@ -304,18 +305,22 @@ def calc_threshold(model, loader, device) -> float:
 
 # ── 메인 ──────────────────────────────────────────────────────────
 def main():
+    t_start = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[디바이스] {device}")
 
     # 1. 데이터 로드
+    _t1 = time.time()
     print("[1/6] 데이터 로드...")
     mmsi_data = load_data(INPUT_FILE)
 
     # 2. 시퀀스 생성
+    _t2 = time.time()
     print("[2/6] 시퀀스 생성...")
     sequences = make_sequences(mmsi_data)
 
     # 3. 정규화
+    _t3 = time.time()
     print("[3/6] 정규화...")
     flat   = [row for seq in sequences for row in seq]
     scaler = MinMaxScaler()
@@ -328,6 +333,7 @@ def main():
     print(f"  스케일러 저장: {SCALER_FILE}")
 
     # 4. Dataset / DataLoader (train / val 분리)
+    _t4 = time.time()
     print("[4/6] 학습 준비...")
     tensor   = torch.tensor(scaled, dtype=torch.float32)
     dataset  = TensorDataset(tensor)
@@ -342,6 +348,7 @@ def main():
     print(f"  학습: {n_train:,}  검증: {n_val:,}")
 
     # 5. 학습 + ONNX 변환
+    _t5 = time.time()
     print("[5/6] 학습 시작...")
     model = LSTMAutoencoder(
         input_size=len(FEATURES),
@@ -352,13 +359,25 @@ def main():
     export_onnx(model, device)
 
     # 6. 임계값 계산 (train 셋 오차 분포 기준, 검증 셋 누수 방지)
+    _t6 = time.time()
     print("[6/6] 임계값 계산...")
     threshold = calc_threshold(model, train_loader, device)
     with open(THRESHOLD_FILE, "w") as f:
         f.write(str(threshold))
     print(f"  임계값: {threshold:.6f}  (상위 {100 - THRESHOLD_PERCENTILE}%)")
     print(f"  임계값 저장: {THRESHOLD_FILE}")
+    t_end = time.time()
     print("완료!")
+    print("")
+    print(f"  [소요 시간]")
+    print(f"  데이터 로드:   {_t2-_t1:6.1f}s")
+    print(f"  시퀀스 생성:   {_t3-_t2:6.1f}s")
+    print(f"  정규화:        {_t4-_t3:6.1f}s")
+    print(f"  학습 준비:     {_t5-_t4:6.1f}s")
+    print(f"  학습+ONNX:     {_t6-_t5:6.1f}s")
+    print(f"  임계값 계산:   {t_end-_t6:6.1f}s")
+    print(f"  ─────────────────────")
+    print(f"  전체:          {t_end-t_start:6.1f}s")
 
 
 if __name__ == "__main__":
