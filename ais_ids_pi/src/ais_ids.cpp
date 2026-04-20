@@ -49,11 +49,10 @@ void ais_ids::to_snapshot(AISTarget &target)
                     * std::sin(dLon/2)  * std::sin(dLon/2);
         float dist_km = (float)(6371.0 * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1-a)));
 
-        // expected_dist_km: SOG(knot) x dt(sec) / 3600 x 1.852
+        // expected_dist_km
         float expected_dist_km = (float)(cur.sog * dt / 3600.0 * 1.852);
 
-        // bearing_cog_diff: 실제 GPS 이동 방향 vs COG 차이
-        // SOG < 0.5 이면 노이즈가 크므로 -1 처리
+        // bearing_cog_diff
         float bearing_cog_diff = -1.0f;
         if (cur.sog >= 0.5) {
             double lat1r = prev.lat * M_PI / 180.0;
@@ -72,7 +71,7 @@ void ais_ids::to_snapshot(AISTarget &target)
             bearing_cog_diff = (float)diff;
         }
 
-        // cog_hdg_diff: COG vs HDG 차이 (HDG=511이면 미정의 → -1)
+        // cog_hdg_diff
         float cog_hdg_diff = -1.0f;
         if (cur.hdg < 511) {
             double diff = std::abs(cur.cog - (double)cur.hdg);
@@ -88,11 +87,58 @@ void ais_ids::to_snapshot(AISTarget &target)
         if (cog_diff_val > 180.0) cog_diff_val = 360.0 - cog_diff_val;
         float cog_change = (float)cog_diff_val;
 
-        // status_sog_product
-        float status_sog_product = (float)cur.navStatus * (float)cur.sog;
+        // sog_status_ratio
+        static const float STATUS_MAX_SOG[] = {
+            30.0f, 1.0f, 5.0f, 10.0f, 10.0f, 1.0f, 5.0f, 15.0f, 15.0f,
+        };
+        int status_idx = (int)cur.navStatus;
+        float max_sog  = (status_idx >= 0 && status_idx <= 8)
+                         ? STATUS_MAX_SOG[status_idx] : 30.0f;
+        float sog_status_ratio = (max_sog > 0.0f)
+                                 ? (float)cur.sog / max_sog : 0.0f;
 
         // dist_expected_ratio
         float dist_expected_ratio = dist_km / (expected_dist_km + 1e-6f);
+
+        // cog_hdg_change
+        float cog_hdg_change = 0.0f;
+        {
+            float prev_cog_hdg_diff = -1.0f;
+            if (prev.hdg < 511) {
+                double d = std::abs(prev.cog - (double)prev.hdg);
+                if (d > 180.0) d = 360.0 - d;
+                prev_cog_hdg_diff = (float)d;
+            }
+            if (cog_hdg_diff >= 0.0f && prev_cog_hdg_diff >= 0.0f)
+                cog_hdg_change = std::abs(cog_hdg_diff - prev_cog_hdg_diff);
+        }
+
+        // cog_hdg_std
+        float cog_hdg_std = 0.0f;
+        {
+            std::vector<float> chd_vals;
+            chd_vals.reserve(ML_SEQ_LEN);
+            auto &hist = ais_history[target.mmsi];
+            int start = (int)hist.size() - ML_SEQ_LEN;
+            if (start < 0) start = 0;
+            for (int hi = start; hi < (int)hist.size(); ++hi) {
+                if (hist[hi].hdg < 511) {
+                    double d = std::abs(hist[hi].cog - (double)hist[hi].hdg);
+                    if (d > 180.0) d = 360.0 - d;
+                    chd_vals.push_back((float)d);
+                } else {
+                    chd_vals.push_back(0.0f);
+                }
+            }
+            if (chd_vals.size() >= 2) {
+                float mean = 0.0f;
+                for (float v : chd_vals) mean += v;
+                mean /= (float)chd_vals.size();
+                float var = 0.0f;
+                for (float v : chd_vals) var += (v - mean) * (v - mean);
+                cog_hdg_std = std::sqrt(var / (float)(chd_vals.size() - 1));
+            }
+        }
 
         ais_ml->PushFeature(target.mmsi,
             (float)cur.sog, (float)cur.cog,
@@ -100,7 +146,8 @@ void ais_ids::to_snapshot(AISTarget &target)
             dt, dist_km,
             expected_dist_km, bearing_cog_diff,
             cog_hdg_diff, sog_change, cog_change,
-            status_sog_product, dist_expected_ratio);
+            sog_status_ratio, dist_expected_ratio,
+            cog_hdg_change, cog_hdg_std);
     }
 }
 
