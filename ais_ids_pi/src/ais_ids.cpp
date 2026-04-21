@@ -49,28 +49,6 @@ void ais_ids::to_snapshot(AISTarget &target)
                     * std::sin(dLon/2)  * std::sin(dLon/2);
         float dist_km = (float)(6371.0 * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1-a)));
 
-        // expected_dist_km
-        float expected_dist_km = (float)(cur.sog * dt / 3600.0 * 1.852);
-
-        // bearing_cog_diff
-        float bearing_cog_diff = -1.0f;
-        if (cur.sog >= 0.5) {
-            double lat1r = prev.lat * M_PI / 180.0;
-            double lat2r = cur.lat  * M_PI / 180.0;
-            double dLonr = (cur.lon - prev.lon) * M_PI / 180.0;
-            double bearing = std::fmod(
-                std::atan2(
-                    std::sin(dLonr) * std::cos(lat2r),
-                    std::cos(lat1r) * std::sin(lat2r)
-                        - std::sin(lat1r) * std::cos(lat2r) * std::cos(dLonr)
-                ) * 180.0 / M_PI + 360.0,
-                360.0
-            );
-            double diff = std::abs(bearing - cur.cog);
-            if (diff > 180.0) diff = 360.0 - diff;
-            bearing_cog_diff = (float)diff;
-        }
-
         // cog_hdg_diff
         float cog_hdg_diff = -1.0f;
         if (cur.hdg < 511) {
@@ -81,24 +59,6 @@ void ais_ids::to_snapshot(AISTarget &target)
 
         // sog_change
         float sog_change = std::abs((float)cur.sog - (float)prev.sog);
-
-        // cog_change
-        float cog_diff_val = std::abs(cur.cog - prev.cog);
-        if (cog_diff_val > 180.0) cog_diff_val = 360.0 - cog_diff_val;
-        float cog_change = (float)cog_diff_val;
-
-        // sog_status_ratio
-        static const float STATUS_MAX_SOG[] = {
-            30.0f, 1.0f, 5.0f, 10.0f, 10.0f, 1.0f, 5.0f, 15.0f, 15.0f,
-        };
-        int status_idx = (int)cur.navStatus;
-        float max_sog  = (status_idx >= 0 && status_idx <= 8)
-                         ? STATUS_MAX_SOG[status_idx] : 30.0f;
-        float sog_status_ratio = (max_sog > 0.0f)
-                                 ? (float)cur.sog / max_sog : 0.0f;
-
-        // dist_expected_ratio
-        float dist_expected_ratio = dist_km / (expected_dist_km + 1e-6f);
 
         // cog_hdg_change
         float cog_hdg_change = 0.0f;
@@ -140,14 +100,33 @@ void ais_ids::to_snapshot(AISTarget &target)
             }
         }
 
+        // speed_consistency: 실제 이동거리 / SOG 기반 예상 거리 (정상 ≈ 1.0)
+        float speed_consistency = 1.0f;
+        if (cur.sog >= 0.1f) {
+            float expected = (float)(cur.sog * dt / 3600.0 * 1.852);
+            speed_consistency = dist_km / (expected + 1e-6f);
+        }
+
+        // sog_consistency: GPS 실제 속도 / 보고된 SOG (정상 ≈ 1.0)
+        float sog_consistency = 1.0f;
+        {
+            float dt_h    = dt / 3600.0f;
+            float gps_spd = dist_km / (dt_h * 1.852f + 1e-6f);
+            sog_consistency = gps_spd / ((float)cur.sog + 1e-6f);
+        }
+
+        // lat_speed / lon_speed: 위도/경도 방향 변화율 (도/초)
+        float lat_speed = (float)((cur.lat - prev.lat) / (dt + 1e-6));
+        float lon_speed = (float)((cur.lon - prev.lon) / (dt + 1e-6));
+
         ais_ml->PushFeature(target.mmsi,
             (float)cur.sog, (float)cur.cog,
             (float)cur.hdg, (float)cur.navStatus,
             dt, dist_km,
-            expected_dist_km, bearing_cog_diff,
-            cog_hdg_diff, sog_change, cog_change,
-            sog_status_ratio, dist_expected_ratio,
-            cog_hdg_change, cog_hdg_std);
+            cog_hdg_diff, sog_change,
+            cog_hdg_change, cog_hdg_std,
+            speed_consistency, sog_consistency,
+            lat_speed, lon_speed);
     }
 }
 

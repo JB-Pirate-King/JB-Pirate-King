@@ -1,334 +1,719 @@
 """
-AIS LSTM Autoencoder 학습 스크립트
+이상 신호 MSE 측정 + 피처 분석 스크립트
 
-입력: ais_preprocessed.csv
-출력: model.onnx, scaler.json, threshold.txt
+[분석 1] 탐지율/오탐율 테이블
+[분석 2] 피처 간 상관행렬 (Pearson)
+[분석 3] 시나리오별 재구성 오차 분해 (피처별 MSE)
+[분석 4] Permutation Importance
 
-피처 변경 (v3):
-  - status_sog_product 제거
-  - sog_status_ratio, cog_hdg_change, cog_hdg_std 추가
-  - 총 피처: 13 → 15
+사용법:
+    python eval_anomaly.py              # 전체 실행
+    python eval_anomaly.py --corr       # 상관행렬만
+    python eval_anomaly.py --recon      # 재구성 오차 분해만
+    python eval_anomaly.py --perm       # Permutation Importance만
+
+피처 (14개):
+    sog, cog, heading, status,
+    dt, dist_km,
+    cog_hdg_diff, sog_change, cog_hdg_change, cog_hdg_std,
+    speed_consistency, sog_consistency,
+    lat_speed, lon_speed
 """
 
-import csv
+import argparse
 import json
+import math
 import random
-import time
-from collections import defaultdict
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset, random_split
+import statistics
+import numpy as np
+import onnxruntime as ort
+from collections import deque
 from tqdm import tqdm
 
-# ── 설정 ──────────────────────────────────────────────────────────
-INPUT_FILE     = "ais-2025-12-31_preprocessed.csv"
-ONNX_FILE      = "model.onnx"
-SCALER_FILE    = "scaler.json"
-THRESHOLD_FILE = "threshold.txt"
+# matplotlib — 없으면 저장만, 없어도 텍스트 출력은 됨
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+    _korean_fonts = [f.name for f in fm.fontManager.ttflist
+                     if any(k in f.name for k in ["Malgun", "NanumGothic", "AppleGothic", "Noto Sans CJK"])]
+    if _korean_fonts:
+        plt.rcParams["font.family"] = _korean_fonts[0]
+    plt.rcParams["axes.unicode_minus"] = False
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
 
+
+def rjust(s: str, width: int) -> str:
+    display_len = sum(2 if 0xAC00 <= ord(c) <= 0xD7A3 or
+                         0x3130 <= ord(c) <= 0x318F else 1 for c in s)
+    return " " * max(width - display_len, 0) + s
+
+
+# ── 설정 ──────────────────────────────────────────────────────────
 FEATURES = [
     "sog", "cog", "heading", "status",
-    "dt", "dist_km", "expected_dist_km",
-    "bearing_cog_diff", "cog_hdg_diff",
-    "sog_change", "cog_change",
-    "sog_status_ratio",     # 신규
-    "dist_expected_ratio",
-    "cog_hdg_change",       # 신규
-    "cog_hdg_std",          # 신규
+    "dt", "dist_km",
+    "cog_hdg_diff", "sog_change",
+    "cog_hdg_change", "cog_hdg_std",
+    "speed_consistency", "sog_consistency",
+    "lat_speed", "lon_speed",
 ]
-
-SEQ_LEN      = 10       # C++ 쪽 ML_SEQ_LEN 과 반드시 일치
-HIDDEN_SIZE  = 64
-NUM_LAYERS   = 2
-BATCH_SIZE   = 256
-EPOCHS       = 30
-LR           = 0.001
-PATIENCE     = 5
-VAL_RATIO    = 0.1
-THRESHOLD_PERCENTILE = 95
-SAMPLE_MMSI  = None  # None이면 전체 MMSI 사용, 숫자면 해당 개수만큼 랜덤 샘플링
-SEQ_BREAK_DT = 600
-SEED         = 42
-
-random.seed(SEED)
-torch.manual_seed(SEED)
+SEQ_LEN        = 10
+MODEL_FILE     = "model.onnx"
+SCALER_FILE    = "scaler.json"
+THRESHOLD_FILE = "threshold.txt"
+DATA_FILE      = "ais_preprocessed.csv"   # 상관행렬용 실제 데이터
 
 
-# ── 정규화 (Min-Max Scaler) ───────────────────────────────────────
-class MinMaxScaler:
-    def __init__(self):
-        self.min_ = None
-        self.max_ = None
-
-    def fit(self, data: list):
-        n = len(data[0])
-        self.min_ = [min(row[i] for row in data) for i in range(n)]
-        self.max_ = [max(row[i] for row in data) for i in range(n)]
-
-    def transform(self, data: list) -> list:
-        result = []
-        for row in data:
-            scaled = []
-            for i, val in enumerate(row):
-                denom = self.max_[i] - self.min_[i]
-                scaled.append((val - self.min_[i]) / denom if denom != 0 else 0.0)
-            result.append(scaled)
-        return result
-
-    def fit_transform(self, data: list) -> list:
-        self.fit(data)
-        return self.transform(data)
 
 
-# ── LSTM Autoencoder ─────────────────────────────────────────────
-class LSTMAutoencoder(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers  = num_layers
+# ── 스케일러 ──────────────────────────────────────────────────────
+def load_scaler(path):
+    with open(path) as f:
+        j = json.load(f)
+    return j["min"], j["max"]
 
-        self.encoder = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.decoder = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.output_layer = nn.Linear(hidden_size, input_size)
-        self.start_token = nn.Parameter(torch.zeros(1, 1, input_size))
+def scale_val(val, mn, mx):
+    d = mx - mn
+    return (val - mn) / d if d != 0 else 0.0
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size = x.size(0)
-
-        _, (hidden, cell) = self.encoder(x)
-
-        dec_input  = self.start_token.expand(batch_size, 1, -1).clone()
-        dec_hidden = hidden
-        dec_cell   = cell
-
-        steps = []
-        for _t in range(x.size(1)):
-            out, (dec_hidden, dec_cell) = self.decoder(
-                dec_input, (dec_hidden, dec_cell)
-            )
-            step_out  = self.output_layer(out)
-            steps.append(step_out)
-            dec_input = step_out
-
-        return torch.cat(steps, dim=1)
+def scale_seq(seq, mins, maxs):
+    return [[scale_val(v, mins[i], maxs[i]) for i, v in enumerate(row)]
+            for row in seq]
 
 
-# ── 데이터 로드 ───────────────────────────────────────────────────
-def load_data(path: str) -> dict:
-    print(f"  데이터 로드 중: {path}")
-    mmsi_data = defaultdict(list)
+# ── ONNX 추론 ─────────────────────────────────────────────────────
+def infer(session, seq_scaled):
+    """MSE + 원본/재구성 배열 반환 — 오차 분해에 사용"""
+    x   = np.array(seq_scaled, dtype=np.float32)[np.newaxis]  # (1,SEQ,F)
+    out = session.run(None, {"x": x})[0]
+    mse = float(np.mean((out - x) ** 2))
+    return mse, x, out
 
-    with open(path, "r", encoding="utf-8") as f:
+def infer_mse(session, seq_scaled):
+    mse, _, _ = infer(session, seq_scaled)
+    return mse
+
+
+# ── 실제 정상 시퀀스 로더 ─────────────────────────────────────────
+def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
+    """
+    ais_preprocessed.csv 에서 슬라이딩 윈도우로 실제 정상 시퀀스를 추출.
+    n_seqs=None 이면 전체 반환.
+    파일이 없으면 None 반환 → 호출부에서 합성 시퀀스로 fallback.
+    """
+    import csv, os
+    if not os.path.exists(DATA_FILE):
+        return None
+
+    from collections import defaultdict
+    mmsi_rows = defaultdict(list)
+    with open(DATA_FILE, encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            mmsi = row.get("mmsi", "")
-            if not mmsi:
-                continue
+        for i, row in enumerate(reader):
+            if max_rows is not None and i >= max_rows:
+                break
             try:
-                record = [float(row[col]) for col in FEATURES]
-                mmsi_data[mmsi].append(record)
+                record = [float(row[feat]) for feat in FEATURES]
+                mmsi_rows[row["mmsi"]].append(record)
             except (ValueError, KeyError):
                 continue
 
-    print(f"  고유 MMSI: {len(mmsi_data):,}")
-
-    if SAMPLE_MMSI and len(mmsi_data) > SAMPLE_MMSI:
-        sampled_keys = random.sample(list(mmsi_data.keys()), SAMPLE_MMSI)
-        mmsi_data = {k: mmsi_data[k] for k in sampled_keys}
-        print(f"  샘플링 후 MMSI: {len(mmsi_data):,}")
-
-    return mmsi_data
-
-
-# ── 시퀀스 생성 (슬라이딩 윈도우) ────────────────────────────────
-def make_sequences(mmsi_data: dict) -> list:
-    dt_idx      = FEATURES.index("dt")
-    dist_km_idx = FEATURES.index("dist_km")
-    sequences   = []
-
-    for records in mmsi_data.values():
-        segments = []
-        current  = [records[0]]
+    # MMSI별 슬라이딩 윈도우로 시퀀스 생성
+    dt_idx = FEATURES.index("dt")
+    all_seqs = []
+    for records in mmsi_rows.values():
+        seg, current = [], [records[0]]
         for rec in records[1:]:
             if rec[dt_idx] >= SEQ_BREAK_DT:
-                segments.append(current)
-                rec = list(rec)
-                rec[dt_idx]      = 0.0
-                rec[dist_km_idx] = 0.0
-                current = [rec]
+                seg.append(current); current = [rec]
             else:
                 current.append(rec)
-        segments.append(current)
-
-        for seg in segments:
-            if len(seg) < SEQ_LEN:
+        seg.append(current)
+        for s in seg:
+            if len(s) < SEQ_LEN:
                 continue
-            for i in range(len(seg) - SEQ_LEN + 1):
-                sequences.append(seg[i : i + SEQ_LEN])
+            for i in range(len(s) - SEQ_LEN + 1):
+                all_seqs.append(s[i:i + SEQ_LEN])
 
-    print(f"  총 시퀀스: {len(sequences):,}")
-    return sequences
+    if not all_seqs:
+        return None
+
+    random.shuffle(all_seqs)
+    sampled = all_seqs if n_seqs is None else all_seqs[:n_seqs]
+    scaled  = [scale_seq(seq, mins, maxs) for seq in sampled]
+    print(f"  실제 정상 시퀀스 로드: {len(scaled):,}개 (전체 풀: {len(all_seqs):,})")
+    return scaled
 
 
-# ── 학습 루프 ─────────────────────────────────────────────────────
-def train(model, loader, val_loader, device):
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.MSELoss()
+SEQ_BREAK_DT = 3600  # preprocess.py 와 동일
 
-    best_val_loss = float("inf")
-    best_state    = None
-    patience_cnt  = 0
 
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        train_loss = 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch:3d}/{EPOCHS}", leave=False)
-        for (batch,) in pbar:
-            batch  = batch.to(device)
-            output = model(batch)
-            loss   = criterion(output, batch)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.6f}")
+# ── 시퀀스 생성 헬퍼 ──────────────────────────────────────────────
+def _cog_hdg_diff(cog, hdg):
+    if hdg >= 511: return -1.0
+    d = abs(cog - hdg)
+    return 360 - d if d > 180 else d
 
-        train_loss /= len(loader)
+def _build_derived(step_list):
+    window = deque(maxlen=10)
+    result = []
+    prev_sog, prev_chd = step_list[0]["sog"], 0.0
+    prev_lat = step_list[0].get("lat", 37.0)
+    prev_lon = step_list[0].get("lon", 126.0)
+    for i, s in enumerate(step_list):
+        sog, cog = s["sog"], s["cog"]
+        hdg    = s.get("hdg", 511)
+        status = s.get("status", 0)
+        dt, dist = s["dt"], s["dist_km"]
+        lat    = s.get("lat", prev_lat)
+        lon    = s.get("lon", prev_lon)
+        chd    = _cog_hdg_diff(cog, hdg)
+        sog_ch = abs(sog - prev_sog) if i > 0 else 0.0
+        chd_change = abs(chd - prev_chd) if (i > 0 and chd >= 0 and prev_chd >= 0) else 0.0
+        window.append(chd if chd >= 0 else 0.0)
+        chd_std = statistics.stdev(window) if len(window) >= 2 else 0.0
 
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for (batch,) in val_loader:
-                batch    = batch.to(device)
-                output   = model(batch)
-                val_loss += criterion(output, batch).item()
-        val_loss /= len(val_loader)
-
-        print(f"  Epoch {epoch:3d}/{EPOCHS} | "
-              f"train={train_loss:.6f} | val={val_loss:.6f}")
-
-        if val_loss < best_val_loss - 1e-6:
-            best_val_loss = val_loss
-            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_cnt  = 0
+        # speed_consistency: 실제 이동거리 / SOG 기반 예상 거리
+        if i == 0 or sog < 0.1:
+            speed_cons = 1.0
         else:
-            patience_cnt += 1
-            if patience_cnt >= PATIENCE:
-                print(f"  조기 종료: {PATIENCE} epoch 동안 개선 없음 → 최적 가중치 복원")
-                break
+            expected = sog * dt / 3600.0 * 1.852
+            speed_cons = round(dist / (expected + 1e-6), 4)
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    print(f"  최적 검증 손실: {best_val_loss:.6f}")
+        # sog_consistency: GPS 실제 속도 / 보고된 SOG
+        if i == 0:
+            sog_cons = 1.0
+        else:
+            dt_h = dt / 3600.0
+            gps_speed = dist / (dt_h * 1.852 + 1e-6)
+            sog_cons = round(gps_speed / (sog + 1e-6), 4)
 
+        # lat_speed, lon_speed: 위도/경도 방향 변화율 (도/초)
+        if i == 0:
+            lat_spd = lon_spd = 0.0
+        else:
+            lat_spd = round((lat - prev_lat) / (dt + 1e-6), 6)
+            lon_spd = round((lon - prev_lon) / (dt + 1e-6), 6)
 
-# ── ONNX export ──────────────────────────────────────────────────
-def export_onnx(model, device):
-    import warnings
-    model.eval()
-    dummy = torch.zeros(1, SEQ_LEN, len(FEATURES), dtype=torch.float32).to(device)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        torch.onnx.export(
-            model,
-            (dummy,),
-            ONNX_FILE,
-            dynamo=False,
-            opset_version=14,
-            input_names=["x"],
-            output_names=["output"],
-        )
-    print(f"  ONNX 저장: {ONNX_FILE}")
-
-
-# ── 임계값 계산 ───────────────────────────────────────────────────
-def calc_threshold(model, loader, device) -> float:
-    model.eval()
-    errors = []
-    with torch.no_grad():
-        for (batch,) in loader:
-            batch  = batch.to(device)
-            output = model(batch)
-            mse    = ((output - batch) ** 2).mean(dim=(1, 2))
-            errors.extend(mse.cpu().tolist())
-
-    errors.sort()
-    idx = int(len(errors) * THRESHOLD_PERCENTILE / 100)
-    return errors[idx]
+        # FEATURES 순서:
+        #   sog, cog, heading, status, dt, dist_km,
+        #   cog_hdg_diff, sog_change, cog_hdg_change, cog_hdg_std,
+        #   speed_consistency, sog_consistency, lat_speed, lon_speed
+        result.append([sog, cog, hdg if hdg < 511 else 0., status,
+                        dt, dist, chd, sog_ch, chd_change, chd_std,
+                        speed_cons, sog_cons, lat_spd, lon_spd])
+        prev_sog = sog
+        prev_chd = chd if chd >= 0 else prev_chd
+        prev_lat, prev_lon = lat, lon
+    return result
 
 
-# ── 메인 ──────────────────────────────────────────────────────────
+# ── 시나리오 ──────────────────────────────────────────────────────
+def make_normal_seq():
+    sog, cog = random.uniform(5,15), random.uniform(0,360)
+    lat, lon = 37., 126.
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(10,30); dist = sog*dt/3600*1.852
+        lat += math.cos(math.radians(cog))*dist/111.
+        lon += math.sin(math.radians(cog))*dist/111.
+        steps.append({"sog":sog,"cog":cog,"hdg":int(cog+random.uniform(-5,5))%360,
+                       "status":0,"dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
+    return _build_derived(steps)
+
+def make_cog_hdg_mismatch_seq():
+    sog, cog, mm = random.uniform(.5,20), random.uniform(0,360), random.uniform(90,180)
+    lat, lon = 37., 126.
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(5,60); dist = sog*dt/3600*1.852
+        lat += math.cos(math.radians(cog))*dist/111.
+        lon += math.sin(math.radians(cog))*dist/111.
+        steps.append({"sog":sog,"cog":cog,"hdg":int((cog+mm)%360),"status":0,
+                       "dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
+        cog = (cog+random.uniform(-10,10))%360
+    return _build_derived(steps)
+
+def make_anchor_move_seq():
+    spd, cog = random.uniform(.2,5), random.uniform(0,360)
+    lat, lon = 37., 126.
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(5,60); dist = spd*dt/3600*1.852
+        lat += math.cos(math.radians(cog))*dist/111.
+        lon += math.sin(math.radians(cog))*dist/111.
+        steps.append({"sog":spd,"cog":cog,"hdg":int((cog+random.uniform(60,180))%360),
+                       "status":1,"dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
+        cog = (cog+random.uniform(-30,30))%360
+    return _build_derived(steps)
+
+def make_speed_spike_seq():
+    base, spike = random.uniform(2,15), random.uniform(20,50)
+    ss, sl = random.randint(0,SEQ_LEN-3), random.randint(1,3)
+    cog = random.uniform(0,360)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        sog = spike if ss<=i<ss+sl else base
+        dt  = random.uniform(5,60); dist = sog*dt/3600*1.852
+        lat += math.cos(math.radians(cog))*dist/111.
+        lon += math.sin(math.radians(cog))*dist/111.
+        steps.append({"sog":sog,"cog":cog,"hdg":int(cog+random.uniform(-5,5))%360,
+                       "status":0,"dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
+        if random.random()<.2: cog=(cog+random.uniform(-30,30))%360
+    return _build_derived(steps)
+
+def make_position_jump_seq():
+    spd, jd = random.uniform(2,10), random.uniform(5,50)
+    ji, cog = random.randint(1,SEQ_LEN-2), random.uniform(0,360)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        dt = random.uniform(5,60)
+        dist = jd if i==ji else spd*dt/3600*1.852
+        lat += math.cos(math.radians(cog))*dist/111.
+        lon += math.sin(math.radians(cog))*dist/111.
+        steps.append({"sog":spd,"cog":cog,"hdg":int(cog+random.uniform(-5,5))%360,
+                       "status":0,"dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
+        cog = random.uniform(0,360)
+    return _build_derived(steps)
+
+def make_fn_dt_jump_seq():
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(61,299); sog = random.choice([2.,18.,3.,20.])
+        d  = random.uniform(.08,.20)*111.; cog = random.uniform(0,360)
+        steps.append({"sog":sog,"cog":cog,"hdg":int(cog),"status":0,
+                       "dt":dt,"dist_km":d})
+    return _build_derived(steps)
+
+def make_fn_speed_ramp_seq():
+    sog, cog = 2., random.uniform(0,360)
+    lat, lon = 37., 126.
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(30,55); dist = sog*dt/3600*1.852
+        lat += math.cos(math.radians(cog))*dist/111.
+        lon += math.sin(math.radians(cog))*dist/111.
+        steps.append({"sog":sog,"cog":cog,"hdg":int(cog),"status":0,
+                       "dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
+        sog = 2. if sog >= 29. else min(sog+9.5, 29.)
+    return _build_derived(steps)
+
+def make_fn_cog_border_seq():
+    sog, cog, mm = random.uniform(3,10), random.uniform(0,360), random.uniform(91,99)
+    lat, lon = 37., 126.
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(10,30); dist = sog*dt/3600*1.852
+        lat += math.cos(math.radians(cog))*dist/111.
+        lon += math.sin(math.radians(cog))*dist/111.
+        steps.append({"sog":sog,"cog":cog,"hdg":int((cog+mm)%360),"status":0,
+                       "dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
+        if random.random()<.1: cog=(cog+random.uniform(-10,10))%360
+    return _build_derived(steps)
+
+def make_fn_nav_status_seq():
+    status = random.choice([2,3,7,8,11,12])
+    sog, cog = random.uniform(.5,5), random.uniform(0,360)
+    lat, lon = 37., 126.
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(10,30); dist = sog*dt/3600*1.852
+        lat += math.cos(math.radians(cog))*dist/111.
+        lon += math.sin(math.radians(cog))*dist/111.
+        steps.append({"sog":sog,"cog":cog,"hdg":int(cog),"status":status,
+                       "dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
+        if random.random()<.05: cog=(cog+random.uniform(-15,15))%360
+    return _build_derived(steps)
+
+SCENARIO_MAKERS = [
+    ("정상",          make_normal_seq,           False),
+    ("COG/HDG불일치", make_cog_hdg_mismatch_seq, True),
+    ("정박이동",      make_anchor_move_seq,       True),
+    ("속도이상",      make_speed_spike_seq,       True),
+    ("위치점프",      make_position_jump_seq,     True),
+    ("FN1-dt점프",   make_fn_dt_jump_seq,        True),
+    ("FN2-속도단계", make_fn_speed_ramp_seq,     True),
+    ("FN3-COG경계", make_fn_cog_border_seq,     True),
+    ("FN4-status",  make_fn_nav_status_seq,     True),
+]
+
+
+# ══════════════════════════════════════════════════════════════════
+# 분석 1: 탐지율/오탐율 테이블
+# ══════════════════════════════════════════════════════════════════
+def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
+    print("\n" + "="*60)
+    print("  [분석 1] 탐지율 / 오탐율 테이블")
+    print("="*60)
+
+    # 정상: real_seqs 전체 사용 (N=None이면 전체)
+    # 이상 시나리오: 합성이므로 N_ANOM개 생성
+    N_ANOM = 500  # 이상 시나리오 합성 시퀀스 수
+
+    all_errors = []
+    for name, maker, is_anom in tqdm(SCENARIO_MAKERS, desc="분석1 시나리오", unit="개"):
+        if not is_anom and real_seqs is not None:
+            seqs = real_seqs if N is None else real_seqs[:N]
+            errs = np.array([infer_mse(session, seq)
+                             for seq in tqdm(seqs, desc=f"  {name}", leave=False, unit="seq")])
+        else:
+            n = N_ANOM if N is None else N
+            errs = np.array([infer_mse(session, scale_seq(maker(), mins, maxs))
+                             for _ in tqdm(range(n), desc=f"  {name}", leave=False, unit="seq")])
+        all_errors.append((name, errs))
+
+    ne      = all_errors[0][1]
+    N_ne    = len(ne)
+    fp_rate = np.sum(ne > threshold) / N_ne * 100
+    print(f"\n  임계값: {threshold:.6f}  |  정상 시퀀스: {N_ne:,}개  |  오탐율: {fp_rate:.1f}%\n")
+
+    col_w = 16
+    sep   = "─" * (12 + col_w * len(all_errors))
+    print(sep)
+    print("".rjust(12) + "".join(rjust(n, col_w) for n, _ in all_errors))
+    print(sep)
+    for label, fn in [
+        ("평균 MSE",  lambda e: f"{e.mean():.6f}"),
+        ("95th %ile", lambda e: f"{np.percentile(e,95):.6f}"),
+        ("탐지율",    lambda e: f"{np.sum(e>threshold)/len(e)*100:.1f}%"),
+    ]:
+        print(rjust(label,12) + "".join(rjust(fn(e), col_w) for _, e in all_errors))
+    print(sep)
+
+    anom = [(n,e) for (n,e),(_,_,ia) in zip(all_errors,SCENARIO_MAKERS) if ia]
+    print("\n  [임계값별 탐지율/오탐율]")
+    print("  " + "임계값".rjust(12) + "오탐율".rjust(9) +
+          "".join(rjust(n,16) for n,_ in anom))
+    print("  " + "─"*(12+9+16*len(anom)))
+    for pct in [99,98,97,95,90]:
+        thr = np.percentile(ne, pct)
+        fp  = np.sum(ne>thr)/N_ne*100
+        row = rjust(f"{thr:.6f}",12) + rjust(f"{fp:.1f}%",9)
+        row += "".join(rjust(f"{np.sum(e>thr)/len(e)*100:.1f}%",16) for _,e in anom)
+        print("  "+row)
+    print("\n→ threshold.txt 를 위 값 중 적절한 것으로 교체하세요.")
+    return all_errors
+
+
+# ══════════════════════════════════════════════════════════════════
+# 분석 2: 피처 간 상관행렬 (Pearson)
+# ══════════════════════════════════════════════════════════════════
+def analysis_correlation():
+    print("\n" + "="*60)
+    print("  [분석 2] 피처 간 상관행렬 (Pearson)")
+    print("="*60)
+
+    import csv, os
+    if not os.path.exists(DATA_FILE):
+        print(f"  ⚠ {DATA_FILE} 없음 — 상관행렬 건너뜀")
+        return None
+
+    data = {f: [] for f in FEATURES}
+    row_count = 0
+    with open(DATA_FILE, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                for feat in FEATURES:
+                    data[feat].append(float(row[feat]))
+                row_count += 1
+            except (ValueError, KeyError):
+                continue
+
+    n = len(data[FEATURES[0]])
+    print(f"  사용 행 수: {row_count:,} (전체)")
+
+    arr  = np.array([data[f] for f in FEATURES], dtype=np.float32)
+    corr = np.corrcoef(arr)
+
+    print("\n  |상관| ≥ 0.5 피처 쌍:")
+    found = False
+    for i in range(len(FEATURES)):
+        for j in range(i+1, len(FEATURES)):
+            if abs(corr[i,j]) >= 0.5:
+                print(f"    {FEATURES[i]:25s} ↔ {FEATURES[j]:25s}  r={corr[i,j]:+.3f}")
+                found = True
+    if not found:
+        print("    없음")
+
+    if HAS_MPL:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1)
+        ax.set_xticks(range(len(FEATURES)))
+        ax.set_xticklabels(FEATURES, rotation=45, ha="right", fontsize=8)
+        ax.set_yticks(range(len(FEATURES)))
+        ax.set_yticklabels(FEATURES, fontsize=8)
+        for i in range(len(FEATURES)):
+            for j in range(len(FEATURES)):
+                ax.text(j, i, f"{corr[i,j]:.2f}", ha="center", va="center",
+                        fontsize=6, color="white" if abs(corr[i,j])>0.6 else "black")
+        plt.colorbar(im, ax=ax)
+        ax.set_title("Feature Correlation Matrix (Pearson)")
+        plt.tight_layout()
+        plt.savefig("feature_correlation.png", dpi=150)
+        plt.close()
+        print("\n  → feature_correlation.png 저장")
+
+    return corr
+
+
+# ══════════════════════════════════════════════════════════════════
+# 분석 3: 시나리오별 재구성 오차 분해 (피처별 MSE)
+# ══════════════════════════════════════════════════════════════════
+def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
+    print("\n" + "="*60)
+    print("  [분석 3] 시나리오별 재구성 오차 분해 (피처별 MSE)")
+    print("="*60)
+
+    N_ANOM = 500  # 이상 시나리오 합성 시퀀스 수
+
+    scenario_feat_mse = {}
+    for name, maker, is_anom in tqdm(SCENARIO_MAKERS, desc="분석3 시나리오", unit="개"):
+        feat_mse = np.zeros(len(FEATURES))
+        if not is_anom and real_seqs is not None:
+            seqs = real_seqs if N is None else real_seqs[:N]
+            for seq in tqdm(seqs, desc=f"  {name}", leave=False, unit="seq"):
+                _, x, out = infer(session, seq)
+                feat_mse += ((out - x) ** 2).mean(axis=(0, 1))
+            feat_mse /= len(seqs)
+        else:
+            n = N_ANOM if N is None else N
+            for _ in tqdm(range(n), desc=f"  {name}", leave=False, unit="seq"):
+                seq = scale_seq(maker(), mins, maxs)
+                _, x, out = infer(session, seq)
+                feat_mse += ((out - x) ** 2).mean(axis=(0, 1))
+            feat_mse /= n
+        scenario_feat_mse[name] = feat_mse
+
+    col_w = 13
+    names = [n for n,_,_ in SCENARIO_MAKERS]
+    header = "피처".ljust(22) + "".join(rjust(n, col_w) for n in names)
+    sep    = "─" * len(header)
+    print("\n" + sep + "\n" + header + "\n" + sep)
+    for fi, feat in enumerate(FEATURES):
+        row = feat.ljust(22)
+        for name in names:
+            row += rjust(f"{scenario_feat_mse[name][fi]:.4f}", col_w)
+        print(row)
+    print(sep)
+
+    if HAS_MPL:
+        mat   = np.array([scenario_feat_mse[n] for n in names])   # (S, F)
+        mat_n = mat / (mat.max(axis=1, keepdims=True) + 1e-9)      # 시나리오 내 상대값
+
+        fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+        for ax, data, title in [
+            (axes[0], mat.T,   "Reconstruction Error (Absolute MSE)"),
+            (axes[1], mat_n.T, "Reconstruction Error (Relative within scenario)"),
+        ]:
+            im = ax.imshow(data, cmap="YlOrRd", aspect="auto")
+            ax.set_xticks(range(len(names)))
+            ax.set_xticklabels(names, rotation=40, ha="right", fontsize=8)
+            ax.set_yticks(range(len(FEATURES)))
+            ax.set_yticklabels(FEATURES, fontsize=8)
+            ax.set_title(title)
+            plt.colorbar(im, ax=ax)
+
+        plt.tight_layout()
+        plt.savefig("reconstruction_error.png", dpi=150)
+        plt.close()
+        print("\n  → reconstruction_error.png 저장")
+
+    return scenario_feat_mse
+
+
+# ══════════════════════════════════════════════════════════════════
+# 분석 4: Permutation Importance
+#
+# [정상 기준] 피처 셔플 시 정상 MSE 상승량
+#   → 모델이 정상 재구성에 의존하는 피처
+#
+# [이상 기준] 피처 셔플 시 이상 MSE 하락량
+#   → 피처를 지웠을 때 이상 탐지가 안 되는 피처
+#   → 이상 탐지에 실제로 기여하는 피처
+# ══════════════════════════════════════════════════════════════════
+def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
+    print("\n" + "="*60)
+    print("  [분석 4] Permutation Importance")
+    print("="*60)
+
+    # ── 정상 시퀀스 준비 ─────────────────────────────────────────
+    if real_seqs is not None:
+        seqs_scaled = real_seqs if N is None else real_seqs[:N]
+        print(f"  실제 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회")
+    else:
+        n = 5000 if N is None else N
+        seqs_scaled = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(n)]
+        print(f"  합성 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회 (CSV 없음)")
+
+    # ── 이상 시나리오 시퀀스 준비 (시나리오별 2000개) ─────────────
+    N_ANOM = 500
+    anom_scenarios = [(name, maker) for name, maker, is_anom in SCENARIO_MAKERS if is_anom]
+    print(f"  이상 시나리오 {len(anom_scenarios)}개 × {N_ANOM:,}개 × 반복 {repeat}회\n")
+
+    arr_normal = np.array(seqs_scaled, dtype=np.float32)
+    n_normal   = len(arr_normal)
+
+    # 이상 시나리오별 스케일링된 배열 미리 생성
+    anom_arrays = {}
+    for name, maker in tqdm(anom_scenarios, desc="이상 시퀀스 생성", unit="시나리오"):
+        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        anom_arrays[name] = np.array(seqs, dtype=np.float32)
+
+    def batch_mse(x_arr, desc="추론"):
+        return np.mean([infer_mse(session, x_arr[i].tolist())
+                        for i in tqdm(range(len(x_arr)), desc=f"  {desc}", leave=False, unit="seq")])
+
+    # ── 정상 기준 Permutation Importance ─────────────────────────
+    print("\n  [4-A] 정상 기준 (ΔMSE↑ = 정상 재구성에 중요)")
+    baseline_normal = batch_mse(arr_normal, desc="baseline 정상")
+    print(f"  baseline MSE (정상): {baseline_normal:.6f}")
+
+    imp_normal = np.zeros(len(FEATURES))
+    for fi in tqdm(range(len(FEATURES)), desc="정상 기준 피처", unit="피처"):
+        delta_sum = 0.
+        for r in range(repeat):
+            shuffled = arr_normal.copy()
+            shuffled[:, :, fi] = arr_normal[np.random.permutation(n_normal), :, fi]
+            delta_sum += batch_mse(shuffled, desc=f"{FEATURES[fi]} r{r+1}") - baseline_normal
+        imp_normal[fi] = delta_sum / repeat
+
+    order_n = np.argsort(imp_normal)[::-1]
+    print(f"\n  {'순위':>4}  {'피처':<25}  {'ΔMSE(정상)':>12}  상대 중요도")
+    print("  " + "─"*68)
+    max_n = max(imp_normal[order_n[0]], 1e-9)
+    for rank, fi in enumerate(order_n):
+        bar = "█" * max(int(imp_normal[fi] / max_n * 20), 0)
+        print(f"  {rank+1:>4}  {FEATURES[fi]:<25}  {imp_normal[fi]:>+12.6f}  {bar}")
+
+    # ── 이상 기준 Permutation Importance ─────────────────────────
+    print("\n  [4-B] 이상 기준 (ΔMSE↓ = 이상 탐지에 실제로 기여하는 피처)")
+    print("        피처 셔플 시 이상 MSE가 떨어질수록 그 피처가 이상 탐지에 핵심")
+
+    # 시나리오별 baseline MSE
+    baseline_anom = {}
+    for name, arr in tqdm(anom_arrays.items(), desc="baseline 이상", unit="시나리오"):
+        baseline_anom[name] = batch_mse(arr, desc=f"baseline {name}")
+
+    # 피처별 × 시나리오별 ΔMSE 계산
+    imp_anom = np.zeros((len(FEATURES), len(anom_scenarios)))  # (F, S)
+    for fi in tqdm(range(len(FEATURES)), desc="이상 기준 피처", unit="피처"):
+        for si, (name, _) in enumerate(anom_scenarios):
+            arr_a   = anom_arrays[name]
+            n_a     = len(arr_a)
+            delta_sum = 0.
+            for r in range(repeat):
+                shuffled = arr_a.copy()
+                shuffled[:, :, fi] = arr_a[np.random.permutation(n_a), :, fi]
+                delta_sum += batch_mse(shuffled, desc=f"{FEATURES[fi]}/{name} r{r+1}") - baseline_anom[name]
+            imp_anom[fi, si] = delta_sum / repeat
+
+    # 시나리오 평균 ΔMSE (음수일수록 탐지에 기여)
+    imp_anom_mean = imp_anom.mean(axis=1)
+    order_a = np.argsort(imp_anom_mean)  # 오름차순 (음수 큰 것이 앞)
+
+    print(f"\n  {'순위':>4}  {'피처':<25}  {'평균 ΔMSE':>12}  탐지 기여도")
+    print("  " + "─"*68)
+    min_a = min(imp_anom_mean[order_a[0]], -1e-9)
+    for rank, fi in enumerate(order_a):
+        bar = "█" * max(int(imp_anom_mean[fi] / min_a * 20), 0)
+        sign = "▼" if imp_anom_mean[fi] < 0 else " "
+        print(f"  {rank+1:>4}  {FEATURES[fi]:<25}  {imp_anom_mean[fi]:>+12.6f} {sign} {bar}")
+
+    # 시나리오별 상세 출력
+    print(f"\n  [시나리오별 ΔMSE] (음수 = 셔플 시 탐지율 하락 = 탐지에 기여)")
+    col_w = 14
+    header = "피처".ljust(25) + "".join(rjust(n, col_w) for n, _ in anom_scenarios)
+    sep    = "─" * len(header)
+    print("  " + sep)
+    print("  " + header)
+    print("  " + sep)
+    for fi, feat in enumerate(FEATURES):
+        row = feat.ljust(25)
+        for si in range(len(anom_scenarios)):
+            row += rjust(f"{imp_anom[fi, si]:+.4f}", col_w)
+        print("  " + row)
+    print("  " + sep)
+
+    # ── 시각화 ───────────────────────────────────────────────────
+    if HAS_MPL:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        # 정상 기준
+        colors_n = ["#e74c3c" if imp_normal[fi] >= 0 else "#3498db" for fi in order_n]
+        axes[0].barh([FEATURES[fi] for fi in order_n[::-1]],
+                     [imp_normal[fi] for fi in order_n[::-1]],
+                     color=colors_n[::-1])
+        axes[0].axvline(0, color="black", linewidth=0.8)
+        axes[0].set_xlabel("ΔMSE (shuffled - baseline)")
+        axes[0].set_title("Permutation Importance\n(정상 기준: 재구성 의존도)")
+
+        # 이상 기준 — 시나리오 평균
+        colors_a = ["#e74c3c" if imp_anom_mean[fi] >= 0 else "#2ecc71" for fi in order_a[::-1]]
+        axes[1].barh([FEATURES[fi] for fi in order_a[::-1]],
+                     [imp_anom_mean[fi] for fi in order_a[::-1]],
+                     color=colors_a)
+        axes[1].axvline(0, color="black", linewidth=0.8)
+        axes[1].set_xlabel("ΔMSE (shuffled - baseline)")
+        axes[1].set_title("Permutation Importance\n(이상 기준: 탐지 기여도, 음수=기여)")
+
+        plt.tight_layout()
+        plt.savefig("permutation_importance.png", dpi=150)
+        plt.close()
+        print("\n  → permutation_importance.png 저장")
+
+    return imp_normal, imp_anom
+
+
+# ══════════════════════════════════════════════════════════════════
+# 메인
+# ══════════════════════════════════════════════════════════════════
 def main():
-    t_start = time.time()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[디바이스] {device}")
-    print(f"[피처 수]  {len(FEATURES)}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--corr",  action="store_true")
+    parser.add_argument("--recon", action="store_true")
+    parser.add_argument("--perm",  action="store_true")
+    args = parser.parse_args()
+    run_all = not any([args.corr, args.recon, args.perm])
 
-    _t1 = time.time()
-    print("[1/6] 데이터 로드...")
-    mmsi_data = load_data(INPUT_FILE)
+    mins, maxs = load_scaler(SCALER_FILE)
+    with open(THRESHOLD_FILE) as f:
+        threshold = float(f.read())
+    session = ort.InferenceSession(MODEL_FILE, providers=["CPUExecutionProvider"])
 
-    _t2 = time.time()
-    print("[2/6] 시퀀스 생성...")
-    sequences = make_sequences(mmsi_data)
+    if not HAS_MPL:
+        print("  ⚠ matplotlib 없음 — 그래프 저장 건너뜀 (pip install matplotlib)")
 
-    _t3 = time.time()
-    print("[3/6] 정규화...")
-    flat   = [row for seq in sequences for row in seq]
-    scaler = MinMaxScaler()
-    scaler.fit(flat)
-    scaled = [scaler.transform(seq) for seq in sequences]
+    # 실제 정상 시퀀스 한 번만 로드 (없으면 None → 합성으로 fallback)
+    print("\n실제 정상 시퀀스 로드 중...")
+    real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=3000)
+    if real_seqs is None:
+        print(f"  ⚠ {DATA_FILE} 없음 — 합성 정상 시퀀스 사용")
 
-    with open(SCALER_FILE, "w") as f:
-        json.dump({"features": FEATURES, "min": scaler.min_, "max": scaler.max_},
-                  f, indent=2)
-    print(f"  스케일러 저장: {SCALER_FILE}")
+    if run_all:
+        analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
+        analysis_correlation()
+        analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
+        analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+    else:
+        if args.corr:  analysis_correlation()
+        if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
+        if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
 
-    _t4 = time.time()
-    print("[4/6] 학습 준비...")
-    tensor   = torch.tensor(scaled, dtype=torch.float32)
-    dataset  = TensorDataset(tensor)
-    n_val    = max(1, int(len(dataset) * VAL_RATIO))
-    n_train  = len(dataset) - n_val
-    train_ds, val_ds = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(SEED)
-    )
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
-    print(f"  학습: {n_train:,}  검증: {n_val:,}")
-
-    _t5 = time.time()
-    print("[5/6] 학습 시작...")
-    model = LSTMAutoencoder(
-        input_size=len(FEATURES),
-        hidden_size=HIDDEN_SIZE,
-        num_layers=NUM_LAYERS,
-    ).to(device)
-    train(model, train_loader, val_loader, device)
-    export_onnx(model, device)
-
-    _t6 = time.time()
-    print("[6/6] 임계값 계산...")
-    threshold = calc_threshold(model, train_loader, device)
-    with open(THRESHOLD_FILE, "w") as f:
-        f.write(str(threshold))
-    print(f"  임계값: {threshold:.6f}  (상위 {100 - THRESHOLD_PERCENTILE}%)")
-    print(f"  임계값 저장: {THRESHOLD_FILE}")
-
-    t_end = time.time()
-    print("완료!")
-    print(f"\n  [소요 시간]")
-    print(f"  데이터 로드:   {_t2-_t1:6.1f}s")
-    print(f"  시퀀스 생성:   {_t3-_t2:6.1f}s")
-    print(f"  정규화:        {_t4-_t3:6.1f}s")
-    print(f"  학습 준비:     {_t5-_t4:6.1f}s")
-    print(f"  학습+ONNX:     {_t6-_t5:6.1f}s")
-    print(f"  임계값 계산:   {t_end-_t6:6.1f}s")
-    print(f"  ─────────────────────")
-    print(f"  전체:          {t_end-t_start:6.1f}s")
+    print("\n완료!")
+    if HAS_MPL:
+        import os
+        saved = [f for f in ["feature_correlation.png",
+                              "reconstruction_error.png",
+                              "permutation_importance.png"] if os.path.exists(f)]
+        if saved:
+            print("저장된 그래프:", ", ".join(saved))
 
 
 if __name__ == "__main__":

@@ -81,18 +81,18 @@ bool AIS_ML::LoadThreshold(const std::string &path, std::string &error_msg)
 void AIS_ML::PushFeature(int mmsi,
                           float sog, float cog, float heading,
                           float status, float dt, float dist_km,
-                          float expected_dist_km, float bearing_cog_diff,
-                          float cog_hdg_diff, float sog_change, float cog_change,
-                          float sog_status_ratio, float dist_expected_ratio,
-                          float cog_hdg_change, float cog_hdg_std)
+                          float cog_hdg_diff, float sog_change,
+                          float cog_hdg_change, float cog_hdg_std,
+                          float speed_consistency, float sog_consistency,
+                          float lat_speed, float lon_speed)
 {
     std::array<float, ML_FEATURE_COUNT> feat = {
         sog, cog, heading, status,
         dt, dist_km,
-        expected_dist_km, bearing_cog_diff,
-        cog_hdg_diff, sog_change, cog_change,
-        sog_status_ratio, dist_expected_ratio,
-        cog_hdg_change, cog_hdg_std
+        cog_hdg_diff, sog_change,
+        cog_hdg_change, cog_hdg_std,
+        speed_consistency, sog_consistency,
+        lat_speed, lon_speed
     };
     auto &seq = m_sequences[mmsi];
     seq.push_back(feat);
