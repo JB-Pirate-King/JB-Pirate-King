@@ -1,1664 +1,2225 @@
 #!/usr/bin/env python3
+# coding: utf-8
 """
-OpenCPN IDS Signal Generator  v3
-Generated AIS patterns + normal NMEA file replay GUI.
-
-v3 신규 기능:
-  - 선단 이동(Translation): 전체 선단을 실시간으로 특정 방향/속도로 이동
-  - 기본 좌표 37N / 21E (서해 해역)
-  - 이동 방향(도), 이동 속도(kn), 가속도, 진동(사인파 이동) 제어
-  - 패턴별 추가 파라미터: 원형 수렴/발산 모드, 격자 회전, 나선 확장 모드,
-    무작위 집단 드리프트, 수렴 포인트
+╔══════════════════════════════════════════════════════════════════╗
+║   OpenCPN AIS IDS Signal Generator  v6                          ║
+║   ML-Aware Attack Simulator for AIS Intrusion Detection Research ║
+╠══════════════════════════════════════════════════════════════════╣
+║  아키텍처                                                        ║
+║  ┌──────────────────────────────────────────────────────────┐   ║
+║  │  AttackPlugin (base class + registry decorator)          │   ║
+║  │    ↓                                                     │   ║
+║  │  SimEngine  ←→  RealTimeState  ←→  RealTimeControlWin   │   ║
+║  │    ↓                                                     │   ║
+║  │  SenderWorker  →  UDP Socket  →  OpenCPN                 │   ║
+║  └──────────────────────────────────────────────────────────┘   ║
+║  모듈 역할                                                       ║
+║   AttackPlugin  : 메타데이터 + make/update 인터페이스            ║
+║   AttackRegistry: 데코레이터 기반 자동 등록                      ║
+║   SimEngine     : tick 루프, RT 오버라이드 적용                  ║
+║   SenderWorker  : UDP 전송 스레드                                ║
+║   App           : tkinter GUI (좌=설정, 우=로그)                 ║
+║   RealTimeControlWindow : 별도 Toplevel 실시간 조작              ║
+╠══════════════════════════════════════════════════════════════════╣
+║  ML 탐지 모델 가정                                               ║
+║   Feature set :                                                  ║
+║    - Δsog, Δcog, Δhdg  (속도·방향 변화율)                       ║
+║    - Haversine dist / Δt  (실효 속도)                            ║
+║    - trajectory_continuity  (LSTM 시계열 잔차)                   ║
+║    - navStatus_consistency  (상태 일관성)                        ║
+║    - mmsi_cluster_feat  (DBSCAN 클러스터 내 위치)                ║
+║    - ship_type_sog_residual  (선종별 SOG 분포 잔차)              ║
+║    - ais_gap_duration  (신호 소실 시간)                          ║
+║    - report_interval_irregularity  (Δt 분산)                     ║
+╚══════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
-
-import math
-import queue
-import random
-import socket
-import threading
-import time
+import math, queue, random, socket, threading, time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+# ══════════════════════════════════════════════════
+#  §1  상수 / 전역
+# ══════════════════════════════════════════════════
+_KN_TO_DPS = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
+_LOG_Q: queue.Queue = queue.Queue()
 
-MODE_OPTIONS = [
-    ("generated", "생성 신호"),
-    ("normal_file", "정상 신호 파일"),
+# 실시간 제어 공유 상태 (메인 ↔ 송신 스레드)
+@dataclass
+class RealTimeState:
+    active:        bool  = False
+    sog_mult:      float = 1.0
+    cog_offset:    float = 0.0
+    pos_scatter:   float = 0.0
+    nav_override:  int   = -1
+    manual_jump:   bool  = False
+    jump_dist:     float = 0.05
+
+RT = RealTimeState()
+
+# 실제 MID / 선박 프로파일 데이터
+_MID_POOL = [440, 441, 432, 431, 477, 413, 416, 352, 503, 538, 566]
+
+@dataclass
+class ShipProfile:
+    ship_type: int
+    sog_lo:    float
+    sog_hi:    float
+    nav_opts:  list[int]
+    name_pfx:  str
+
+_PROFILES = [
+    ShipProfile(70, 10.0, 16.0, [0],    "CARGO"),
+    ShipProfile(71, 10.0, 14.0, [0],    "BULK"),
+    ShipProfile(72,  8.0, 12.0, [0],    "TANKER"),
+    ShipProfile(60, 14.0, 22.0, [0],    "PASS"),
+    ShipProfile(30,  3.0,  9.0, [0, 7], "FISH"),
+    ShipProfile(36,  4.0, 14.0, [0],    "YACHT"),
+    ShipProfile(52,  5.0, 11.0, [0],    "TUG"),
 ]
-MODE_LABEL_TO_KEY = {label: key for key, label in MODE_OPTIONS}
 
-ATTACK_OPTIONS = [
-    ("speed_spike",      "속도 이상"),
-    ("anchor_move",      "정박 이동 이상"),
-    ("course_mismatch",  "COG/HDG 불일치"),
-    ("position_jump",    "위치 점프 이상"),
-    # ── IDS False-Negative 테스트 케이스 ──────────────
-    ("blind_dt_jump",    "[FN] dt 구간 점프"),
-    ("blind_speed_ramp", "[FN] 속도 단계 상승"),
-    ("blind_cog_border", "[FN] COG/HDG 경계값"),
-    ("blind_nav_status", "[FN] navStatus 회피"),
-]
-ATTACK_LABEL_TO_KEY = {label: key for key, label in ATTACK_OPTIONS}
+_COASTAL_HDGS = [0, 45, 90, 135, 180, 225, 270, 315]
 
-DEFAULT_SAMPLE_FILE = Path(__file__).with_name("nmea_data_sample.txt")
+def _qlog(msg: str, level: str = "info") -> None:
+    _LOG_Q.put({"kind": "log", "message": msg, "level": level})
 
-log_queue: "queue.Queue[dict[str, str]]" = queue.Queue()
-stop_event = threading.Event()
+def _qstate(ch: str, state: str) -> None:
+    _LOG_Q.put({"kind": "chan", "channel": ch, "state": state})
 
-# ──────────────────────────────────────────────────
-# 유틸리티
-# ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════
+#  §2  NMEA 인코딩
+# ══════════════════════════════════════════════════
+def _nmea_cs(s: str) -> str:
+    cs = 0
+    for c in s: cs ^= ord(c)
+    return f"{cs:02X}"
 
-def queue_log(log_q, message: str, level: str = "info") -> None:
-    log_q.put({"kind": "log", "message": message, "level": level})
-
-
-def queue_state(log_q, state: str) -> None:
-    log_q.put({"kind": "state", "state": state})
-
-
-def queue_channel_state(log_q, channel: str, state: str) -> None:
-    log_q.put({"kind": "channel_state", "channel": channel, "state": state})
-
-
-def sleep_with_stop(seconds: float) -> bool:
-    end_time = time.time() + max(0.0, seconds)
-    while not stop_event.is_set():
-        remaining = end_time - time.time()
-        if remaining <= 0:
-            return True
-        time.sleep(min(0.1, remaining))
-    return False
-
-
-def sleep_with_event(stop_signal: threading.Event, seconds: float) -> bool:
-    end_time = time.time() + max(0.0, seconds)
-    while not stop_signal.is_set():
-        remaining = end_time - time.time()
-        if remaining <= 0:
-            return True
-        time.sleep(min(0.1, remaining))
-    return False
-
-
-def nmea_checksum(sentence: str) -> str:
-    checksum = 0
-    for ch in sentence:
-        checksum ^= ord(ch)
-    return f"{checksum:02X}"
-
-
-def encode_payload(bits: list[int]) -> str:
-    while len(bits) % 6:
-        bits.append(0)
-    payload = []
+def _encode_payload(bits: list[int]) -> str:
+    while len(bits) % 6: bits.append(0)
+    out = []
     for i in range(0, len(bits), 6):
-        value = 0
-        for bit in bits[i:i + 6]:
-            value = (value << 1) | bit
-        char_code = value + 48
-        if char_code > 87:
-            char_code += 8
-        payload.append(chr(char_code))
-    return "".join(payload)
+        v = sum(bits[i+b] << (5-b) for b in range(6))
+        c = v + 48
+        if c > 87: c += 8
+        out.append(chr(c))
+    return "".join(out)
 
+def build_vdm(mmsi:int, lat:float, lon:float, sog:float,
+              cog:float, hdg:int, nav:int=0) -> str:
+    b: list[int] = []
+    def p(v:int, w:int):
+        for i in range(w-1,-1,-1): b.append((int(v)>>i)&1)
+    p(1,6); p(0,2); p(mmsi,30); p(nav,4); p(0,8)
+    p(min(1023,max(0,round(sog*10))),10); p(1,1)
+    p(int(round(lon*600000))&0xFFFFFFF,28)
+    p(int(round(lat*600000))&0x7FFFFFF,27)
+    p(min(3600,max(0,round(cog*10))),12)
+    p(min(511,max(0,hdg%360)),9); p(int(time.time())%60,6)
+    p(0,2); p(0,3); p(0,1); p(0,19)
+    pl = _encode_payload(b)
+    body = f"AIVDM,1,1,,A,{pl},0"
+    return f"!{body}*{_nmea_cs(body)}\r\n"
 
-def build_vdm(mmsi, lat, lon, sog, cog, heading, nav_status=0) -> str:
-    bits: list[int] = []
+def build_vsd(mmsi:int, name:str) -> str:
+    nm = name[:20].upper().ljust(20,"@")
+    b: list[int] = []
+    def p(v:int,w:int):
+        for i in range(w-1,-1,-1): b.append((int(v)>>i)&1)
+    def ps(s:str,w:int):
+        for c in s[:w]:
+            cc = ord(c); cc = cc-64 if cc>=64 else cc; p(cc,6)
+    p(24,6); p(0,2); p(mmsi,30); p(0,2); ps(nm,20); p(0,8)
+    pl = _encode_payload(b)
+    body = f"AIVDM,1,1,,A,{pl},0"
+    return f"!{body}*{_nmea_cs(body)}\r\n"
 
-    def push(value: int, width: int) -> None:
-        for i in range(width - 1, -1, -1):
-            bits.append((value >> i) & 1)
+def load_nmea(path:str) -> list[str]:
+    msgs = [l.strip()+"\r\n" for l in Path(path).read_text(errors="ignore").splitlines()
+            if l.strip().startswith("!AIVDM")]
+    if not msgs: raise ValueError("파일에 !AIVDM 문장 없음")
+    return msgs
 
-    push(1, 6)
-    push(0, 2)
-    push(mmsi, 30)
-    push(nav_status, 4)
-    push(0, 8)
-    push(int(round(sog * 10)) & 0x3FF, 10)
-    push(1, 1)
-    push(int(round(lon * 600000)) & 0xFFFFFFF, 28)
-    push(int(round(lat * 600000)) & 0x7FFFFFF, 27)
-    push(int(round(cog * 10)) & 0xFFF, 12)
-    push(heading % 360, 9)
-    push(int(time.time()) % 60, 6)
-    push(0, 2)
-    push(0, 3)
-    push(0, 1)
-    push(0, 19)
-
-    payload = encode_payload(bits)
-    sentence_body = f"AIVDM,1,1,,A,{payload},0"
-    return f"!{sentence_body}*{nmea_checksum(sentence_body)}\r\n"
-
-
-def build_vsd(mmsi: int, vessel_name: str) -> str:
-    name = vessel_name[:20].upper().ljust(20, "@")
-    bits: list[int] = []
-
-    def push(value: int, width: int) -> None:
-        for i in range(width - 1, -1, -1):
-            bits.append((value >> i) & 1)
-
-    def push_str(value: str, width: int) -> None:
-        for ch in value[:width]:
-            code = ord(ch)
-            if code >= 64:
-                code -= 64
-            push(code, 6)
-
-    push(24, 6)
-    push(0, 2)
-    push(mmsi, 30)
-    push(0, 2)
-    push_str(name, 20)
-    push(0, 8)
-
-    payload = encode_payload(bits)
-    sentence_body = f"AIVDM,1,1,,A,{payload},0"
-    return f"!{sentence_body}*{nmea_checksum(sentence_body)}\r\n"
-
-
-def load_nmea(file_path) -> list[str]:
-    path = Path(file_path)
-    with path.open("r", encoding="utf-8", errors="ignore") as handle:
-        messages = [
-            line.strip() + "\r\n"
-            for line in handle
-            if line.strip().startswith("!AIVDM")
-        ]
-    if not messages:
-        raise ValueError("파일에서 !AIVDM 문장을 찾지 못했습니다.")
-    return messages
-
-
-# ──────────────────────────────────────────────────
-# 선단 이동(Translation) 헬퍼
-# ──────────────────────────────────────────────────
-
-_KN_TO_DEG_PER_SEC = 1.0 / 3600.0 * 1852.0 / 111320.0  # knot → deg/s (위도 기준)
-
-
-def translation_offset(cfg: dict, elapsed: float) -> tuple[float, float]:
-    """
-    선단 전체 이동 오프셋(dlat, dlon) 계산.
-    elapsed: 송신 시작 후 경과 시간(초)
-    """
-    move_speed = float(cfg.get("move_speed", 0.0))   # kn
-    move_heading = float(cfg.get("move_heading", 0.0))  # 도 (진북 기준)
-    move_accel = float(cfg.get("move_accel", 0.0))   # kn/min 가속
-
-    # 가속도 적용
-    effective_speed = move_speed + move_accel * (elapsed / 60.0)
-    # 이동 방향(헤딩)에 따른 위경도 변화
-    rad = math.radians(move_heading)
-    speed_dps = effective_speed * _KN_TO_DEG_PER_SEC  # deg/s
-    dlat = math.cos(rad) * speed_dps * elapsed
-    dlon = math.sin(rad) * speed_dps * elapsed * 1.2   # 경도 보정
-    return dlat, dlon
-
-
-# ──────────────────────────────────────────────────
-# Vessel
-# ──────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════
+#  §3  Vessel 모델
+# ══════════════════════════════════════════════════
 class Vessel:
-    def __init__(self, mmsi: int, name: str, nav_status: int = 0) -> None:
-        self.mmsi = mmsi
-        self.name = name
-        self.nav_status = nav_status
-        self.lat = 0.0
-        self.lon = 0.0
-        self.sog = 0.0
-        self.cog = 0.0
-        self.heading = 0
+    __slots__ = ("mmsi","name","lat","lon","sog","cog","hdg","nav","_extra")
+    def __init__(self, mmsi:int, name:str, nav:int=0):
+        self.mmsi=mmsi; self.name=name
+        self.lat=self.lon=self.sog=self.cog=0.0
+        self.hdg=0; self.nav=nav; self._extra: dict[str,Any] = {}
+    def pos_msg(self)->str:
+        return build_vdm(self.mmsi,self.lat,self.lon,
+                         self.sog,self.cog,self.hdg,self.nav)
+    def name_msg(self)->str: return build_vsd(self.mmsi,self.name)
+    def x(self,key:str,default=None): return self._extra.get(key,default)
+    def sx(self,key:str,val): self._extra[key]=val; return val
 
-    def position_message(self) -> str:
-        return build_vdm(
-            self.mmsi, self.lat, self.lon,
-            self.sog, self.cog, self.heading, self.nav_status,
-        )
+def _mk_mmsi(mid:int|None=None)->int:
+    m = mid or random.choice(_MID_POOL)
+    return m*1000000+random.randint(100000,999999)
 
-    def name_message(self) -> str:
-        return build_vsd(self.mmsi, self.name)
+def _place(v:Vessel,clat:float,clon:float,r:float=0.08)->None:
+    v.lat=clat+random.uniform(-r,r)
+    v.lon=clon+random.uniform(-r*1.2,r*1.2)
 
+def _step(v:Vessel,dt:float)->None:
+    s=v.sog*_KN_TO_DPS*dt
+    v.lat+=math.cos(math.radians(v.cog))*s
+    v.lon+=math.sin(math.radians(v.cog))*s*1.2
 
-# ──────────────────────────────────────────────────
-# 속도 이상
-# ──────────────────────────────────────────────────
+def _sleep(ev:threading.Event,sec:float)->bool:
+    end=time.time()+max(0,sec)
+    while not ev.is_set():
+        r=end-time.time()
+        if r<=0: return True
+        time.sleep(min(0.05,r))
+    return False
 
+# ══════════════════════════════════════════════════
+#  §4  AttackPlugin 기반 + Registry
+# ══════════════════════════════════════════════════
+@dataclass
+class AttackMeta:
+    key:         str
+    label:       str
+    category:    str   # A B C D E F
+    purpose:     str   # 어떤 feature를 속이는지
+    evasion:     str   # 탐지 회피 전략 요약
+    expected_fn: str   # 예상 탐지 실패 이유
 
-def make_speed_spike_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg["speed_count"])
-    base_speed = float(cfg["speed_base"])
-    spike_speed = float(cfg["speed_spike"])
-    mode = str(cfg.get("speed_mode", "intermittent"))
-    interval = max(1.0, float(cfg.get("speed_interval", 10.0)))
+class AttackPlugin(ABC):
+    meta: AttackMeta
 
-    fleet = []
-    for index in range(count):
-        vessel = Vessel(990100000 + index, f"GHOST-S{index + 1:03d}")
-        vessel.lat = center_lat + random.uniform(-0.03, 0.03)
-        vessel.lon = center_lon + random.uniform(-0.03 * 1.2, 0.03 * 1.2)
-        vessel.sog = base_speed
-        vessel.cog = random.uniform(0, 360)
-        vessel.heading = int(vessel.cog)
-        vessel.nav_status = 0
-        vessel._base_speed = base_speed
-        vessel._spike_speed = spike_speed
-        vessel._speed_mode = mode
-        vessel._spike_interval = interval
-        vessel._last_spike = 0.0
-        vessel._spike_state = False
-        fleet.append(vessel)
-    return fleet
+    @abstractmethod
+    def make(self, cfg:dict)->list[Vessel]: ...
 
+    @abstractmethod
+    def update(self, fleet:list[Vessel], elapsed:float, dt:float, cfg:dict)->None: ...
 
-def update_speed_spike_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
-    for vessel in fleet:
-        if not hasattr(vessel, "_spike_interval"):
-            continue
-        if elapsed - vessel._last_spike >= vessel._spike_interval:
-            vessel._last_spike = elapsed
-            if vessel._speed_mode == "간헐":
-                vessel._spike_state = not vessel._spike_state
-            else:
-                vessel._spike_state = True
+    def param_defs(self)->list[dict]:
+        """GUI 파라미터 정의: [{'label','key','type','min','max','default','step'}]"""
+        return []
 
-        if vessel._spike_state:
-            vessel.sog = vessel._spike_speed
-            if vessel._speed_mode == "순간":
-                vessel._spike_state = False
-        else:
-            vessel.sog = vessel._base_speed
+class AttackRegistry:
+    _map: dict[str,"AttackPlugin"] = {}
+    _order: list[str] = []
 
-        if random.random() < 0.2:
-            vessel.cog = (vessel.cog + random.uniform(-30, 30)) % 360
+    @classmethod
+    def register(cls, plugin_class):
+        """클래스를 받아 인스턴스화 후 등록. 데코레이터에서 호출."""
+        instance = plugin_class()
+        k = instance.meta.key
+        cls._map[k] = instance
+        if k not in cls._order: cls._order.append(k)
+        return plugin_class   # 클래스 자체를 반환 (데코레이터 체인 유지)
 
-        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
-        vessel.lat += math.cos(math.radians(vessel.cog)) * step
-        vessel.lon += math.sin(math.radians(vessel.cog)) * step
-        vessel.heading = int(vessel.cog)
+    @classmethod
+    def get(cls, key:str)->"AttackPlugin": return cls._map[key]
 
+    @classmethod
+    def all(cls)->list["AttackPlugin"]:
+        return [cls._map[k] for k in cls._order]
 
-# ──────────────────────────────────────────────────
-# 정박 이동 이상
-# ──────────────────────────────────────────────────
+    @classmethod
+    def labels(cls)->list[str]:
+        return [cls._map[k].meta.label for k in cls._order]
 
-def make_anchor_move_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg["anchor_count"])
-    radius = float(cfg["anchor_radius"])
-    speed = float(cfg["anchor_speed"])
-    cog = float(cfg.get("anchor_cog", 90.0))
-    drift = float(cfg.get("anchor_drift", 0.0))
-    lon_offset = float(cfg.get("anchor_lon_offset", 0.0))
+    @classmethod
+    def key_by_label(cls, lbl:str)->str:
+        for k,v in cls._map.items():
+            if v.meta.label==lbl: return k
+        raise KeyError(lbl)
 
-    fleet = []
-    for index in range(count):
-        vessel = Vessel(990500000 + index, f"GHOST-A{index + 1:03d}", nav_status=1)
-        vessel.lat = center_lat + random.uniform(-radius, radius)
-        vessel.lon = center_lon + random.uniform(-radius * 1.2, radius * 1.2) + lon_offset
-        vessel.sog = max(0.2, speed)
-        vessel.cog = (cog + random.uniform(-30, 30)) % 360
-        vessel.heading = int((vessel.cog + 120) % 360)
-        vessel._drift = drift
-        fleet.append(vessel)
-    return fleet
+def _reg(plugin_class)->"type[AttackPlugin]":
+    AttackRegistry.register(plugin_class)
+    return plugin_class
 
-
-def update_anchor_move_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
-    for vessel in fleet:
-        if not hasattr(vessel, "_drift"):
-            continue
-        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
-        vessel.lat += math.cos(math.radians(vessel.cog)) * step
-        vessel.lon += math.sin(math.radians(vessel.cog)) * step
-        vessel.lat += vessel._drift * dt * 0.00001
-        vessel.lon += vessel._drift * dt * 0.00001
-        vessel.heading = int((vessel.cog + 120) % 360)
-
-
-# ──────────────────────────────────────────────────
-# COG/HDG 불일치
-# ──────────────────────────────────────────────────
-
-def make_course_mismatch_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg["course_count"])
-    mismatch = float(cfg["course_mismatch"])
-    speed = float(cfg["course_speed"])
-    drift = float(cfg.get("course_drift", 5.0))
-    offset = float(cfg.get("course_offset", 120.0))
-
-    fleet = []
-    for index in range(count):
-        vessel = Vessel(990600000 + index, f"GHOST-CM{index + 1:03d}")
-        vessel.lat = center_lat + random.uniform(-0.05, 0.05)
-        vessel.lon = center_lon + random.uniform(-0.05 * 1.2, 0.05 * 1.2)
-        vessel.sog = max(0.5, speed)
-        vessel.cog = random.uniform(0, 360)
-        vessel.heading = int((vessel.cog + mismatch + offset) % 360)
-        vessel._drift = drift
-        fleet.append(vessel)
-    return fleet
-
-
-def update_course_mismatch_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
-    for vessel in fleet:
-        if not hasattr(vessel, "_drift"):
-            continue
-        if random.random() < 0.15:
-            vessel.cog = (vessel.cog + random.uniform(-vessel._drift, vessel._drift)) % 360
-        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
-        vessel.lat += math.cos(math.radians(vessel.cog)) * step
-        vessel.lon += math.sin(math.radians(vessel.cog)) * step
-        vessel.heading = int((vessel.cog + float(cfg.get("course_mismatch", 150.0)) + float(cfg.get("course_offset", 120.0))) % 360)
-
-
-# ──────────────────────────────────────────────────
-# 위치 점프 이상
-# ──────────────────────────────────────────────────
-
-def make_position_jump_fleet(cfg):
-    center_lat = float(cfg.get("jump_center_lat", cfg["center_lat"]))
-    center_lon = float(cfg.get("jump_center_lon", cfg["center_lon"]))
-    count = int(cfg["jump_count"])
-    radius = float(cfg["jump_radius"])
-    interval = max(1.0, float(cfg.get("jump_interval", 10.0)))
-
-    fleet = []
-    for index in range(count):
-        vessel = Vessel(990700000 + index, f"GHOST-P{index + 1:03d}")
-        vessel.lat = center_lat + random.uniform(-radius, radius)
-        vessel.lon = center_lon + random.uniform(-radius * 1.2, radius * 1.2)
-        vessel.sog = random.uniform(2.0, 10.0)
-        vessel.cog = random.uniform(0, 360)
-        vessel.heading = int(vessel.cog)
-        vessel._jump_radius = radius
-        vessel._jump_interval = interval
-        vessel._last_jump = 0.0
-        fleet.append(vessel)
-    return fleet
-
-
-def update_position_jump_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
-    for vessel in fleet:
-        if not hasattr(vessel, "_jump_interval"):
-            continue
-        if elapsed - vessel._last_jump >= vessel._jump_interval:
-            vessel._last_jump = elapsed
-            jump_lat = random.choice([-1, 1]) * random.uniform(0.08, 0.20)
-            jump_lon = random.choice([-1, 1]) * random.uniform(0.08, 0.20)
-            vessel.lat += jump_lat
-            vessel.lon += jump_lon
-            vessel.cog = random.uniform(0, 360)
-            vessel.heading = int(vessel.cog)
-
-        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
-        vessel.lat += math.cos(math.radians(vessel.cog)) * step
-        vessel.lon += math.sin(math.radians(vessel.cog)) * step
-        vessel.heading = int(vessel.cog)
-
+# 파라미터 헬퍼
+def _pi(label,key,lo,hi,default,step=1.0,t="spin"):
+    return {"label":label,"key":key,"type":t,"min":lo,"max":hi,"default":default,"step":step}
+def _pc(label,key,values,default):
+    return {"label":label,"key":key,"type":"combo","values":values,"default":default}
 
 
 # ══════════════════════════════════════════════════
-# IDS FALSE-NEGATIVE 테스트 케이스
-# ──────────────────────────────────────────────────
-#
-# ais_ids.cpp 탐지 로직의 blind spot을 체계적으로 확인하기 위한
-# 경계 조건 시나리오. 각 케이스는 IDS가 탐지하지 못하는 조건을
-# 의도적으로 재현한다.
-#
+#  §5  공격 플러그인 구현
+#  카테고리:
+#   A  규칙 기반 탐지 대상 (IDS 검증용)
+#   B  시각적 패턴
+#   C  규칙 IDS False-Negative
+#   D  ML 우회 v1 (단일 피처 조작)
+#   E  ML 우회 v2 (구조적)
+#   F  고급 (LSTM·clustering·hybrid·gap)
 # ══════════════════════════════════════════════════
 
+# ─── A1  속도 이상 ────────────────────────────────
+@_reg
+class SpeedSpike(AttackPlugin):
+    meta = AttackMeta(
+        key="speed_spike", label="A1  속도 이상",
+        category="A",
+        purpose="SOG 상한 초과 탐지 (ship-type maxSOG)",
+        evasion="없음 — IDS 정상 동작 검증용",
+        expected_fn="maxSOG 초과 즉시 탐지됨")
 
-# ──────────────────────────────────────────────────
-# [FN-1] dt 구간 점프
-#
-# 탐지 회피 원리:
-#   Check 5 (급격한 속도 변화): dt > 0 && dt <= 60 → skip 조건
-#   Check 6 (위치 점프):       dt > 0 && dt <= 60 → skip 조건
-#   Check 7 (신호 소실):       dt > 300 → 탐지
-#   따라서 메시지 전송 간격을 61~299초로 유지하면
-#   Check 5, 6, 7 모두 트리거되지 않는다.
-#
-# 테스트 방법:
-#   생성 신호 주기를 65~120초로 설정하고 이 패턴 실행.
-#   IDS가 위치 점프나 속도 변화 경보를 내지 않는지 확인.
-# ──────────────────────────────────────────────────
+    def param_defs(self):
+        return [_pi("선박 수","count",1,200,25),
+                _pi("기본 SOG (kn)","sog_base",0,40,8,0.5),
+                _pi("스파이크 SOG (kn)","sog_spike",0,60,32,1.0),
+                _pc("방식","mode",["간헐","순간"],"간헐"),
+                _pi("스파이크 주기 (초)","interval",1,120,10,1.0)]
 
-def make_blind_dt_jump_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg.get("fn_dt_count", 10))
-    jump_dist = float(cfg.get("fn_dt_jump_dist", 0.15))  # 도 단위 (~16km)
-
-    fleet = []
-    for i in range(count):
-        v = Vessel(991100000 + i, f"GHOST-FN1-{i+1:03d}")
-        v.lat = center_lat + random.uniform(-0.05, 0.05)
-        v.lon = center_lon + random.uniform(-0.05, 0.05)
-        v.sog = random.uniform(5.0, 12.0)
-        v.cog = random.uniform(0, 360)
-        v.heading = int(v.cog)
-        v.nav_status = 0
-        v._fn_jump_dist = jump_dist
-        v._fn_prev_lat = v.lat
-        v._fn_prev_lon = v.lon
-        fleet.append(v)
-    return fleet
-
-
-def update_blind_dt_jump_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
-    """
-    매 업데이트마다 위치를 크게 이동 + 속도를 급변시킨다.
-    IDS의 Check 5/6 회피 여부는 전적으로 '전송 주기(interval)'에 달려 있다.
-    interval >= 61초로 설정하면 dt > 60 조건으로 두 체크가 모두 skip된다.
-    """
-    for v in fleet:
-        if not hasattr(v, "_fn_jump_dist"):
-            continue
-        # 위치 점프 (Check 6 기준 초과: ~16km)
-        direction = random.uniform(0, 360)
-        rad = math.radians(direction)
-        v.lat += math.cos(rad) * v._fn_jump_dist
-        v.lon += math.sin(rad) * v._fn_jump_dist * 1.2
-        # 속도 급변 (Check 5 기준 초과: >10kn)
-        v.sog = random.choice([2.0, 18.0, 3.0, 20.0])
-        v.cog = random.uniform(0, 360)
-        v.heading = int(v.cog)
-
-
-# ──────────────────────────────────────────────────
-# [FN-2] 속도 단계 상승 (Step Ramp-up)
-#
-# 탐지 회피 원리:
-#   Check 5: dt <= 60이고 |Δsog| > 10.0일 때 탐지
-#   → 매 메시지마다 Δsog = 9.9kn 이하로 증가시키면 통과
-#   → 예: 2→11→20→29kn 를 3 메시지에 걸쳐 달성
-#     각 단계 Δsog = 9.9kn < 10.0 → 탐지 안됨
-#   단, 최종 속도가 선종 maxSOG 초과 시 Check 2에서 탐지됨.
-#   shipType=0(미지정) → maxSOG=30이므로 29kn까지 허용.
-#
-# 테스트 방법:
-#   interval을 30~55초로 설정(dt<=60 조건 유지).
-#   IDS가 속도 급변 경보를 내지 않는지 확인.
-# ──────────────────────────────────────────────────
-
-def make_blind_speed_ramp_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg.get("fn_ramp_count", 10))
-    ramp_start = float(cfg.get("fn_ramp_start", 2.0))
-    ramp_step = float(cfg.get("fn_ramp_step", 9.5))   # < 10.0 유지
-    ramp_max = float(cfg.get("fn_ramp_max", 29.0))    # shipType=0 maxSOG=30 미만
-
-    fleet = []
-    for i in range(count):
-        v = Vessel(991200000 + i, f"GHOST-FN2-{i+1:03d}")
-        v.lat = center_lat + random.uniform(-0.05, 0.05)
-        v.lon = center_lon + random.uniform(-0.05, 0.05)
-        v.sog = ramp_start
-        v.cog = random.uniform(0, 360)
-        v.heading = int(v.cog)
-        v.nav_status = 0
-        v._ramp_step = ramp_step
-        v._ramp_max = ramp_max
-        v._ramp_start = ramp_start
-        fleet.append(v)
-    return fleet
-
-
-def update_blind_speed_ramp_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
-    """
-    매 업데이트마다 sog를 ramp_step씩 증가.
-    IDS Check 5 threshold(10.0kn)보다 0.5kn 낮게 유지.
-    ramp_max 도달 시 ramp_start로 리셋.
-    """
-    for v in fleet:
-        if not hasattr(v, "_ramp_step"):
-            continue
-        prev_sog = v.sog
-        v.sog = min(v.sog + v._ramp_step, v._ramp_max)
-        if v.sog >= v._ramp_max:
-            v.sog = v._ramp_start   # 리셋
-        # COG/HDG는 일치시켜 Check 4 회피
-        v.heading = int(v.cog)
-        step = v.sog * _KN_TO_DEG_PER_SEC * dt
-        v.lat += math.cos(math.radians(v.cog)) * step
-        v.lon += math.sin(math.radians(v.cog)) * step
-
-
-# ──────────────────────────────────────────────────
-# [FN-3] COG/HDG 경계값 (Threshold Border)
-#
-# 탐지 회피 원리:
-#   Check 4: diff > 100.0 일 때 탐지
-#   → 91~99도 불일치는 탐지 안됨
-#   실제 운항에서 91도 이상의 COG/HDG 차이는
-#   이상 신호로 볼 수 있으나 IDS는 통과시킴.
-#   개선 방향: threshold를 45도 또는 30도로 낮춰야 함.
-# ──────────────────────────────────────────────────
-
-def make_blind_cog_border_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg.get("fn_cog_count", 10))
-    mismatch_deg = float(cfg.get("fn_cog_mismatch", 95.0))  # 91~99 범위 유지
-
-    fleet = []
-    for i in range(count):
-        v = Vessel(991300000 + i, f"GHOST-FN3-{i+1:03d}")
-        v.lat = center_lat + random.uniform(-0.05, 0.05)
-        v.lon = center_lon + random.uniform(-0.05, 0.05)
-        v.sog = random.uniform(3.0, 10.0)
-        v.cog = random.uniform(0, 360)
-        # HDG = COG + mismatch_deg: 탐지 한계 바로 아래
-        v.heading = int((v.cog + mismatch_deg) % 360)
-        v.nav_status = 0
-        v._fn_mismatch = mismatch_deg
-        fleet.append(v)
-    return fleet
-
-
-def update_blind_cog_border_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
-    """
-    COG를 서서히 변경하되 HDG는 항상 COG + mismatch_deg로 유지.
-    100도 미만이므로 Check 4 탐지 안됨.
-    """
-    for v in fleet:
-        if not hasattr(v, "_fn_mismatch"):
-            continue
-        if random.random() < 0.1:
-            v.cog = (v.cog + random.uniform(-10, 10)) % 360
-        v.heading = int((v.cog + v._fn_mismatch) % 360)
-        step = v.sog * _KN_TO_DEG_PER_SEC * dt
-        v.lat += math.cos(math.radians(v.cog)) * step
-        v.lon += math.sin(math.radians(v.cog)) * step
-
-
-# ──────────────────────────────────────────────────
-# [FN-4] navStatus 회피 (Unchecked Status Spoofing)
-#
-# 탐지 회피 원리:
-#   Check 3: navStatus == 1(정박) / 5(계류) / 6(좌초) 만 검사
-#   → navStatus 2(조종불능), 3(조종제한), 7(어로작업중),
-#     8(범주추진), 11(예인 중), 12(계류) 에서 SOG >= 0.5여도 탐지 안됨
-#   → 반대로 navStatus 0(항해 중)인데 SOG=0이어도 탐지 안됨
-#   개선 방향: 검사 대상 navStatus를 확장해야 함.
-# ──────────────────────────────────────────────────
-
-# Check 3이 검사하지 않는 navStatus 목록
-_UNCHECKED_STATUSES = [2, 3, 7, 8, 11, 12]
-_UNCHECKED_STATUS_NAMES = {
-    2: "조종불능(2)", 3: "조종제한(3)", 7: "어로작업(7)",
-    8: "범주추진(8)", 11: "예인중(11)", 12: "계류예외(12)"
-}
-
-
-def make_blind_nav_status_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg.get("fn_nav_count", 12))
-    move_sog = float(cfg.get("fn_nav_sog", 3.0))   # >= 0.5 이면 Check 3에 걸려야 함
-
-    fleet = []
-    for i in range(count):
-        status = _UNCHECKED_STATUSES[i % len(_UNCHECKED_STATUSES)]
-        v = Vessel(991400000 + i, f"GHOST-FN4-{i+1:03d}", nav_status=status)
-        v.lat = center_lat + random.uniform(-0.05, 0.05)
-        v.lon = center_lon + random.uniform(-0.05, 0.05)
-        v.sog = move_sog
-        v.cog = random.uniform(0, 360)
-        v.heading = int(v.cog)
-        v._fn_status_label = _UNCHECKED_STATUS_NAMES.get(status, str(status))
-        fleet.append(v)
-    return fleet
-
-
-def update_blind_nav_status_fleet(fleet, elapsed: float, dt: float, cfg: dict) -> None:
-    """
-    navStatus를 Check 3의 검사 대상(1/5/6) 이외로 유지하면서
-    SOG >= 0.5로 이동. IDS는 이 이동을 탐지하지 못한다.
-    """
-    for v in fleet:
-        if random.random() < 0.05:
-            v.cog = (v.cog + random.uniform(-15, 15)) % 360
-        v.heading = int(v.cog)
-        step = v.sog * _KN_TO_DEG_PER_SEC * dt
-        v.lat += math.cos(math.radians(v.cog)) * step
-        v.lon += math.sin(math.radians(v.cog)) * step
-
-
-
-
-def make_jbu_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    scale = float(cfg["jbu_scale"])
-
-    j_points = [
-        (0.08, 0.04), (0.05, 0.04), (0.02, 0.04),
-        (-0.01, 0.04), (-0.04, 0.03), (-0.06, 0.01), (-0.06, -0.02),
-    ]
-    b_points = [
-        (0.08, 0.0), (0.04, 0.0), (0.0, 0.0), (-0.04, 0.0), (-0.08, 0.0),
-        (-0.06, 0.025), (-0.04, 0.04), (-0.02, 0.025), (0.0, 0.0),
-        (0.02, 0.025), (0.04, 0.04), (0.06, 0.025), (0.08, 0.0),
-    ]
-    u_points = [
-        (0.08, 0.0), (0.04, 0.0), (0.0, 0.0), (-0.04, 0.005),
-        (-0.07, 0.02), (-0.07, 0.05), (-0.04, 0.06),
-        (0.0, 0.06), (0.04, 0.05), (0.08, 0.02),
-    ]
-
-    j_offset = (-0.12 * scale, -0.28 * scale)
-    b_offset = (-0.12 * scale, -0.06 * scale)
-    u_offset = (-0.12 * scale,  0.16 * scale)
-
-    fleet = []
-
-    def make_letter(points, offset, prefix, start_mmsi):
-        ships = []
-        for index, (dlat, dlon) in enumerate(points):
-            vessel = Vessel(start_mmsi + index, f"{prefix}{index + 1:02d}")
-            vessel.lat = center_lat + offset[0] + dlat * scale
-            vessel.lon = center_lon + offset[1] + dlon * scale
-            vessel._waypoints = [
-                (center_lat + offset[0] + lat * scale, center_lon + offset[1] + lon * scale)
-                for lat, lon in points
-            ]
-            vessel._base_waypoints = list(vessel._waypoints)
-            vessel._wp_idx = index % len(points)
-            vessel._wp_progress = 0.0
-            vessel.sog = 3.0 + random.uniform(-0.5, 0.5)
-            ships.append(vessel)
-        return ships
-
-    fleet.extend(make_letter(j_points, j_offset, "GHOST-J", 990200000))
-    fleet.extend(make_letter(b_points, b_offset, "GHOST-B", 990300000))
-    fleet.extend(make_letter(u_points, u_offset, "GHOST-U", 990400000))
-    return fleet
-
-
-def update_jbu_fleet(fleet, dt: float, cfg: dict, elapsed: float) -> None:
-    dlat, dlon = translation_offset(cfg, elapsed)
-
-    for vessel in fleet:
-        if not hasattr(vessel, "_waypoints") or len(vessel._waypoints) < 2:
-            continue
-
-        # 웨이포인트 이동 적용
-        vessel._waypoints = [
-            (blat + dlat, blon + dlon)
-            for blat, blon in vessel._base_waypoints
-        ]
-
-        waypoints = vessel._waypoints
-        current = vessel._wp_idx % len(waypoints)
-        nxt = (current + 1) % len(waypoints)
-        clat, clon = waypoints[current]
-        nlat, nlon = waypoints[nxt]
-
-        distance = math.sqrt((nlat - clat) ** 2 + (nlon - clon) ** 2)
-        if distance < 1e-9:
-            vessel._wp_idx = nxt
-            continue
-
-        step = vessel.sog * _KN_TO_DEG_PER_SEC * dt
-        vessel._wp_progress += step / distance
-        if vessel._wp_progress >= 1.0:
-            vessel._wp_progress = 0.0
-            vessel._wp_idx = nxt
-            current, nxt = nxt, (nxt + 1) % len(waypoints)
-            clat, clon = waypoints[current]
-            nlat, nlon = waypoints[nxt]
-
-        progress = vessel._wp_progress
-        vessel.lat = clat + (nlat - clat) * progress
-        vessel.lon = clon + (nlon - clon) * progress
-        dx = nlon - clon
-        dy = nlat - clat
-        vessel.cog = math.degrees(math.atan2(dx, dy)) % 360
-        vessel.heading = int(vessel.cog)
-
-
-# ──────────────────────────────────────────────────
-# 집게 협공 (Pincer)  ─ 신규 패턴
-# ──────────────────────────────────────────────────
-
-def make_pincer_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg.get("pincer_count", 20))
-    width = float(cfg.get("pincer_width", 0.5))
-    depth = float(cfg.get("pincer_depth", 0.3))
-
-    fleet = []
-    half = count // 2
-    for i in range(half):
-        # 좌측 날개
-        t = i / max(half - 1, 1)
-        lat = center_lat + depth * (1 - t)
-        lon = center_lon - width * t
-        v = Vessel(990800000 + i, f"GHOST-PL{i + 1:02d}")
-        v.lat = lat; v.lon = lon
-        v._target_lat = center_lat; v._target_lon = center_lon
-        v.sog = 8.0 + random.uniform(-1, 1)
-        v.cog = math.degrees(math.atan2(
-            center_lon - lon, center_lat - lat)) % 360
-        v.heading = int(v.cog)
-        fleet.append(v)
-
-        # 우측 날개
-        v2 = Vessel(990800000 + half + i, f"GHOST-PR{i + 1:02d}")
-        v2.lat = lat; v2.lon = center_lon + width * t
-        v2._target_lat = center_lat; v2._target_lon = center_lon
-        v2.sog = 8.0 + random.uniform(-1, 1)
-        v2.cog = math.degrees(math.atan2(
-            center_lon - v2.lon, center_lat - v2.lat)) % 360
-        v2.heading = int(v2.cog)
-        fleet.append(v2)
-
-    return fleet
-
-
-def update_pincer_fleet(fleet, dt: float, cfg: dict, elapsed: float) -> None:
-    dlat, dlon = translation_offset(cfg, elapsed)
-    pincer_speed = float(cfg.get("pincer_speed", 8.0))
-
-    for vessel in fleet:
-        if not hasattr(vessel, "_target_lat"):
-            continue
-        target_lat = vessel._target_lat + dlat
-        target_lon = vessel._target_lon + dlon
-        diff_lat = target_lat - vessel.lat
-        diff_lon = target_lon - vessel.lon
-        dist = math.sqrt(diff_lat ** 2 + diff_lon ** 2) + 1e-9
-        step = pincer_speed * _KN_TO_DEG_PER_SEC * dt
-        if dist > 0.001:
-            vessel.lat += (diff_lat / dist) * step
-            vessel.lon += (diff_lon / dist) * step
-        vessel.cog = math.degrees(math.atan2(diff_lon, diff_lat)) % 360
-        vessel.heading = int(vessel.cog)
-        vessel.sog = pincer_speed
-
-
-# ──────────────────────────────────────────────────
-# 파상 대형 (Wave)  ─ 신규 패턴
-# ──────────────────────────────────────────────────
-
-def make_wave_fleet(cfg):
-    center_lat = float(cfg["center_lat"])
-    center_lon = float(cfg["center_lon"])
-    count = int(cfg.get("wave_count", 24))
-    width = float(cfg.get("wave_width", 0.6))
-    amplitude = float(cfg.get("wave_amplitude", 0.15))
-    lanes = int(cfg.get("wave_lanes", 3))
-
-    fleet = []
-    per_lane = count // max(lanes, 1)
-    for lane in range(lanes):
-        lon_offset = center_lon + (lane - lanes / 2) * (width / lanes)
-        for i in range(per_lane):
-            idx = lane * per_lane + i
-            t = i / max(per_lane - 1, 1)
-            lat = center_lat - amplitude * 2 * t  # 북에서 남으로 정렬
-            v = Vessel(990900000 + idx, f"GHOST-W{idx + 1:02d}")
-            v.lat = lat
-            v.lon = lon_offset
-            v._wave_phase = (i / per_lane) * 2 * math.pi + lane * math.pi / lanes
-            v._wave_base_lon = lon_offset
-            v._wave_amplitude = amplitude
-            v.sog = 10.0
-            v.cog = 180.0
-            v.heading = 180
+    def make(self,cfg):
+        n=int(cfg.get("count",25)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(990100000+i,f"SPK-{i+1:03d}")
+            _place(v,cl,cn,0.06); v.sog=float(cfg.get("sog_base",8))
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("base",v.sog); v.sx("spike",float(cfg.get("sog_spike",32)))
+            v.sx("mode",cfg.get("mode","간헐")); v.sx("itv",float(cfg.get("interval",10)))
+            v.sx("last_sp",0.0); v.sx("sp_on",False)
             fleet.append(v)
-    return fleet
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            if elapsed-v.x("last_sp")>=v.x("itv"):
+                v.sx("last_sp",elapsed)
+                if v.x("mode")=="간헐": v.sx("sp_on",not v.x("sp_on"))
+                else: v.sx("sp_on",True)
+            v.sog=v.x("spike") if v.x("sp_on") else v.x("base")
+            if v.x("mode")=="순간" and v.x("sp_on"): v.sx("sp_on",False)
+            if random.random()<0.15: v.cog=(v.cog+random.uniform(-20,20))%360
+            v.hdg=int(v.cog); _step(v,dt)
 
 
-def update_wave_fleet(fleet, t: float, cfg: dict) -> None:
-    dlat, dlon = translation_offset(cfg, t)
-    wave_speed = float(cfg.get("wave_speed", 10.0))
-    wave_freq = float(cfg.get("wave_freq", 0.05))
+# ─── A2  정박 이동 이상 ───────────────────────────
+@_reg
+class AnchorMove(AttackPlugin):
+    meta = AttackMeta(
+        key="anchor_move", label="A2  정박 이동 이상",
+        category="A",
+        purpose="navStatus=1 + SOG≥0.5 불일치 탐지",
+        evasion="없음 — IDS Check3 검증용",
+        expected_fn="정박 중 이동 즉시 탐지")
 
-    for vessel in fleet:
-        if not hasattr(vessel, "_wave_phase"):
-            continue
-        # 남진
-        step = wave_speed * _KN_TO_DEG_PER_SEC * 0.1
-        vessel.lat -= step
-        # 횡방향 사인파
-        lon_offset = vessel._wave_amplitude * math.sin(vessel._wave_phase + t * wave_freq)
-        vessel.lon = vessel._wave_base_lon + lon_offset + dlon
-        vessel.lat += dlat * 0.001
+    def param_defs(self):
+        return [_pi("선박 수","count",1,300,30),
+                _pi("반경 (도)","radius",0.01,1.0,0.10,0.01),
+                _pi("이상 속도 (kn)","sog",0.1,10,3.0,0.1),
+                _pi("COG (도)","cog",0,359,90,5)]
 
-        # 방향 갱신
-        vessel.cog = (180 + math.degrees(math.atan2(
-            lon_offset - vessel._wave_amplitude * math.sin(vessel._wave_phase + (t - 0.1) * wave_freq),
-            -step * 111000
-        ))) % 360
-        vessel.heading = int(vessel.cog)
+    def make(self,cfg):
+        n=int(cfg.get("count",30)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(990500000+i,f"ANC-{i+1:03d}",nav=1)
+            _place(v,cl,cn,float(cfg.get("radius",0.1)))
+            v.sog=float(cfg.get("sog",3)); v.cog=float(cfg.get("cog",90))
+            v.hdg=int((v.cog+120)%360)
+            fleet.append(v)
+        return fleet
 
-
-# ──────────────────────────────────────────────────
-# 앵커 선박
-# ──────────────────────────────────────────────────
-
-def make_anchor_vessel(cfg) -> Vessel:
-    anchor = Vessel(440123456, "BUSAN ANCHOR", nav_status=1)
-    anchor.lat = float(cfg["center_lat"])
-    anchor.lon = float(cfg["center_lon"])
-    anchor.sog = 0.0
-    anchor.cog = 0.0
-    anchor.heading = 45
-    return anchor
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            _step(v,dt); v.hdg=int((v.cog+120)%360)
 
 
-# ──────────────────────────────────────────────────
-# 선단 빌드 / 업데이트 디스패처
-# ──────────────────────────────────────────────────
+# ─── A3  COG/HDG 불일치 ──────────────────────────
+@_reg
+class CourseMismatch(AttackPlugin):
+    meta = AttackMeta(
+        key="course_mismatch", label="A3  COG/HDG 불일치",
+        category="A",
+        purpose="COG-HDG diff>100° 탐지",
+        evasion="없음 — IDS Check4 검증용",
+        expected_fn="불일치 즉시 탐지")
 
-def build_generated_fleet(cfg) -> list[Vessel]:
-    attack_key = str(cfg["attack_key"])
-    builders = {
-        "speed_spike":     make_speed_spike_fleet,
-        "anchor_move":     make_anchor_move_fleet,
-        "course_mismatch": make_course_mismatch_fleet,
-        "position_jump":   make_position_jump_fleet,
-        # IDS false-negative 케이스
-        "blind_dt_jump":    make_blind_dt_jump_fleet,
-        "blind_speed_ramp": make_blind_speed_ramp_fleet,
-        "blind_cog_border": make_blind_cog_border_fleet,
-        "blind_nav_status": make_blind_nav_status_fleet,
-    }
-    if attack_key not in builders:
-        raise ValueError(f"지원하지 않는 패턴입니다: {attack_key}")
-    fleet = builders[attack_key](cfg)
-    if cfg.get("add_anchor"):
-        fleet.append(make_anchor_vessel(cfg))
-    return fleet
+    def param_defs(self):
+        return [_pi("선박 수","count",3,200,20),
+                _pi("불일치 각도 (도)","mismatch",101,180,150,5),
+                _pi("SOG (kn)","sog",0.5,30,10,0.5),
+                _pi("COG 변화율","drift",0,20,5,0.5)]
 
+    def make(self,cfg):
+        n=int(cfg.get("count",20)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(990600000+i,f"CMM-{i+1:03d}")
+            _place(v,cl,cn,0.05); v.sog=float(cfg.get("sog",10))
+            v.cog=random.uniform(0,360)
+            v.hdg=int((v.cog+float(cfg.get("mismatch",150)))%360)
+            v.sx("drift",float(cfg.get("drift",5)))
+            fleet.append(v)
+        return fleet
 
-def update_generated_fleet(fleet, attack_key: str, tick: float, interval: float, cfg: dict) -> None:
-    if attack_key == "speed_spike":
-        update_speed_spike_fleet(fleet, tick, interval, cfg)
-    elif attack_key == "anchor_move":
-        update_anchor_move_fleet(fleet, tick, interval, cfg)
-    elif attack_key == "course_mismatch":
-        update_course_mismatch_fleet(fleet, tick, interval, cfg)
-    elif attack_key == "position_jump":
-        update_position_jump_fleet(fleet, tick, interval, cfg)
-    # IDS false-negative 케이스
-    elif attack_key == "blind_dt_jump":
-        update_blind_dt_jump_fleet(fleet, tick, interval, cfg)
-    elif attack_key == "blind_speed_ramp":
-        update_blind_speed_ramp_fleet(fleet, tick, interval, cfg)
-    elif attack_key == "blind_cog_border":
-        update_blind_cog_border_fleet(fleet, tick, interval, cfg)
-    elif attack_key == "blind_nav_status":
-        update_blind_nav_status_fleet(fleet, tick, interval, cfg)
+    def update(self,fleet,elapsed,dt,cfg):
+        mm=float(cfg.get("mismatch",150))
+        for v in fleet:
+            if random.random()<0.1: v.cog=(v.cog+random.uniform(-v.x("drift"),v.x("drift")))%360
+            v.hdg=int((v.cog+mm)%360); _step(v,dt)
 
 
-# ──────────────────────────────────────────────────
-# 송신 루프
-# ──────────────────────────────────────────────────
+# ─── A4  위치 점프 ────────────────────────────────
+@_reg
+class PositionJump(AttackPlugin):
+    meta = AttackMeta(
+        key="position_jump", label="A4  위치 점프",
+        category="A",
+        purpose="Haversine 거리 > 5km/min 탐지",
+        evasion="없음 — IDS Check6 검증용",
+        expected_fn="위치 점프 즉시 탐지")
 
-def send_generated_loop_v3(cfg, log_q, stop_signal: threading.Event) -> bool:
-    host = str(cfg["host"])
-    port = int(cfg["port"])
-    interval = float(cfg["interval"])
-    attack_key = str(cfg["attack_key"])
-    attack_label = str(cfg["attack_label"])
+    def param_defs(self):
+        return [_pi("선박 수","count",1,300,30),
+                _pi("점프 반경 (도)","radius",0.05,2.0,0.3,0.05),
+                _pi("점프 주기 (초)","interval",1,60,10,0.5)]
 
-    fleet = build_generated_fleet(cfg)
-    name_sent: set[int] = set()
-    tick = 0.0
-    iteration = 0
-    start_time = time.time()
+    def make(self,cfg):
+        n=int(cfg.get("count",30)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(990700000+i,f"JMP-{i+1:03d}")
+            _place(v,cl,cn,float(cfg.get("radius",0.3)))
+            v.sog=random.uniform(2,10); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("r",float(cfg.get("radius",0.3))); v.sx("itv",float(cfg.get("interval",10)))
+            v.sx("last_j",0.0)
+            fleet.append(v)
+        return fleet
 
-    move_speed = float(cfg.get("move_speed", 0.0))
-    move_heading = float(cfg.get("move_heading", 0.0))
-    queue_log(log_q, f"[생성 시작] 패턴: {attack_label} | 선박 {len(fleet)}척", "start")
-    queue_log(log_q, f"[생성 전송] {host}:{port} | 주기 {interval:.2f}s", "info")
-    if move_speed > 0:
-        queue_log(log_q, f"[이동] 속도 {move_speed:.1f}kn | 방향 {move_heading:.0f}°", "info")
-
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        while not stop_signal.is_set():
-            iteration += 1
-            cycle_start = time.time()
-            elapsed = cycle_start - start_time
-            tick = elapsed  # 경과 시간 기준으로 tick 동기화
-
-            update_generated_fleet(fleet, attack_key, tick, interval, cfg)
-
-            sent = 0
-            for vessel in fleet:
-                if stop_signal.is_set():
-                    return False
-
-                if vessel.mmsi not in name_sent:
-                    sock.sendto(vessel.name_message().encode("ascii"), (host, port))
-                    name_sent.add(vessel.mmsi)
-                    if not sleep_with_event(stop_signal, 0.01):
-                        return False
-
-                sock.sendto(vessel.position_message().encode("ascii"), (host, port))
-                sent += 1
-                if not sleep_with_event(stop_signal, 0.005):
-                    return False
-
-            elapsed2 = time.time() - cycle_start
-            if iteration == 1 or iteration % 5 == 0:
-                dlat, dlon = translation_offset(cfg, tick)
-                queue_log(
-                    log_q,
-                    f"[생성] {iteration}회차 | {sent}건 | {elapsed2:.2f}s | 오프셋 Δlat={dlat:.4f} Δlon={dlon:.4f}",
-                    "info",
-                )
-            if not sleep_with_event(stop_signal, max(0.0, interval - elapsed2)):
-                return False
-    return False
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            if elapsed-v.x("last_j")>=v.x("itv"):
+                v.sx("last_j",elapsed)
+                v.lat+=random.choice([-1,1])*random.uniform(0.08,0.2)
+                v.lon+=random.choice([-1,1])*random.uniform(0.08,0.2)
+                v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            _step(v,dt)
 
 
-def send_file_loop_v2(cfg, log_q, stop_signal: threading.Event) -> bool:
-    host = str(cfg["host"])
-    port = int(cfg["port"])
-    file_path = Path(str(cfg["file_path"]))
-    interval = float(cfg["file_interval"])
-    repeat = bool(cfg["file_repeat"])
-    messages = load_nmea(file_path)
+# ─── B1  고스트쉽 원형 정지 ──────────────────────
+@_reg
+class GhostCircleStatic(AttackPlugin):
+    meta = AttackMeta(
+        key="ghost_circle", label="B1  고스트쉽 원형 정지",
+        category="B",
+        purpose="갑작스러운 위치 출현 + navStatus=1",
+        evasion="출현/소멸 반복으로 IDS 이력 초기화 유도",
+        expected_fn="출현 시 위치 점프, 소멸 후 재출현은 신호 소실로 탐지")
 
-    queue_log(log_q, f"[파일 시작] {file_path.name} | AIVDM {len(messages)}개", "start")
-    queue_log(log_q, f"[파일 전송] {host}:{port} | 간격 {interval:.2f}s | 반복 {'켜짐' if repeat else '꺼짐'}", "info")
+    def param_defs(self):
+        return [_pi("선박 수","count",4,100,20),
+                _pi("원 반경 (도)","radius",0.01,1.0,0.15,0.01),
+                _pi("출현 주기 (초)","appear",5,300,30,5),
+                _pi("유지 시간 (초)","vanish",5,300,20,5)]
 
-    sent_count = 0
-    cycle = 0
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        while not stop_signal.is_set():
-            cycle += 1
-            for index, message in enumerate(messages, start=1):
-                if stop_signal.is_set():
-                    return False
-                sock.sendto(message.encode("ascii"), (host, port))
-                sent_count += 1
-                queue_log(log_q, f"[파일 {index:04d}] {message.strip()}", "info")
-                if not sleep_with_event(stop_signal, interval):
-                    return False
+    def make(self,cfg):
+        n=int(cfg.get("count",20)); cl=cfg["clat"]; cn=cfg["clon"]
+        r=float(cfg.get("radius",0.15))
+        ap=float(cfg.get("appear",30)); va=float(cfg.get("vanish",20))
+        fleet=[]
+        for i in range(n):
+            ang=2*math.pi*i/n
+            v=Vessel(991000000+i,f"GHO-{i+1:02d}",nav=1)
+            v.sx("clat",cl+math.cos(ang)*r); v.sx("clon",cn+math.sin(ang)*r*1.2)
+            v.lat=0; v.lon=0; v.sog=0; v.cog=0; v.hdg=int(math.degrees(ang))
+            v.sx("ap",ap); v.sx("va",va); v.sx("last",-(ap)); v.sx("vis",False)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            since=elapsed-v.x("last")
+            if not v.x("vis"):
+                if since>=v.x("ap"):
+                    v.lat=v.x("clat")+random.uniform(-0.002,0.002)
+                    v.lon=v.x("clon")+random.uniform(-0.002,0.002)
+                    v.sx("last",elapsed); v.sx("vis",True)
+            else:
+                if since>=v.x("va"):
+                    v.lat=0; v.lon=0; v.sx("vis",False); v.sx("last",elapsed)
+
+
+# ─── B2  원형 순찰 (자연스러운 CTRV 기반) ────────
+@_reg
+class CirclePatrol(AttackPlugin):
+    meta = AttackMeta(
+        key="circle_patrol", label="B2  원형 순찰",
+        category="B",
+        purpose="원형 항적 패턴 + 선택적 속도 이상 주입",
+        evasion="일정 각속도 유지 → CTRV 모델 잔차 낮음",
+        expected_fn="속도 이상 주입 구간에서 SOG 초과 탐지")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",2,100,15),
+                _pi("순찰 반경 (도)","radius",0.05,1.0,0.2,0.01),
+                _pi("기본 SOG (kn)","sog",1,40,12,0.5),
+                _pi("이상 SOG (kn, 0=없음)","spike_sog",0,60,0,1),
+                _pi("이상 주기 (초)","spike_itv",5,120,20,5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",15)); cl=cfg["clat"]; cn=cfg["clon"]
+        r=float(cfg.get("radius",0.2)); sog=float(cfg.get("sog",12))
+        fleet=[]
+        for i in range(n):
+            ang=2*math.pi*i/n
+            v=Vessel(991050000+i,f"CPT-{i+1:02d}")
+            v.lat=cl+math.cos(ang)*r; v.lon=cn+math.sin(ang)*r*1.2
+            v.sog=sog+random.uniform(-0.5,0.5)
+            v.cog=(math.degrees(ang)+90)%360; v.hdg=int(v.cog)
+            v.sx("ang",ang); v.sx("r",r); v.sx("cl",cl); v.sx("cn",cn)
+            v.sx("base_sog",v.sog); v.sx("spike",float(cfg.get("spike_sog",0)))
+            v.sx("sitv",float(cfg.get("spike_itv",20)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        base_sog=float(cfg.get("sog",12)); spike=float(cfg.get("spike_sog",0))
+        sitv=float(cfg.get("spike_itv",20))
+        for v in fleet:
+            circ=2*math.pi*v.x("r")
+            omega=v.sog*_KN_TO_DPS/(circ+1e-9)
+            v.sx("ang",(v.x("ang")+omega*dt)%(2*math.pi))
+            v.lat=v.x("cl")+math.cos(v.x("ang"))*v.x("r")
+            v.lon=v.x("cn")+math.sin(v.x("ang"))*v.x("r")*1.2
+            v.cog=(math.degrees(v.x("ang"))+90)%360; v.hdg=int(v.cog)
+            if spike>0 and (elapsed%sitv)/sitv<0.12:
+                v.sog=spike
+            else:
+                v.sog=base_sog+random.uniform(-0.3,0.3)
+
+
+# ─── B3  직선 왕복 (가속/감속 포함) ─────────────
+@_reg
+class LinearBounce(AttackPlugin):
+    meta = AttackMeta(
+        key="linear_bounce", label="B3  직선 왕복",
+        category="B",
+        purpose="직선 왕복 + 이상 속도 주입",
+        evasion="반환점 근처 자연스러운 감속/가속 포함",
+        expected_fn="이상 속도 구간 탐지")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,100,15),
+                _pi("왕복 길이 (도)","length",0.1,2.0,0.4,0.05),
+                _pi("방향 (도)","hdg",0,359,0,5),
+                _pi("기본 SOG (kn)","sog",1,30,10,0.5),
+                _pi("이상 SOG (kn, 0=없음)","spike_sog",0,60,0,1),
+                _pi("이상 주기 (초)","spike_itv",5,120,20,5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",15)); cl=cfg["clat"]; cn=cfg["clon"]
+        L=float(cfg.get("length",0.4)); hdg=float(cfg.get("hdg",0))
+        sog=float(cfg.get("sog",10)); rad=math.radians(hdg)
+        fleet=[]
+        for i in range(n):
+            t=i/max(n-1,1)
+            perp=math.radians(hdg+90); sp=(i-n//2)*0.003
+            v=Vessel(991100000+i,f"LBN-{i+1:02d}")
+            v.lat=cl+math.cos(rad)*L*(t-0.5)+math.cos(perp)*sp
+            v.lon=cn+math.sin(rad)*L*(t-0.5)*1.2+math.sin(perp)*sp*1.2
+            v.sog=sog+random.uniform(-0.5,0.5); v.cog=hdg; v.hdg=int(hdg)
+            v.sx("s_lat",cl-math.cos(rad)*L/2)
+            v.sx("s_lon",cn-math.sin(rad)*L/2*1.2)
+            v.sx("e_lat",cl+math.cos(rad)*L/2)
+            v.sx("e_lon",cn+math.sin(rad)*L/2*1.2)
+            v.sx("fwd",t<0.5); v.sx("base_sog",v.sog)
+            v.sx("spike",float(cfg.get("spike_sog",0)))
+            v.sx("sitv",float(cfg.get("spike_itv",20)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        spike=float(cfg.get("spike_sog",0)); sitv=float(cfg.get("spike_itv",20))
+        for v in fleet:
+            # 반환점 근처 감속 (자연스러운 패턴)
+            fwd=v.x("fwd")
+            tx=v.x("e_lat") if fwd else v.x("s_lat")
+            ty=v.x("e_lon") if fwd else v.x("s_lon")
+            dist=math.sqrt((tx-v.lat)**2+(ty-v.lon)**2)+1e-9
+            decel=min(1.0,dist/0.02)  # 반환점 0.02도 전부터 감속
+            if spike>0 and (elapsed%sitv)/sitv<0.12:
+                v.sog=spike
+            else:
+                v.sog=v.x("base_sog")*decel+0.3
+            step=v.sog*_KN_TO_DPS*dt
+            if dist<step*2: v.sx("fwd",not fwd)
+            else:
+                dl=tx-v.lat; dn=ty-v.lon
+                v.lat+=dl/dist*step; v.lon+=dn/dist*step
+            v.cog=math.degrees(math.atan2(ty-v.lat,tx-v.lon)+1e-9)%360
+            v.hdg=int(v.cog)
+
+
+# ─── B4  실제 항로 모방 + 이상 속도 ─────────────
+_ROUTE_WPS=[
+    (-0.20,0.00),(-0.13,0.07),(-0.05,0.14),(0.03,0.19),
+    (0.10,0.17),(0.15,0.09),(0.18,0.00),(0.14,-0.10),
+    (0.07,-0.17),(0.00,-0.20),(-0.10,-0.14),(-0.17,-0.07),(-0.20,0.00)
+]
+
+@_reg
+class RealisticRoute(AttackPlugin):
+    meta = AttackMeta(
+        key="realistic_route", label="B4  실제루트 이상속도",
+        category="B",
+        purpose="정상 항로 이동 중 특정 WP에서 SOG 이상",
+        evasion="13개 웨이포인트 실항로 → route conformance 통과",
+        expected_fn="이상 SOG 구간에서 shipType maxSOG 초과 탐지")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("정상 SOG (kn)","sog_n",1,30,12,0.5),
+                _pi("이상 SOG (kn)","sog_s",1,60,35,1),
+                _pi("이상 WP 인덱스 (0~12)","spike_wp",0,12,4,1)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        wps=[(cl+d[0],cn+d[1]*1.2) for d in _ROUTE_WPS]
+        fleet=[]
+        for i in range(n):
+            si=int(i/n*len(wps))%len(wps)
+            v=Vessel(991200000+i,f"RRT-{i+1:02d}")
+            v.lat,v.lon=wps[si]
+            v.lat+=random.uniform(-0.004,0.004); v.lon+=random.uniform(-0.004,0.004)
+            v.sog=float(cfg.get("sog_n",12)); v.cog=0; v.hdg=0
+            v.sx("wps",wps); v.sx("wi",si); v.sx("prog",0.0)
+            v.sx("sog_n",float(cfg.get("sog_n",12)))
+            v.sx("sog_s",float(cfg.get("sog_s",35)))
+            v.sx("swp",int(cfg.get("spike_wp",4)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            wps=v.x("wps"); wi=v.x("wi"); nxt=(wi+1)%len(wps)
+            cy,cx=wps[wi]; ny,nx=wps[nxt]
+            d=math.sqrt((ny-cy)**2+(nx-cx)**2)+1e-9
+            v.sog=v.x("sog_s") if wi==v.x("swp") else v.x("sog_n")
+            v.sx("prog",v.x("prog")+v.sog*_KN_TO_DPS*dt/d)
+            if v.x("prog")>=1.0:
+                v.sx("prog",0.0); v.sx("wi",(wi+1)%len(wps))
+                wi=(wi+1)%len(wps); nxt=(wi+1)%len(wps)
+                cy,cx=wps[wi]; ny,nx=wps[nxt]; d=math.sqrt((ny-cy)**2+(nx-cx)**2)+1e-9
+            p=v.x("prog")
+            v.lat=cy+(ny-cy)*p; v.lon=cx+(nx-cx)*p
+            v.cog=math.degrees(math.atan2(nx-cx,ny-cy)+1e-9)%360; v.hdg=int(v.cog)
+
+
+# ─── B5  JBU 글자 선단 ───────────────────────────
+_J=[( 0.08,0.04),(0.05,0.04),(0.02,0.04),(-0.01,0.04),(-0.04,0.03),(-0.06,0.01),(-0.06,-0.02)]
+_B=[( 0.08,0.0),(0.04,0.0),(0.00,0.0),(-0.04,0.0),(-0.08,0.0),(-0.06,0.025),(-0.04,0.04),
+    (-0.02,0.025),(0.0,0.0),(0.02,0.025),(0.04,0.04),(0.06,0.025),(0.08,0.0)]
+_U=[( 0.08,0.0),(0.04,0.0),(0.00,0.0),(-0.04,0.005),(-0.07,0.02),(-0.07,0.05),
+    (-0.04,0.06),(0.0,0.06),(0.04,0.05),(0.08,0.02)]
+
+@_reg
+class JBUFleet(AttackPlugin):
+    meta = AttackMeta(
+        key="jbu_fleet", label="B5  JBU 글자 선단",
+        category="B",
+        purpose="다수 선박 협조 이동으로 문자 형태 구성",
+        evasion="각 선박의 개별 거동은 저속 정상 범위 내",
+        expected_fn="fleet-level 협조 패턴 탐지 가능")
+
+    def param_defs(self):
+        return [_pi("글자 크기 배율","scale",0.5,5.0,1.0,0.1)]
+
+    def make(self,cfg):
+        cl=cfg["clat"]; cn=cfg["clon"]; sc=float(cfg.get("scale",1.0))
+        fleet=[]
+        def mk(pts,off_lat,off_lon,pfx,base_mmsi):
+            for idx,(dl,dn) in enumerate(pts):
+                v=Vessel(base_mmsi+idx,f"{pfx}{idx+1:02d}")
+                v.lat=cl+off_lat+dl*sc; v.lon=cn+off_lon+dn*sc
+                wps=[(cl+off_lat+p[0]*sc,cn+off_lon+p[1]*sc) for p in pts]
+                v.sx("wps",wps); v.sx("bwps",list(wps))
+                v.sx("wi",idx%len(pts)); v.sx("prog",0.0)
+                v.sog=3.0+random.uniform(-0.3,0.3)
+                fleet.append(v)
+        mk(_J,-0.12*sc,-0.28*sc,"J-",990200000)
+        mk(_B,-0.12*sc,-0.06*sc,"B-",990300000)
+        mk(_U,-0.12*sc, 0.16*sc,"U-",990400000)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            wps=v.x("wps"); wi=v.x("wi"); nxt=(wi+1)%len(wps)
+            cy,cx=wps[wi]; ny,nx=wps[nxt]
+            d=math.sqrt((ny-cy)**2+(nx-cx)**2)+1e-9
+            v.sx("prog",v.x("prog")+v.sog*_KN_TO_DPS*dt/d)
+            if v.x("prog")>=1.0:
+                v.sx("prog",0.0); v.sx("wi",nxt)
+            p=v.x("prog")
+            v.lat=cy+(ny-cy)*p; v.lon=cx+(nx-cx)*p
+            v.cog=math.degrees(math.atan2(nx-cx,ny-cy)+1e-9)%360; v.hdg=int(v.cog)
+
+
+# ─── B6  집게 협공 ────────────────────────────────
+@_reg
+class Pincer(AttackPlugin):
+    meta = AttackMeta(
+        key="pincer", label="B6  집게 협공",
+        category="B",
+        purpose="다수 선박 중심점 수렴 패턴",
+        evasion="없음 — fleet 협조 패턴 탐지 검증",
+        expected_fn="fleet-level 수렴 피처 탐지")
+
+    def param_defs(self):
+        return [_pi("선박 수 (양날 합)","count",4,80,20,2),
+                _pi("날개 폭 (도)","width",0.05,2,0.5,0.05),
+                _pi("종심 (도)","depth",0.05,1.5,0.3,0.05),
+                _pi("수렴 속도 (kn)","speed",1,30,8,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",20)); cl=cfg["clat"]; cn=cfg["clon"]
+        w=float(cfg.get("width",0.5)); dep=float(cfg.get("depth",0.3))
+        half=n//2; fleet=[]
+        for i in range(half):
+            t=i/max(half-1,1)
+            for side,sign in [("L",-1),("R",1)]:
+                mmsi=990800000+(i if side=="L" else half+i)
+                v=Vessel(mmsi,f"PNC-{side}{i+1:02d}")
+                v.lat=cl+dep*(1-t); v.lon=cn+sign*w*t
+                v.sx("tl",cl); v.sx("tn",cn)
+                v.sog=float(cfg.get("speed",8))+random.uniform(-0.5,0.5)
+                v.cog=math.degrees(math.atan2(cn-v.lon,cl-v.lat)+1e-9)%360
+                v.hdg=int(v.cog)
+                fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        spd=float(cfg.get("speed",8))
+        for v in fleet:
+            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
+            dist=math.sqrt(dl**2+dn**2)+1e-9
+            step=spd*_KN_TO_DPS*dt
+            if dist>0.001: v.lat+=dl/dist*step; v.lon+=dn/dist*step
+            v.cog=math.degrees(math.atan2(dn,dl)+1e-9)%360; v.hdg=int(v.cog); v.sog=spd
+
+
+# ─── B7  파상 대형 ────────────────────────────────
+@_reg
+class Wave(AttackPlugin):
+    meta = AttackMeta(
+        key="wave", label="B7  파상 대형",
+        category="B",
+        purpose="사인파 횡진 + 전진 대형",
+        evasion="각 선박의 COG 변화는 자연스러운 파도 회피 패턴처럼 보임",
+        expected_fn="fleet-level 정렬 패턴 탐지 가능")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",3,60,24,3),
+                _pi("열 수","lanes",1,6,3,1),
+                _pi("전체 폭 (도)","width",0.1,2,0.6,0.1),
+                _pi("횡진폭 (도)","amp",0.01,0.5,0.15,0.01),
+                _pi("전진 속도 (kn)","speed",1,30,10,0.5),
+                _pi("사인 주파수","freq",0.005,0.2,0.05,0.005)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",24)); lanes=int(cfg.get("lanes",3))
+        cl=cfg["clat"]; cn=cfg["clon"]
+        w=float(cfg.get("width",0.6)); amp=float(cfg.get("amp",0.15))
+        per=n//max(lanes,1); fleet=[]
+        for lane in range(lanes):
+            bn=cn+(lane-lanes/2)*(w/lanes)
+            for i in range(per):
+                idx=lane*per+i; t=i/max(per-1,1)
+                v=Vessel(990900000+idx,f"WVE-{idx+1:02d}")
+                v.lat=cl-amp*2*t; v.lon=bn
+                v.sx("phase",(i/per)*2*math.pi+lane*math.pi/lanes)
+                v.sx("bn",bn); v.sx("amp",amp)
+                v.sog=float(cfg.get("speed",10)); v.cog=180; v.hdg=180
+                fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        spd=float(cfg.get("speed",10)); freq=float(cfg.get("freq",0.05))
+        for v in fleet:
+            step=spd*_KN_TO_DPS*0.1; v.lat-=step
+            lo=v.x("amp")*math.sin(v.x("phase")+elapsed*freq)
+            v.lon=v.x("bn")+lo
+            prev=v.x("amp")*math.sin(v.x("phase")+(elapsed-0.1)*freq)
+            v.cog=(180+math.degrees(math.atan2(lo-prev,-step*111000)+1e-9))%360
+            v.hdg=int(v.cog)
+
+
+
+# ═══════════════════════════════════════════════════
+#  C  규칙 IDS False-Negative 테스트
+# ═══════════════════════════════════════════════════
+
+# ─── C1  dt 구간 점프 ─────────────────────────────
+@_reg
+class BlindDtJump(AttackPlugin):
+    meta = AttackMeta(
+        key="blind_dt_jump", label="C1  [FN] dt 구간 점프",
+        category="C",
+        purpose="IDS Check5/6 회피: dt>60s이면 검사 skip",
+        evasion="송신 주기를 65~120s로 설정 → dt 항상 >60",
+        expected_fn="Check5·6 모두 skip, Check7(dt>300)도 아님 → 탐지 없음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("점프 거리 (도)","jdist",0.05,0.5,0.15,0.01)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(991700000+i,f"FN1-{i+1:03d}")
+            _place(v,cl,cn,0.05); v.sog=random.uniform(5,12)
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("jd",float(cfg.get("jdist",0.15)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            d=v.x("jd"); ang=random.uniform(0,360)
+            v.lat+=math.cos(math.radians(ang))*d
+            v.lon+=math.sin(math.radians(ang))*d*1.2
+            v.sog=random.choice([2.0,18.0,3.0,20.0])
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+
+
+# ─── C2  속도 단계 상승 ───────────────────────────
+@_reg
+class BlindSpeedRamp(AttackPlugin):
+    meta = AttackMeta(
+        key="blind_speed_ramp", label="C2  [FN] 속도 단계 상승",
+        category="C",
+        purpose="IDS Check5 회피: Δsog < 10.0/메시지 유지",
+        evasion="매 메시지 9.5kn씩 증가 → 임계값(10.0) 미달",
+        expected_fn="2→11→20→29kn 달성해도 각 Δ<10 → 탐지 없음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("시작 SOG (kn)","start",0,5,2,0.5),
+                _pi("증가량 (kn, <10)","step",1,9.9,9.5,0.1),
+                _pi("상한 SOG (kn, <30)","maxs",5,29.9,29,1)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(991800000+i,f"FN2-{i+1:03d}")
+            _place(v,cl,cn,0.05); v.sog=float(cfg.get("start",2))
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("step",float(cfg.get("step",9.5)))
+            v.sx("maxs",float(cfg.get("maxs",29)))
+            v.sx("start",float(cfg.get("start",2)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sog=min(v.sog+v.x("step"),v.x("maxs"))
+            if v.sog>=v.x("maxs"): v.sog=v.x("start")
+            v.hdg=int(v.cog); _step(v,dt)
+
+
+# ─── C3  COG/HDG 경계값 ──────────────────────────
+@_reg
+class BlindCogBorder(AttackPlugin):
+    meta = AttackMeta(
+        key="blind_cog_border", label="C3  [FN] COG/HDG 경계값",
+        category="C",
+        purpose="IDS Check4 임계값(100°) 하회",
+        evasion="91~99° 불일치 유지 → diff<100 → 탐지 없음",
+        expected_fn="실제로는 비정상이나 임계가 느슨해 탐지 안됨")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("COG-HDG 불일치 (도)","mm",80,99.9,95,1)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        mm=float(cfg.get("mm",95))
+        fleet=[]
+        for i in range(n):
+            v=Vessel(991900000+i,f"FN3-{i+1:03d}")
+            _place(v,cl,cn,0.05); v.sog=random.uniform(3,10)
+            v.cog=random.uniform(0,360); v.hdg=int((v.cog+mm)%360)
+            v.sx("mm",mm)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            if random.random()<0.1: v.cog=(v.cog+random.uniform(-10,10))%360
+            v.hdg=int((v.cog+v.x("mm"))%360); _step(v,dt)
+
+
+# ─── C4  navStatus 회피 ───────────────────────────
+@_reg
+class BlindNavStatus(AttackPlugin):
+    meta = AttackMeta(
+        key="blind_nav_status", label="C4  [FN] navStatus 회피",
+        category="C",
+        purpose="IDS Check3 미검사 navStatus 악용",
+        evasion="navStatus 2/3/7/8/11/12 에서 SOG≥0.5 이동",
+        expected_fn="IDS는 1/5/6만 검사 → 나머지 상태는 탐지 없음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,12),
+                _pi("SOG (kn, ≥0.5)","sog",0.5,20,3,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",12)); cl=cfg["clat"]; cn=cfg["clon"]
+        stlist=[2,3,7,8,11,12]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(992000000+i,f"FN4-{i+1:03d}",nav=stlist[i%len(stlist)])
+            _place(v,cl,cn,0.05); v.sog=float(cfg.get("sog",3))
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            if random.random()<0.05: v.cog=(v.cog+random.uniform(-15,15))%360
+            v.hdg=int(v.cog); _step(v,dt)
+
+
+# ═══════════════════════════════════════════════════
+#  D  ML 우회 v1 (단일 피처 조작)
+# ═══════════════════════════════════════════════════
+
+# ─── D1  Low & Slow ───────────────────────────────
+@_reg
+class MLLowSlow(AttackPlugin):
+    meta = AttackMeta(
+        key="ml_low_slow", label="D1  [ML] Low & Slow",
+        category="D",
+        purpose="모든 규칙 임계값 동시 하회",
+        evasion="Δsog<9.9, dist<5km/min, COG-HDG<99° 동시 유지",
+        expected_fn="단일 피처는 정상이나 동시 조합이 ML에서 이상 패턴으로 포착될 수 있음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(991300000+i,f"LS-{i+1:03d}")
+            _place(v,cl,cn,0.05); v.sog=random.uniform(0.3,2)
+            v.cog=random.uniform(0,360); v.hdg=int((v.cog+random.uniform(0,99))%360)
+            v.sx("bc",v.cog); v.sx("bs",v.sog)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sog=max(0.1,v.x("bs")+random.uniform(-0.15,0.15))
+            v.cog=(v.x("bc")+random.uniform(-2,2))%360
+            v.hdg=int((v.cog+random.uniform(50,95))%360)
+            _step(v,dt)
+
+
+# ─── D2  Temporal Camouflage ─────────────────────
+@_reg
+class MLTemporal(AttackPlugin):
+    meta = AttackMeta(
+        key="ml_temporal", label="D2  [ML] Temporal Camouflage",
+        category="D",
+        purpose="정상 N개 사이 이상 1개 삽입",
+        evasion="window 피처 평균에 희석됨",
+        expected_fn="window 크기에 따라 이상 score가 1/N 수준으로 희석")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("정상 메시지 수 N","norm_n",2,20,8,1),
+                _pi("이상 SOG (kn)","anom_sog",10,60,40,1)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(991400000+i,f"TC-{i+1:03d}")
+            _place(v,cl,cn,0.05); v.sog=random.uniform(5,12)
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("cnt",0); v.sx("nn",int(cfg.get("norm_n",8)))
+            v.sx("as",float(cfg.get("anom_sog",40)))
+            v.sx("bs",v.sog); v.sx("bc",v.cog)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sx("cnt",v.x("cnt")+1)
+            if v.x("cnt")%(v.x("nn")+1)==0:
+                v.sog=v.x("as")
+                v.cog=(v.x("bc")+175)%360; v.hdg=int((v.cog+160)%360)
+            else:
+                v.sog=v.x("bs")+random.uniform(-0.5,0.5)
+                v.cog=(v.x("bc")+random.uniform(-5,5))%360; v.hdg=int(v.cog)
+            _step(v,dt)
+
+
+# ─── D3  Gradual Drift ────────────────────────────
+@_reg
+class MLGradualDrift(AttackPlugin):
+    meta = AttackMeta(
+        key="ml_gradual_drift", label="D3  [ML] Gradual Drift",
+        category="D",
+        purpose="GPS 노이즈 수준 이동 누적",
+        evasion="각 스텝 ~44m (GPS 오차 범위), 누적 시 수십km",
+        expected_fn="단기 window: 정상 / 장기 누적 피처 없으면 탐지 못함")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("스텝 크기 (도/틱)","step",0.0001,0.001,0.0004,0.0001)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(991500000+i,f"GD-{i+1:03d}",nav=1)
+            _place(v,cl,cn,0.05); v.sog=random.uniform(0,0.3)
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("dir",random.uniform(0,360))
+            v.sx("step",float(cfg.get("step",0.0004)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            r=math.radians(v.x("dir")); st=v.x("step")
+            v.lat+=math.cos(r)*st+random.uniform(-st*0.3,st*0.3)
+            v.lon+=math.sin(r)*st*1.2+random.uniform(-st*0.3,st*0.3)
+            v.sog=random.uniform(0,0.3)
+
+
+# ─── D4  Feature Mimicry ─────────────────────────
+@_reg
+class MLMimicry(AttackPlugin):
+    meta = AttackMeta(
+        key="ml_mimicry", label="D4  [ML] Feature Mimicry",
+        category="D",
+        purpose="정상 SOG 프로파일 복사 + 실제 위치 다른 방향 이동",
+        evasion="보고 SOG는 정상 분포 내, 실제 위치는 hidden 속도로 이동",
+        expected_fn="개별 피처 정상 → fleet-level trajectory 분석 없으면 탐지 못함")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("실제 이동 속도 (kn)","hidden",1,40,15,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        prof=[8.0,8.2,8.5,8.3,8.1,7.9,8.0,8.2,8.4,8.3,8.1,8.0,7.8,8.0]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(991600000+i,f"MM-{i+1:03d}")
+            _place(v,cl,cn,0.1); v.sog=prof[0]; v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("prof",prof); v.sx("pi",i%len(prof))
+            v.sx("hdir",random.uniform(0,360))
+            v.sx("hspd",float(cfg.get("hidden",15)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sx("pi",(v.x("pi")+1)%len(v.x("prof")))
+            v.sog=v.x("prof")[v.x("pi")]
+            v.cog=(v.cog+random.uniform(-3,3))%360; v.hdg=int(v.cog)
+            step=v.x("hspd")*_KN_TO_DPS*dt
+            v.lat+=math.cos(math.radians(v.x("hdir")))*step
+            v.lon+=math.sin(math.radians(v.x("hdir")))*step*1.2
+
+
+
+# ═══════════════════════════════════════════════════
+#  E  ML 우회 v2 (구조적)
+# ═══════════════════════════════════════════════════
+
+# ─── E1  Smooth Trajectory (CTRV 기반) ───────────
+@_reg
+class AdvSmooth(AttackPlugin):
+    meta = AttackMeta(
+        key="adv_smooth", label="E1  [ADV] Smooth Trajectory",
+        category="E",
+        purpose="Kalman 잔차·jerk 피처 무력화",
+        evasion="CTRV(등각속도·등속) 운동 유지 → 운동 모델 예측 오차 ≈ 0",
+        expected_fn="residual-based scorer 통과. behavioral context만으로 탐지 가능")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("SOG (kn)","sog",1,40,15,0.5),
+                _pi("선회율 (deg/s)","omega",0.1,10,2,0.1)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(993100000+i,f"SMT-{i+1:03d}")
+            _place(v,cl,cn,0.08); v.sog=float(cfg.get("sog",15))+random.uniform(-1,1)
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("om",float(cfg.get("omega",2))*random.choice([-1,1]))
+            v.sx("bs",v.sog)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.cog=(v.cog+v.x("om")*dt)%360; v.sog=v.x("bs"); v.hdg=int(v.cog)
+            _step(v,dt)
+
+
+# ─── E2  Fleet Desync ─────────────────────────────
+@_reg
+class AdvDesync(AttackPlugin):
+    meta = AttackMeta(
+        key="adv_desync", label="E2  [ADV] Fleet Desync",
+        category="E",
+        purpose="fleet-level 상관 피처 파괴",
+        evasion="MMSI·shipType·SOG분포 개별화, 이상 발생 시각 분산",
+        expected_fn="MMSI clustering·fleet variance 피처 무력화. 개별 탐지만 가능")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,12),
+                _pi("이상 SOG (kn)","spike",10,60,38,1)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",12)); cl=cfg["clat"]; cn=cfg["clon"]
+        used=set(); fleet=[]
+        for i in range(n):
+            mid=random.choice(_MID_POOL)
+            while True:
+                mmsi=mid*1000000+random.randint(100000,999999)
+                if mmsi not in used: used.add(mmsi); break
+            pr=random.choice(_PROFILES)
+            v=Vessel(mmsi,f"{pr.name_pfx}{mmsi%10000:04d}")
+            _place(v,cl,cn,0.1); v.sog=random.uniform(pr.sog_lo,pr.sog_hi)
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog+random.uniform(-5,5))%360
+            v.nav=random.choice(pr.nav_opts)
+            v.sx("ao",random.uniform(0,45)); v.sx("ai",random.uniform(30,90))
+            v.sx("bs",v.sog); v.sx("sp",float(cfg.get("spike",38))*random.uniform(0.85,1.15))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            adj=elapsed+v.x("ao"); cyc=adj%v.x("ai")
+            v.sog=v.x("sp") if cyc<v.x("ai")*0.12 else v.x("bs")+random.uniform(-0.3,0.3)
+            if random.random()<0.08: v.cog=(v.cog+random.uniform(-8,8))%360
+            v.hdg=int(v.cog+random.uniform(-4,4))%360
+            _step(v,dt)
+
+
+# ─── E3  Window Edge ──────────────────────────────
+@_reg
+class AdvWindowEdge(AttackPlugin):
+    meta = AttackMeta(
+        key="adv_window_edge", label="E3  [ADV] Window Edge",
+        category="E",
+        purpose="sliding window anomaly score 희석",
+        evasion="window_size-1 틱마다 이상 1회 → 양쪽 window에 각 1개만 포함",
+        expected_fn="window당 anomaly score = 1/window_size → 임계 미달 가능성 높음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("ML window 크기 가정","wsize",5,50,20,1),
+                _pi("이상 SOG (kn)","anom",10,60,42,1),
+                _pi("정상 SOG (kn)","norm",1,30,12,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(993300000+i,f"WED-{i+1:03d}")
+            _place(v,cl,cn,0.06); v.sog=float(cfg.get("norm",12))
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("ws",int(cfg.get("wsize",20))); v.sx("tick",0)
+            v.sx("an",float(cfg.get("anom",42))); v.sx("nm",float(cfg.get("norm",12)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sx("tick",v.x("tick")+1)
+            cyc=v.x("tick")%v.x("ws")
+            if cyc==v.x("ws")-1:
+                v.sog=v.x("an"); v.cog=(v.cog+175+random.uniform(-3,3))%360
+            else:
+                v.sog=v.x("nm")+random.uniform(-0.4,0.4)
+                if cyc==0: v.cog=(v.cog+175+random.uniform(-3,3))%360
+            v.hdg=int(v.cog); _step(v,dt)
+
+
+# ─── E4  Contextual Blend (어선 위장) ────────────
+_FISH_PHASES=[
+    ("net_out",   5.0,120,0.0,  0),
+    ("trawling",  3.5,180,12.0, 7),
+    ("hauling",   1.5, 90,0.0,  7),
+    ("transit",  10.0, 60,0.0,  0),
+    ("drifting",  0.4,150,4.0,  7),
+]
+
+@_reg
+class AdvContextual(AttackPlugin):
+    meta = AttackMeta(
+        key="adv_contextual", label="E4  [ADV] Contextual Blend",
+        category="E",
+        purpose="ship-type 맥락 위장으로 ML 클러스터 오분류 유도",
+        evasion="shipType=30+navStatus=7+조업 패턴 → 어선 클러스터로 평가됨",
+        expected_fn="어선 전용 ML 모델 내에서 정상으로 처리될 가능성 높음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("실제 침투 방향 (도)","ddir",0,359,45,5),
+                _pi("실제 침투 속도 (kn)","dsog",0.5,10,3,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            mmsi=random.choice([440,441])*1000000+random.randint(100000,999999)
+            v=Vessel(mmsi,f"KFI{i+1:03d}")
+            _place(v,cl,cn,0.08); v.sog=4; v.cog=random.uniform(0,360); v.hdg=int(v.cog); v.nav=7
+            v.sx("pi",i%len(_FISH_PHASES)); v.sx("pe",random.uniform(0,_FISH_PHASES[i%len(_FISH_PHASES)][2]))
+            v.sx("dd",float(cfg.get("ddir",45))+random.uniform(-10,10))
+            v.sx("ds",float(cfg.get("dsog",3)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            ph=_FISH_PHASES[v.x("pi")]
+            v.sx("pe",v.x("pe")+dt)
+            if v.x("pe")>=ph[2]:
+                v.sx("pe",0); v.sx("pi",(v.x("pi")+1)%len(_FISH_PHASES))
+                ph=_FISH_PHASES[v.x("pi")]
+            v.nav=ph[4]; v.sog=ph[1]+random.uniform(-0.3,0.3)
+            if ph[3]>0: v.cog=(v.cog+ph[3]*dt*0.5)%360
+            v.hdg=int(v.cog+random.uniform(-5,5))%360
+            step=v.x("ds")*_KN_TO_DPS*dt
+            v.lat+=math.cos(math.radians(v.x("dd")))*step
+            v.lon+=math.sin(math.radians(v.x("dd")))*step*1.2
+
+
+# ─── E5  Shadow Vessel ────────────────────────────
+@_reg
+class AdvShadow(AttackPlugin):
+    meta = AttackMeta(
+        key="adv_shadow", label="E5  [ADV] Shadow Vessel",
+        category="E",
+        purpose="MMSI 지역 정합·항로 준수로 규칙+ML 동시 우회",
+        evasion="한국 MID(440/441)+연안화물 프로파일+실제 항로각 → 전 검사 통과",
+        expected_fn="규칙 IDS: MMSI/SOG/navStatus 전 정상. ML: 정상 화물선 클러스터 내 위치")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,30,8),
+                _pi("접근 속도 (kn)","sog",5,20,12,0.5),
+                _pi("목표 위도 오프셋","tlat_off",  -0.5, 0.5, 0.0, 0.05),
+                _pi("목표 경도 오프셋","tlon_off", -0.5, 0.5, 0.0, 0.05)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",8)); cl=cfg["clat"]; cn=cfg["clon"]
+        tl=cl+float(cfg.get("tlat_off",0)); tn=cn+float(cfg.get("tlon_off",0))
+        fleet=[]
+        for i in range(n):
+            ang=2*math.pi*i/n; sd=0.35
+            mmsi=random.choice([440,441])*1000000+random.randint(100000,999999)
+            v=Vessel(mmsi,f"KR{mmsi%100000:05d}")
+            v.lat=tl+math.cos(ang)*sd; v.lon=tn+math.sin(ang)*sd*1.2
+            to_t=math.degrees(math.atan2(tn-v.lon,tl-v.lat)+1e-9)%360
+            v.sog=float(cfg.get("sog",12))+random.uniform(-1.5,1.5)
+            v.cog=to_t+random.uniform(-8,8); v.hdg=int(v.cog+random.uniform(-3,3))%360
+            v.sx("tl",tl); v.sx("tn",tn); v.sx("bs",v.sog)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
+            dist=math.sqrt(dl**2+dn**2)+1e-9
+            if dist<0.005:
+                v.sog=random.uniform(0,0.4); v.nav=random.choice([0,5])
+                v.lat+=random.uniform(-0.001,0.001); v.lon+=random.uniform(-0.001,0.001)
+                return
+            tc=math.degrees(math.atan2(dn,dl)+1e-9)%360
+            v.cog=(0.85*v.cog+0.15*tc)%360
+            v.hdg=int(v.cog+random.uniform(-3,3))%360
+            v.sog=v.x("bs")+random.uniform(-0.5,0.5)
+            _step(v,dt)
+
+
+
+# ═══════════════════════════════════════════════════
+#  F  고급 공격 (LSTM·clustering·hybrid·gap)
+# ═══════════════════════════════════════════════════
+
+# ─── F1  Feature Smoothing ────────────────────────
+# 목적: ML feature의 Δ값을 학습된 정상 분포 내로 클램핑하면서 이동
+# 동작: 매 틱 Δsog·Δcog·Δpos 전부를 "정상 분포 내 최대값"으로 제한
+# 회피: 어떤 단일 피처 변화도 임계를 넘지 않음 → 누적 이동만 이상
+@_reg
+class FSmoothing(AttackPlugin):
+    meta = AttackMeta(
+        key="feat_smooth", label="F1  [F] Feature Smoothing",
+        category="F",
+        purpose="Δsog·Δcog·Δpos 전부 정상 분포 상위값으로 클램핑",
+        evasion="어떤 단일 Δ피처도 임계 미달. 누적 변위만 이상",
+        expected_fn="단기 window IDS 전 통과. 궤적 이탈 감지기만 탐지 가능")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("목표 위도 오프셋","tlat",  -0.5,0.5,0.2,0.01),
+                _pi("목표 경도 오프셋","tlon", -0.5,0.5,0.2,0.01),
+                _pi("max Δsog/틱 (kn)","dsog_max",0.1,9.9,3.0,0.1),
+                _pi("max Δcog/틱 (도)","dcog_max",0.1,30,5.0,0.5),
+                _pi("max Δpos/틱 (도)","dpos_max",0.001,0.04,0.01,0.001)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        tl=cl+float(cfg.get("tlat",0.2)); tn=cn+float(cfg.get("tlon",0.2))
+        fleet=[]
+        for i in range(n):
+            v=Vessel(993500000+i,f"FSM-{i+1:03d}")
+            _place(v,cl,cn,0.06)
+            v.sog=random.uniform(5,12); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("tl",tl+random.uniform(-0.02,0.02))
+            v.sx("tn",tn+random.uniform(-0.02,0.02))
+            v.sx("dsmax",float(cfg.get("dsog_max",3)))
+            v.sx("dcmax",float(cfg.get("dcog_max",5)))
+            v.sx("dpmax",float(cfg.get("dpos_max",0.01)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            # 원하는 방향 계산
+            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
+            dist=math.sqrt(dl**2+dn**2)+1e-9
+            want_cog=math.degrees(math.atan2(dn,dl)+1e-9)%360
+            want_sog=min(15.0,dist/(_KN_TO_DPS*max(dt,0.1)))
+
+            # Δ클램핑: 각 피처 변화를 정상 범위 내로 제한
+            dcog=want_cog-v.cog
+            if dcog>180: dcog-=360
+            elif dcog<-180: dcog+=360
+            dcog=max(-v.x("dcmax"),min(v.x("dcmax"),dcog))
+            v.cog=(v.cog+dcog)%360
+
+            dsog=want_sog-v.sog
+            dsog=max(-v.x("dsmax"),min(v.x("dsmax"),dsog))
+            v.sog=max(0,v.sog+dsog)
+
+            v.hdg=int(v.cog)
+            step=v.sog*_KN_TO_DPS*dt
+            step=min(step,v.x("dpmax"))   # 위치 변화도 클램핑
+            v.lat+=math.cos(math.radians(v.cog))*step
+            v.lon+=math.sin(math.radians(v.cog))*step*1.2
+
+
+# ─── F2  Intermittent Spoofing ────────────────────
+# 목적: 간헐적 위조 — 정상 구간과 이상 구간을 교번
+# 동작: T_normal초 동안 완전 정상 거동, T_attack초 동안 이상 삽입
+# 회피: 이상 구간이 전체의 T_attack/(T_n+T_a) 비율만 차지
+@_reg
+class IntermittentSpoof(AttackPlugin):
+    meta = AttackMeta(
+        key="intermittent", label="F2  [F] Intermittent Spoofing",
+        category="F",
+        purpose="정상/이상 교번으로 anomaly score 시간 평균 희석",
+        evasion="전체 시간의 일부만 이상 → 평균 score = α × peak_score",
+        expected_fn="T_normal이 클수록 평균 score 낮음. 순간 탐지기만 잡음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("정상 구간 (초)","tn",5,120,30,5),
+                _pi("이상 구간 (초)","ta",1,60,5,1),
+                _pi("이상 SOG (kn)","anom",10,60,45,1),
+                _pi("이상 navStatus","anav",0,15,6,1)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(993600000+i,f"ISP-{i+1:03d}")
+            _place(v,cl,cn,0.06); v.sog=random.uniform(5,12)
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("tn",float(cfg.get("tn",30))); v.sx("ta",float(cfg.get("ta",5)))
+            v.sx("anom",float(cfg.get("anom",45))); v.sx("anav",int(cfg.get("anav",6)))
+            v.sx("bs",v.sog); v.sx("phase_off",random.uniform(0,float(cfg.get("tn",30))))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            tn=v.x("tn"); ta=v.x("ta"); cycle=tn+ta
+            t=(elapsed+v.x("phase_off"))%cycle
+            if t<ta:
+                # 이상 구간
+                v.sog=v.x("anom"); v.nav=v.x("anav")
+                v.cog=(v.cog+random.uniform(-60,60))%360
+            else:
+                # 정상 구간
+                v.sog=v.x("bs")+random.uniform(-0.5,0.5); v.nav=0
+                v.cog=(v.cog+random.uniform(-3,3))%360
+            v.hdg=int(v.cog); _step(v,dt)
+
+
+# ─── F3  Trajectory Stitching ─────────────────────
+# 목적: 두 정상 궤적 사이를 3차 보간으로 봉합
+# 동작: Phase A(정상 항해) → Hermite spline 전환 → Phase B(목표지 항해)
+# 회피: 전환 구간이 수학적으로 C1 연속 → jerk/curvature 피처 낮음
+@_reg
+class TrajStitch(AttackPlugin):
+    meta = AttackMeta(
+        key="traj_stitch", label="F3  [F] Trajectory Stitching",
+        category="F",
+        purpose="trajectory continuity 피처 무력화",
+        evasion="C1 연속 Hermite spline으로 궤적 봉합 → 곡률·jerk 자연스러움",
+        expected_fn="단순 속도 기반 탐지기 통과. high-order curvature 분석만 잡음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("Phase A 방향 (도)","hdg_a",0,359,90,5),
+                _pi("Phase B 방향 (도)","hdg_b",0,359,270,5),
+                _pi("전환 시간 (초)","stitch_t",5,60,20,5),
+                _pi("SOG (kn)","sog",1,30,12,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(993700000+i,f"STC-{i+1:03d}")
+            _place(v,cl,cn,0.06)
+            v.sog=float(cfg.get("sog",12))+random.uniform(-1,1)
+            v.cog=float(cfg.get("hdg_a",90)); v.hdg=int(v.cog)
+            v.sx("ha",float(cfg.get("hdg_a",90)))
+            v.sx("hb",float(cfg.get("hdg_b",270)))
+            v.sx("st",float(cfg.get("stitch_t",20)))
+            v.sx("bs",v.sog); v.sx("phase","A")
+            v.sx("pt",0.0)  # phase 경과 시간
+            v.sx("stitch_start",random.uniform(10,30))  # A 구간 길이
+            v.sx("stitch_done",False)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sx("pt",v.x("pt")+dt)
+            phase=v.x("phase")
+            if phase=="A":
+                v.cog=v.x("ha")+random.uniform(-2,2)
+                v.sog=v.x("bs")+random.uniform(-0.3,0.3)
+                if v.x("pt")>=v.x("stitch_start"):
+                    v.sx("phase","S"); v.sx("pt",0)
+                    v.sx("s_lat",v.lat); v.sx("s_lon",v.lon)
+                    v.sx("s_cog",v.cog)
+            elif phase=="S":
+                # Hermite 보간: t 0→1
+                t=min(1.0,v.x("pt")/v.x("st"))
+                h00=2*t**3-3*t**2+1; h10=t**3-2*t**2+t
+                h01=-2*t**3+3*t**2; h11=t**3-t**2
+                # tangent: A방향/B방향 단위벡터 × 전환거리
+                td=v.sog*_KN_TO_DPS*v.x("st")
+                ra=math.radians(v.x("ha")); rb=math.radians(v.x("hb"))
+                m0y=math.cos(ra)*td; m0x=math.sin(ra)*td
+                m1y=math.cos(rb)*td; m1x=math.sin(rb)*td
+                p0y=v.x("s_lat"); p0x=v.x("s_lon")
+                p1y=p0y+math.cos(rb)*td; p1x=p0x+math.sin(rb)*td
+                v.lat=h00*p0y+h10*m0y+h01*p1y+h11*m1y
+                v.lon=h00*p0x+h10*m0x+h01*p1x+h11*m1x
+                # COG = spline tangent 방향
+                dh00=6*t**2-6*t; dh10=3*t**2-4*t+1
+                dh01=-6*t**2+6*t; dh11=3*t**2-2*t
+                dcog_y=dh00*p0y+dh10*m0y+dh01*p1y+dh11*m1y
+                dcog_x=dh00*p0x+dh10*m0x+dh01*p1x+dh11*m1x
+                v.cog=math.degrees(math.atan2(dcog_x,dcog_y)+1e-9)%360
+                if t>=1.0: v.sx("phase","B"); v.sx("pt",0)
+            else:  # Phase B
+                v.cog=v.x("hb")+random.uniform(-2,2)
+                v.sog=v.x("bs")+random.uniform(-0.3,0.3)
+                _step(v,dt)
+            v.hdg=int(v.cog)
+
+
+# ─── F4  Time Skew ────────────────────────────────
+# 목적: Δt 불규칙 조작으로 velocity 피처 왜곡
+# 동작: 빠른 burst (짧은 Δt) + 긴 침묵 (긴 Δt) 교번
+#       ML이 Δpos/Δt로 속도를 재구성하면 burst 구간은
+#       실제 속도의 수배로 계산됨
+# 회피: 각 메시지의 SOG 필드는 정상값 → 보고 vs 추정 불일치
+@_reg
+class TimeSkew(AttackPlugin):
+    meta = AttackMeta(
+        key="time_skew", label="F4  [F] Time Skew",
+        category="F",
+        purpose="Δt 조작으로 ML 재구성 속도와 보고 SOG 불일치 생성",
+        evasion="보고 SOG는 정상 → 규칙 IDS 통과. ML은 Δpos/Δt로 이상 감지 어려움",
+        expected_fn="SOG-필드 기반 탐지기 통과. Δpos/Δt 재구성 탐지기만 잡을 수 있음")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("burst 메시지 수","burst_n",2,10,4,1),
+                _pi("burst 이동 거리 (도)","burst_dist",0.01,0.3,0.08,0.01),
+                _pi("보고 SOG (kn, 정상값)","rep_sog",1,30,10,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(993800000+i,f"TSK-{i+1:03d}")
+            _place(v,cl,cn,0.06)
+            v.sog=float(cfg.get("rep_sog",10)); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("bn",int(cfg.get("burst_n",4)))
+            v.sx("bd",float(cfg.get("burst_dist",0.08)))
+            v.sx("rs",float(cfg.get("rep_sog",10)))
+            v.sx("tick",0); v.sx("mode","idle")
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sx("tick",v.x("tick")+1)
+            t=v.x("tick"); bn=v.x("bn")
+            # burst: bn개 메시지를 연속으로 큰 이동
+            if t%(bn*3)<bn:
+                v.sx("mode","burst")
+                # 한 틱에 burst_dist/bn 이동 (빠른 실제 이동)
+                step=v.x("bd")/bn
+                v.lat+=math.cos(math.radians(v.cog))*step
+                v.lon+=math.sin(math.radians(v.cog))*step*1.2
+            else:
+                v.sx("mode","idle")
+                # idle: 거의 움직이지 않음 (하지만 SOG는 정상 보고)
+                _step(v,dt*0.05)
+            # 보고 SOG는 항상 정상값
+            v.sog=v.x("rs")+random.uniform(-0.3,0.3)
+            v.hdg=int(v.cog)
+
+
+# ─── F5  Multi-Ship Coordination ─────────────────
+# 목적: 선박군이 협조적으로 동일 목표로 이동하되
+#       개별 거동은 정상으로 보이게 함
+# 동작: 각 선박이 목표 방향으로 조금씩 편향된 정상 항로를 따름
+#       개별 분석: 완전 정상
+#       fleet-level: 수렴 벡터 필드가 형성됨
+@_reg
+class MultiCoord(AttackPlugin):
+    meta = AttackMeta(
+        key="multi_coord", label="F5  [F] Multi-Ship Coordination",
+        category="F",
+        purpose="fleet-level 협조 탐지 vs 개별 정상성 트레이드오프",
+        evasion="각 선박 개별 피처는 완전 정상. 協調는 fleet-level에만 나타남",
+        expected_fn="개별 IDS 전 통과. fleet-level 수렴 벡터 분석만 탐지 가능")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",3,50,12),
+                _pi("목표 위도 오프셋","tlat",  -0.5,0.5,0.15,0.05),
+                _pi("목표 경도 오프셋","tlon", -0.5,0.5,0.15,0.05),
+                _pi("SOG (kn)","sog",5,20,10,0.5),
+                _pi("목표 편향 가중치","bias",0.0,1.0,0.3,0.05)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",12)); cl=cfg["clat"]; cn=cfg["clon"]
+        tl=cl+float(cfg.get("tlat",0.15)); tn=cn+float(cfg.get("tlon",0.15))
+        fleet=[]
+        for i in range(n):
+            pr=random.choice(_PROFILES)
+            mmsi=random.choice([440,441,477,413])*1000000+random.randint(100000,999999)
+            v=Vessel(mmsi,f"{pr.name_pfx}{i+1:03d}")
+            _place(v,cl,cn,0.15)
+            v.sog=float(cfg.get("sog",10))+random.uniform(-1,1)
+            # 각 선박의 기본 항로: 실제 항로 방향 중 가장 가까운 것
+            tc=math.degrees(math.atan2(tn-v.lon,tl-v.lat)+1e-9)%360
+            base=min(_COASTAL_HDGS,key=lambda h:min(abs(h-tc),360-abs(h-tc)))
+            v.cog=base+random.uniform(-10,10); v.hdg=int(v.cog)
+            v.sx("tl",tl); v.sx("tn",tn)
+            v.sx("bias",float(cfg.get("bias",0.3)))
+            v.sx("base_cog",v.cog); v.sx("bs",v.sog)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        bias=float(cfg.get("bias",0.3))
+        for v in fleet:
+            # 목표 방향
+            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
+            tc=math.degrees(math.atan2(dn,dl)+1e-9)%360
+            # 기본 항로 + bias × 목표 방향 blend (자연스럽게 편향)
+            v.cog=((1-bias)*v.x("base_cog")+bias*tc+random.uniform(-5,5))%360
+            v.sog=v.x("bs")+random.uniform(-0.4,0.4)
+            v.hdg=int(v.cog+random.uniform(-4,4))%360
+            _step(v,dt)
+
+
+# ─── F6  AIS Gap Attack ───────────────────────────
+# 목적: 신호 끊김을 악용한 위치 도약
+# 동작: T_silence초 동안 신호를 끊은 뒤 목표 위치 근처에서 재등장
+#       IDS Check7(dt>300)은 "신호 소실" 경보를 내지만
+#       재등장 위치 자체는 새 시작점으로 처리됨
+# 회피: 재등장 후 최소 2개 이상의 정상 메시지를 보내면
+#       이전 이력이 희석되거나 reset됨 (IDS 구현에 따라 다름)
+@_reg
+class AISGap(AttackPlugin):
+    meta = AttackMeta(
+        key="ais_gap", label="F6  [F] AIS Gap",
+        category="F",
+        purpose="신호 소실 → 재등장으로 IDS 이력 리셋 유도",
+        evasion="T_silence>300s → Check7만 발생. 재등장 후 이력 재시작",
+        expected_fn="재등장 위치가 이전 위치와 멀어도 이력 없으면 Check5/6 미적용")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,8),
+                _pi("침묵 시간 (초)","silence",31,600,120,10),
+                _pi("활동 시간 (초)","active",10,120,30,5),
+                _pi("재등장 오프셋 (도)","jump",0.05,0.5,0.2,0.05),
+                _pi("재등장 SOG (kn)","sog",1,30,10,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",8)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(993900000+i,f"GAP-{i+1:03d}")
+            _place(v,cl,cn,0.08)
+            v.sog=float(cfg.get("sog",10)); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("silence",float(cfg.get("silence",120)))
+            v.sx("active",float(cfg.get("active",30)))
+            v.sx("jump",float(cfg.get("jump",0.2)))
+            v.sx("phase","active"); v.sx("pt",random.uniform(0,float(cfg.get("active",30))))
+            v.sx("orig_lat",v.lat); v.sx("orig_lon",v.lon)
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sx("pt",v.x("pt")+dt)
+            if v.x("phase")=="active":
+                v.sog=float(cfg.get("sog",10))+random.uniform(-0.5,0.5)
+                v.cog=(v.cog+random.uniform(-3,3))%360; v.hdg=int(v.cog)
+                _step(v,dt)
+                if v.x("pt")>=v.x("active"):
+                    v.sx("phase","silent"); v.sx("pt",0)
+                    # 침묵 전 위치 저장 후 목표 재등장 위치 미리 계산
+                    ang=random.uniform(0,360); jd=v.x("jump")
+                    v.sx("next_lat",v.lat+math.cos(math.radians(ang))*jd)
+                    v.sx("next_lon",v.lon+math.sin(math.radians(ang))*jd*1.2)
+                    # 침묵: 위치를 0,0으로 (IDS에는 신호 소실로 처리)
+                    v.lat=0; v.lon=0; v.sog=0
+            else:  # silent
+                if v.x("pt")>=v.x("silence"):
+                    # 재등장: 새 위치에서 시작
+                    v.lat=v.x("next_lat"); v.lon=v.x("next_lon")
+                    v.sog=float(cfg.get("sog",10)); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+                    v.sx("phase","active"); v.sx("pt",0)
+
+
+# ─── F7  LSTM Beat ────────────────────────────────
+# 목적: LSTM hidden state를 정상 분포 내로 유지하는 궤적 생성
+# 동작: ΔSOG·ΔCOG·Δpos 전부 정상 학습 데이터의 1σ 이내로 유지하면서
+#       목표 위치 방향으로 아주 천천히 이동 (Gradual Drift의 고급버전)
+#       ΔSOG~N(0,0.5), ΔCOG~N(0,3°), Δpos~U(0,0.002°) 가정
+@_reg
+class LSTMBeat(AttackPlugin):
+    meta = AttackMeta(
+        key="lstm_beat", label="F7  [F] LSTM Beat",
+        category="F",
+        purpose="LSTM hidden state를 정상 분포 내로 유지",
+        evasion="모든 Δ피처를 정상 학습 1σ 이내로 클램핑. 누적 위치만 이상",
+        expected_fn="LSTM reconstruction error ≈ 0. 누적 drift 감지기만 탐지")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("목표 위도 오프셋","tlat",-0.5,0.5,0.3,0.01),
+                _pi("목표 경도 오프셋","tlon",-0.5,0.5,0.3,0.01),
+                _pi("σ_sog (정상 ΔSOG 표준편차)","s_sog",0.1,3.0,0.5,0.1),
+                _pi("σ_cog (정상 ΔCOG 표준편차)","s_cog",0.5,10.0,3.0,0.5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        tl=cl+float(cfg.get("tlat",0.3)); tn=cn+float(cfg.get("tlon",0.3))
+        fleet=[]
+        for i in range(n):
+            v=Vessel(994000000+i,f"LBT-{i+1:03d}")
+            _place(v,cl,cn,0.06)
+            v.sog=random.uniform(6,12); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("tl",tl+random.uniform(-0.02,0.02))
+            v.sx("tn",tn+random.uniform(-0.02,0.02))
+            v.sx("ss",float(cfg.get("s_sog",0.5)))
+            v.sx("sc",float(cfg.get("s_cog",3.0)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            # 원하는 방향 계산 (목표 쪽으로 아주 작은 편향)
+            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
+            dist=math.sqrt(dl**2+dn**2)+1e-9
+            want_cog=math.degrees(math.atan2(dn,dl)+1e-9)%360
+            # ΔCOG: 정상 1σ 내에서 목표 방향으로 조금씩 편향
+            dcog=want_cog-v.cog
+            if dcog>180: dcog-=360
+            elif dcog<-180: dcog+=360
+            # 한 번에 최대 1σ_cog만 이동
+            dcog=max(-v.x("sc"),min(v.x("sc"),dcog*0.15))
+            v.cog=(v.cog+dcog)%360
+            # ΔSOG: 정상 N(0,σ_sog)
+            dsog=random.gauss(0,v.x("ss"))*0.3
+            v.sog=max(2.0,min(20.0,v.sog+dsog))
+            v.hdg=int(v.cog)
+            # Δpos: 최대 0.002도/틱 (GPS 정밀도 수준)
+            step=min(v.sog*_KN_TO_DPS*dt,0.002)
+            v.lat+=math.cos(math.radians(v.cog))*step
+            v.lon+=math.sin(math.radians(v.cog))*step*1.2
+
+
+
+# ═══════════════════════════════════════════════════
+#  §6  SimEngine
+# ═══════════════════════════════════════════════════
+class SimEngine:
+    """송신 루프 — 패턴·RT 오버라이드·UDP 전송을 캡슐화"""
+
+    def __init__(self, cfg:dict, log_q:queue.Queue, stop:threading.Event):
+        self.cfg=cfg; self.log_q=log_q; self.stop=stop
+
+    # ── RT 오버라이드 적용 ─────────────────────────
+    @staticmethod
+    def _apply_rt(fleet:list[Vessel])->None:
+        if not RT.active: return
+        if RT.manual_jump:
+            RT.manual_jump=False
+            jd=RT.jump_dist
+            for v in fleet:
+                ang=random.uniform(0,360)
+                v.lat+=math.cos(math.radians(ang))*jd
+                v.lon+=math.sin(math.radians(ang))*jd*1.2
+        for v in fleet:
+            v.sog=max(0,v.sog*RT.sog_mult)
+            v.cog=(v.cog+RT.cog_offset)%360
+            v.hdg=(v.hdg+int(RT.cog_offset))%360
+            if RT.pos_scatter>0:
+                v.lat+=random.uniform(-RT.pos_scatter,RT.pos_scatter)
+                v.lon+=random.uniform(-RT.pos_scatter,RT.pos_scatter)*1.2
+            if RT.nav_override>=0: v.nav=RT.nav_override
+
+    # ── 메인 루프 ──────────────────────────────────
+    def run(self)->None:
+        cfg=self.cfg
+        host=cfg["host"]; port=int(cfg["port"])
+        interval=float(cfg["interval"])
+        key=cfg["attack_key"]
+        plugin=AttackRegistry.get(key)
+        fleet=plugin.make(cfg)
+        name_sent:set[int]=set()
+        iteration=0; start=time.time()
+        _qlog(f"[SimEngine] {plugin.meta.label} | {len(fleet)}척 | {host}:{port}","start")
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+            while not self.stop.is_set():
+                iteration+=1; t0=time.time(); elapsed=t0-start
+                plugin.update(fleet,elapsed,interval,cfg)
+                self._apply_rt(fleet)
+                sent=0
+                for v in fleet:
+                    if self.stop.is_set(): return
+                    if v.mmsi not in name_sent:
+                        sock.sendto(v.name_msg().encode("ascii"),(host,port))
+                        name_sent.add(v.mmsi)
+                        if not _sleep(self.stop,0.01): return
+                    sock.sendto(v.pos_msg().encode("ascii"),(host,port))
+                    sent+=1
+                    if not _sleep(self.stop,0.004): return
+                dt=time.time()-t0
+                if iteration==1 or iteration%10==0:
+                    rt_tag=" | RT" if RT.active else ""
+                    _qlog(f"[{iteration}] {sent}건 {dt:.2f}s{rt_tag}","info")
+                if not _sleep(self.stop,max(0,interval-dt)): return
+
+
+def _file_loop(cfg:dict,log_q:queue.Queue,stop:threading.Event)->None:
+    host=cfg["host"]; port=int(cfg["port"])
+    msgs=load_nmea(cfg["file_path"])
+    interval=float(cfg["file_interval"]); repeat=bool(cfg["file_repeat"])
+    _qlog(f"[파일] {Path(cfg['file_path']).name} | {len(msgs)}개","start")
+    cycle=0
+    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+        while not stop.is_set():
+            cycle+=1
+            for i,msg in enumerate(msgs,1):
+                if stop.is_set(): return
+                sock.sendto(msg.encode("ascii"),(host,port))
+                _qlog(f"[파일 {i:04d}] {msg.strip()}","info")
+                if not _sleep(stop,interval): return
             if not repeat:
-                queue_log(log_q, f"[파일 완료] 1회 송신 완료 | 총 {sent_count}건", "start")
-                return True
-            queue_log(log_q, f"[파일 반복] {cycle}회차 완료 | 누적 {sent_count}건", "info")
-    return False
+                _qlog(f"[파일 완료] 총 {cycle*len(msgs)}건","start"); return
+            _qlog(f"[파일 반복] {cycle}회차","info")
 
 
-def sender_worker_v3(channel: str, cfg, log_q, stop_signal: threading.Event) -> None:
-    completed = False
+def sender_worker(channel:str,cfg:dict,stop:threading.Event)->None:
     try:
-        if channel == "generated":
-            completed = send_generated_loop_v3(cfg, log_q, stop_signal)
+        if channel=="generated":
+            SimEngine(cfg,_LOG_Q,stop).run()
         else:
-            completed = send_file_loop_v2(cfg, log_q, stop_signal)
-    except Exception as exc:
-        prefix = "생성" if channel == "generated" else "파일"
-        queue_log(log_q, f"[{prefix} 오류] {exc}", "error")
+            _file_loop(cfg,_LOG_Q,stop)
+    except Exception as e:
+        _qlog(f"[오류] {e}","error")
     finally:
-        label = "생성" if channel == "generated" else "파일"
-        if stop_signal.is_set():
-            queue_log(log_q, f"[{label} 종료] 사용자 중단", "start")
-        elif completed:
-            queue_log(log_q, f"[{label} 종료] 송신 완료", "start")
+        lbl="생성" if channel=="generated" else "파일"
+        _qlog(f"[{lbl}] {'중단' if stop.is_set() else '완료'}","start")
+        _qstate(channel,"finished")
+
+
+# ═══════════════════════════════════════════════════
+#  §7  RealTimeControlWindow
+# ═══════════════════════════════════════════════════
+class RealTimeControlWindow(tk.Toplevel):
+    BG="#09111d"; AC="#ff9f44"; FG="#edf4ff"; SB="#9db0c7"; EB="#172334"
+
+    def __init__(self,master):
+        super().__init__(master)
+        self.title("🎮  RT Control  |  실시간 조작")
+        self.configure(bg=self.BG); self.minsize(440,620); self.resizable(True,True)
+        self.v_act=tk.BooleanVar(value=False)
+        self.v_sm =tk.DoubleVar(value=1.0)
+        self.v_co =tk.DoubleVar(value=0.0)
+        self.v_ps =tk.DoubleVar(value=0.0)
+        self.v_nav=tk.IntVar(value=-1)
+        self.v_jd =tk.DoubleVar(value=0.05)
+        for var in (self.v_act,self.v_sm,self.v_co,self.v_ps,self.v_nav,self.v_jd):
+            var.trace_add("write",self._sync)
+        self._build(); self._sync()
+
+    def _lbl(self,p,t,sub=False):
+        tk.Label(p,text=t,bg=self.BG,fg=self.SB if sub else self.FG,
+                 font=("Consolas",9 if sub else 10)).pack(anchor="w",padx=16,pady=(4,0))
+
+    def _slider(self,p,lbl,var,lo,hi,res=0.01,fmt="{:.2f}"):
+        row=tk.Frame(p,bg=self.BG); row.pack(fill="x",padx=14,pady=3)
+        tk.Label(row,text=lbl,bg=self.BG,fg=self.SB,
+                 font=("Consolas",9),width=22,anchor="w").pack(side="left")
+        vl=tk.Label(row,text=fmt.format(var.get()),bg=self.BG,fg=self.AC,
+                    font=("Consolas",10,"bold"),width=8); vl.pack(side="right")
+        def upd(*_): vl.config(text=fmt.format(var.get()))
+        tk.Scale(row,variable=var,from_=lo,to=hi,resolution=res,orient="horizontal",
+                 bg=self.BG,fg=self.FG,activebackground=self.AC,highlightthickness=0,
+                 troughcolor=self.EB,sliderlength=18,
+                 command=lambda _:upd()).pack(side="left",fill="x",expand=True,padx=(6,4))
+
+    def _build(self):
+        tk.Label(self,text="  REAL-TIME CONTROL  |  실시간 조작",
+                 bg=self.AC,fg="#000",font=("Consolas",12,"bold"),pady=7).pack(fill="x")
+        tk.Label(self,text="  현재 실행 중인 선단에 즉시 반영",
+                 bg="#1a2030",fg=self.SB,font=("Consolas",8),pady=3).pack(fill="x")
+        self.abtn=tk.Button(self,text="○ 비활성",bg="#24354d",fg=self.FG,
+                            font=("Consolas",11,"bold"),relief="flat",cursor="hand2",
+                            padx=12,pady=7,command=self._toggle)
+        self.abtn.pack(fill="x",padx=14,pady=(12,4))
+        tk.Frame(self,height=1,bg="#24354d").pack(fill="x",padx=10,pady=6)
+        self._lbl(self,"SOG 배율  (1.0 = 원래 속도)")
+        self._slider(self,"sog_mult",self.v_sm,0,5,0.05,"{:.2f}×")
+        self._lbl(self,"COG 오프셋  (도, 전체 선단 회전)")
+        self._slider(self,"cog_offset",self.v_co,-180,180,1,"{:+.0f}°")
+        self._lbl(self,"위치 노이즈  (도)")
+        self._slider(self,"scatter",self.v_ps,0,0.5,0.001,"{:.3f}°")
+        self._lbl(self,"navStatus 강제  (-1=비활성)")
+        self._slider(self,"nav_override",self.v_nav,-1,15,1,"{:.0f}")
+        tk.Frame(self,height=1,bg="#24354d").pack(fill="x",padx=10,pady=6)
+        self._lbl(self,"수동 위치 점프")
+        self._slider(self,"jump_dist",self.v_jd,0.01,0.5,0.01,"{:.2f}°")
+        self.jbtn=tk.Button(self,text="⚡ 즉시 점프",bg="#3d1a1a",fg="#ff6b6b",
+                             font=("Consolas",11,"bold"),relief="flat",cursor="hand2",
+                             pady=7,command=self._jump)
+        self.jbtn.pack(fill="x",padx=14,pady=(4,6))
+        tk.Frame(self,height=1,bg="#24354d").pack(fill="x",padx=10,pady=4)
+        self.stlbl=tk.Label(self,text="● 비활성",bg=self.BG,fg="#556677",
+                            font=("Consolas",9),pady=5); self.stlbl.pack(fill="x",padx=16)
+        tk.Button(self,text="초기화",bg="#172334",fg=self.SB,
+                  font=("Consolas",10),relief="flat",cursor="hand2",pady=4,
+                  command=self._reset).pack(fill="x",padx=14,pady=(4,12))
+
+    def _toggle(self):
+        self.v_act.set(not self.v_act.get()); self._sync(); self._upd_btn()
+    def _upd_btn(self):
+        if self.v_act.get():
+            self.abtn.config(text="● 활성화됨 — 클릭하여 비활성",bg="#1a3d1a",fg="#44ff88")
+            self.stlbl.config(text="● 활성 — 다음 틱에 반영",fg="#44ff88")
         else:
-            queue_log(log_q, f"[{label} 종료] 스레드 종료", "start")
-        queue_channel_state(log_q, channel, "finished")
+            self.abtn.config(text="○ 비활성 — 클릭하여 활성화",bg="#24354d",fg=self.FG)
+            self.stlbl.config(text="● 비활성",fg="#556677")
+    def _sync(self,*_):
+        RT.active=bool(self.v_act.get()); RT.sog_mult=float(self.v_sm.get())
+        RT.cog_offset=float(self.v_co.get()); RT.pos_scatter=float(self.v_ps.get())
+        RT.nav_override=int(self.v_nav.get()); RT.jump_dist=float(self.v_jd.get())
+    def _jump(self):
+        RT.manual_jump=True
+        self.jbtn.config(bg="#6b1a1a"); self.after(300,lambda:self.jbtn.config(bg="#3d1a1a"))
+    def _reset(self):
+        self.v_act.set(False); self.v_sm.set(1.0); self.v_co.set(0.0)
+        self.v_ps.set(0.0); self.v_nav.set(-1); self.v_jd.set(0.05)
+        RT.manual_jump=False; self._upd_btn()
 
 
-# ──────────────────────────────────────────────────
-# GUI
-# ──────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════
+#  §8  GUI — App
+# ═══════════════════════════════════════════════════
+_DEFAULT_FILE = Path(__file__).with_name("nmea_data_sample.txt")
 
 class App(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
-        self.title("OpenCPN IDS Signal Generator  v3")
-        self.configure(bg="#09111d")
-        self.minsize(1020, 760)
-        self.resizable(True, True)
-        self.generated_thread: threading.Thread | None = None
-        self.file_thread: threading.Thread | None = None
-        self.generated_stop_event = threading.Event()
-        self.file_stop_event = threading.Event()
-
-        self._setup_styles()
-        self._build_ui()
-        self._set_channel_state("generated", False)
-        self._set_channel_state("file", False)
+        self.title("OpenCPN AIS IDS Signal Generator  v6")
+        self.configure(bg="#09111d"); self.minsize(1120,720); self.resizable(True,True)
+        self._gen_thread: threading.Thread|None = None
+        self._file_thread: threading.Thread|None = None
+        self._gen_stop  = threading.Event()
+        self._file_stop = threading.Event()
+        self._rt_win: RealTimeControlWindow|None = None
+        # 파라미터 위젯 보관 {key: widget}
+        self._param_widgets: dict[str, dict] = {}
+        self._setup_styles(); self._build_ui()
         self._on_attack_change()
-        self._poll_log()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._set_ch("generated",False); self._set_ch("file",False)
+        self._poll(); self.protocol("WM_DELETE_WINDOW",self._close)
 
     # ── 스타일 ─────────────────────────────────────
-    def _setup_styles(self) -> None:
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        bg, accent, fg = "#09111d", "#35d0ff", "#edf4ff"
-        fg_sub, entry_bg, highlight = "#9db0c7", "#172334", "#24354d"
-
-        style.configure(".", background=bg, foreground=fg, font=("Consolas", 10))
-        style.configure("TFrame", background=bg)
-        style.configure("TLabel", background=bg, foreground=fg, font=("Consolas", 10))
-        style.configure("Header.TLabel", background=bg, foreground=accent, font=("Consolas", 13, "bold"))
-        style.configure("Sub.TLabel", background=bg, foreground=fg_sub, font=("Consolas", 9))
-        style.configure("Accent.TLabel", background=bg, foreground="#ffcc44", font=("Consolas", 10, "bold"))
-        style.configure("TEntry", fieldbackground=entry_bg, foreground="#ffffff", insertcolor=accent, borderwidth=0)
-        style.configure("TSpinbox", fieldbackground=entry_bg, foreground="#ffffff", background=entry_bg,
-                         arrowcolor=accent, borderwidth=0)
-        style.configure("TCombobox", fieldbackground=entry_bg, foreground="#ffffff",
-                         selectbackground=accent, selectforeground=bg)
-        style.map("TCombobox", fieldbackground=[("readonly", entry_bg)], foreground=[("readonly", "#ffffff")])
-        style.configure("TCheckbutton", background=bg, foreground=fg, font=("Consolas", 10))
-        style.map("TCheckbutton", background=[("active", bg)])
-        style.configure("TSeparator", background=highlight)
+    def _setup_styles(self):
+        s=ttk.Style(self); s.theme_use("clam")
+        bg,ac,fg="#09111d","#35d0ff","#edf4ff"
+        sb,eb,hi="#9db0c7","#172334","#24354d"
+        s.configure(".",background=bg,foreground=fg,font=("Consolas",10))
+        s.configure("TFrame",background=bg); s.configure("TLabel",background=bg,foreground=fg)
+        s.configure("H.TLabel", background=bg,foreground=ac,  font=("Consolas",11,"bold"))
+        s.configure("A.TLabel", background=bg,foreground="#ffcc44",font=("Consolas",10,"bold"))
+        s.configure("ML.TLabel",background=bg,foreground="#ff9f44",font=("Consolas",10,"bold"))
+        s.configure("ADV.TLabel",background=bg,foreground="#ff4488",font=("Consolas",10,"bold"))
+        s.configure("Sub.TLabel",background=bg,foreground=sb,font=("Consolas",9))
+        s.configure("TEntry",fieldbackground=eb,foreground="#ffffff",insertcolor=ac,borderwidth=0)
+        s.configure("TSpinbox",fieldbackground=eb,foreground="#ffffff",
+                    background=eb,arrowcolor=ac,borderwidth=0)
+        s.configure("TCombobox",fieldbackground=eb,foreground="#ffffff",
+                    selectbackground=ac,selectforeground=bg)
+        s.map("TCombobox",fieldbackground=[("readonly",eb)],foreground=[("readonly","#ffffff")])
+        s.configure("TCheckbutton",background=bg,foreground=fg)
+        s.map("TCheckbutton",background=[("active",bg)])
 
     # ── 공통 빌더 ───────────────────────────────────
-    def _section(self, parent, title: str, color: str = None) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill="x", padx=10, pady=(10, 2))
-        style = "Header.TLabel" if not color else "Accent.TLabel"
-        ttk.Label(frame, text=title, style=style).pack(anchor="w")
-        tk.Frame(parent, height=1, bg="#24354d").pack(fill="x", padx=10, pady=(0, 6))
+    def _section(self,p,t,style="H.TLabel"):
+        f=ttk.Frame(p); f.pack(fill="x",padx=10,pady=(10,2))
+        ttk.Label(f,text=t,style=style).pack(anchor="w")
+        tk.Frame(p,height=1,bg="#24354d").pack(fill="x",padx=10,pady=(0,4))
 
-    def _row(self, parent, label: str, widget_factory, **kwargs):
-        row = ttk.Frame(parent)
-        row.pack(fill="x", padx=16, pady=2)
-        ttk.Label(row, text=label, width=26, anchor="w", style="Sub.TLabel").pack(side="left")
-        widget = widget_factory(row, **kwargs)
-        widget.pack(side="left", fill="x", expand=True)
-        return widget
+    def _row(self,p,label,factory,**kw):
+        row=ttk.Frame(p); row.pack(fill="x",padx=16,pady=2)
+        ttk.Label(row,text=label,width=26,anchor="w",style="Sub.TLabel").pack(side="left")
+        w=factory(row,**kw); w.pack(side="left",fill="x",expand=True); return w
 
-    def _entry(self, parent, default: str = "", **kwargs):
-        var = tk.StringVar(value=str(default))
-        entry = ttk.Entry(parent, textvariable=var, **kwargs)
-        entry._var = var
-        return entry
+    def _entry(self,p,default="",**kw):
+        var=tk.StringVar(value=str(default)); e=ttk.Entry(p,textvariable=var,**kw)
+        e._var=var; return e
 
-    def _spin(self, parent, from_: float, to: float, default: float, step: float = 1.0):
-        var = tk.DoubleVar(value=default)
-        spin = ttk.Spinbox(parent, from_=from_, to=to, increment=step, textvariable=var,
-                            font=("Consolas", 10))
-        spin._var = var
-        return spin
+    def _spin(self,p,lo,hi,default,step=1.0):
+        var=tk.DoubleVar(value=default)
+        s=ttk.Spinbox(p,from_=lo,to=hi,increment=step,textvariable=var,font=("Consolas",10))
+        s._var=var; return s
 
-    def _combo(self, parent, values: list[str], default: str):
-        var = tk.StringVar(value=default)
-        combo = ttk.Combobox(parent, textvariable=var, values=values, state="readonly",
-                              font=("Consolas", 10))
-        combo._var = var
-        return combo
+    def _combo(self,p,values,default):
+        var=tk.StringVar(value=default)
+        c=ttk.Combobox(p,textvariable=var,values=values,state="readonly",font=("Consolas",10))
+        c._var=var; return c
 
     # ── UI 빌드 ─────────────────────────────────────
-    def _build_ui(self) -> None:
-        title_bar = ttk.Frame(self)
-        title_bar.pack(fill="x")
-        tk.Label(title_bar, text="  OPENCPN IDS SIGNAL GENERATOR  v3",
-                 bg="#35d0ff", fg="#08101a", font=("Consolas", 14, "bold"), padx=10, pady=8).pack(fill="x")
-        tk.Label(title_bar,
-                 text="  AIS NMEA 0183 UDP Sender  |  Ghost Fleet Attack Simulator  |  실시간 이동·정밀 제어",
-                 bg="#112033", fg="#8aa1bb", font=("Consolas", 9), padx=10, pady=3).pack(fill="x")
+    def _build_ui(self):
+        tk.Label(self,text="  OPENCPN AIS IDS SIGNAL GENERATOR  v6",
+                 bg="#35d0ff",fg="#08101a",
+                 font=("Consolas",14,"bold"),padx=10,pady=8).pack(fill="x")
+        tk.Label(self,
+                 text="  ML-Aware AIS Attack Simulator  |  "
+                      "Plugin Architecture  |  A~F Category (총 "+str(len(AttackRegistry.all()))+"개 패턴)",
+                 bg="#112033",fg="#8aa1bb",
+                 font=("Consolas",9),padx=10,pady=3).pack(fill="x")
 
-        main = ttk.Frame(self)
-        main.pack(fill="both", expand=True)
+        main=ttk.Frame(self); main.pack(fill="both",expand=True)
+        left=ttk.Frame(main); left.pack(side="left",fill="both",expand=True)
+        tk.Frame(main,width=1,bg="#24354d").pack(side="left",fill="y")
+        right=ttk.Frame(main); right.pack(side="right",fill="both",expand=True)
 
-        left = ttk.Frame(main)
-        left.pack(side="left", fill="both", expand=False)
-        tk.Frame(main, width=1, bg="#24354d").pack(side="left", fill="y")
-        right = ttk.Frame(main)
-        right.pack(side="right", fill="both", expand=True)
-
-        canvas = tk.Canvas(left, bg="#09111d", highlightthickness=0, width=490)
-        scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
-        self.scroll_frame = ttk.Frame(canvas)
-        self.scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        # 스크롤 캔버스
+        canvas=tk.Canvas(left,bg="#09111d",highlightthickness=0)
+        vbar=ttk.Scrollbar(left,orient="vertical",command=canvas.yview)
+        self._sf=ttk.Frame(canvas)
+        self._sfwin=canvas.create_window((0,0),window=self._sf,anchor="nw")
+        self._sf.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",lambda e:canvas.itemconfig(self._sfwin,width=e.width))
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right",fill="y"); canvas.pack(side="left",fill="both",expand=True)
         canvas.bind_all("<MouseWheel>",
-                         lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+                        lambda e:canvas.yview_scroll(-1*(e.delta//120),"units"))
 
-        sf = self.scroll_frame
-        self._build_network_section(sf)
+        sf=self._sf
+        self._build_network(sf)
+        self._build_center(sf)
+        self._build_movement(sf)
+        self._build_attack_selector(sf)
+        self._build_all_param_frames(sf)
+        self._build_extra(sf)
+        self._build_file(sf)
+        self._build_controls(sf)
 
-        self.generated_panel = ttk.Frame(sf)
-        self.generated_panel.pack(fill="x")
-        self._build_center_section(self.generated_panel)
-        self._build_movement_section(self.generated_panel)   # ★ 이동 제어
-        self._build_attack_section(self.generated_panel)
-        self._build_circle_section(self.generated_panel)
-        self._build_grid_section(self.generated_panel)
-        self._build_spiral_section(self.generated_panel)
-        self._build_random_section(self.generated_panel)
-        self._build_fn_dt_section(self.generated_panel)
-        self._build_fn_ramp_section(self.generated_panel)
-        self._build_fn_cog_section(self.generated_panel)
-        self._build_fn_nav_section(self.generated_panel)
-        self._build_extra_section(self.generated_panel)
+        # 로그
+        tk.Label(right,text="  LIVE LOG",bg="#09111d",fg="#35d0ff",
+                 font=("Consolas",11,"bold"),padx=12,pady=8).pack(fill="x")
+        self._log=scrolledtext.ScrolledText(
+            right,bg="#051019",fg="#dff7ff",font=("Consolas",9),
+            insertbackground="#35d0ff",selectbackground="#1b3555",
+            relief="flat",borderwidth=0,wrap="word")
+        self._log.pack(fill="both",expand=True,padx=8,pady=(0,8))
+        self._log.tag_config("info",foreground="#c6d6ea")
+        self._log.tag_config("start",foreground="#35d0ff")
+        self._log.tag_config("error",foreground="#ff6b6b")
 
-        self.file_panel = ttk.Frame(sf)
-        self.file_panel.pack(fill="x")
-        self._build_file_section(self.file_panel)
+    def _build_network(self,p):
+        self._section(p,"네트워크")
+        self._host  =self._row(p,"대상 IP",          self._entry,default="127.0.0.1")
+        self._port  =self._row(p,"UDP 포트",          self._entry,default="1111")
+        self._itv   =self._row(p,"송신 주기 (초)",   self._spin,lo=0.2,hi=120,default=2.0,step=0.1)
 
-        self.control_panel = self._build_control_section(sf)
+    def _build_center(self,p):
+        self._section(p,"기준 좌표")
+        self._lat=self._row(p,"중심 위도",self._entry,default="37.00")
+        self._lon=self._row(p,"중심 경도",self._entry,default="21.00")
 
-        # 로그 패널
-        tk.Label(right, text="  LIVE TRANSMISSION LOG",
-                 bg="#09111d", fg="#35d0ff", font=("Consolas", 11, "bold"),
-                 padx=12, pady=8).pack(fill="x")
-        self.log_box = scrolledtext.ScrolledText(
-            right, bg="#051019", fg="#dff7ff", font=("Consolas", 9),
-            insertbackground="#35d0ff", selectbackground="#1b3555",
-            relief="flat", borderwidth=0, wrap="word")
-        self.log_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.log_box.tag_config("info", foreground="#c6d6ea")
-        self.log_box.tag_config("start", foreground="#35d0ff")
-        self.log_box.tag_config("error", foreground="#ff6b6b")
+    def _build_movement(self,p):
+        self._section(p,"★ 선단 이동 제어",style="A.TLabel")
+        self._mv_spd=self._row(p,"이동 속도 (kn)",self._spin,lo=0,hi=30,default=0,step=0.5)
+        self._mv_hdg=self._row(p,"이동 방향 (도)",self._spin,lo=0,hi=359,default=0,step=5)
+        self._mv_acc=self._row(p,"가속도 (kn/분)", self._spin,lo=0,hi=5,default=0,step=0.1)
 
-    def _build_network_section(self, parent) -> None:
-        self._section(parent, "네트워크")
-        self.host_entry = self._row(parent, "대상 IP", self._entry, default="127.0.0.1")
-        self.port_entry = self._row(parent, "UDP 포트", self._entry, default="1111")
-        self.interval_spin = self._row(parent, "생성 신호 주기(초)", self._spin,
-                                        from_=0.2, to=30.0, default=2.0, step=0.1)
+    def _build_attack_selector(self,p):
+        self._section(p,"공격 패턴 선택")
+        row=ttk.Frame(p); row.pack(fill="x",padx=16,pady=4)
+        self._atk_var=tk.StringVar(value=AttackRegistry.labels()[0])
+        cb=ttk.Combobox(row,textvariable=self._atk_var,
+                        values=AttackRegistry.labels(),state="readonly",
+                        font=("Consolas",11))
+        cb.pack(fill="x"); cb.bind("<<ComboboxSelected>>",self._on_attack_change)
+        # 패턴 설명 레이블
+        self._meta_lbl=ttk.Label(p,text="",style="Sub.TLabel",wraplength=480)
+        self._meta_lbl.pack(anchor="w",padx=16,pady=(0,4))
 
-    def _build_center_section(self, parent) -> None:
-        self._section(parent, "기준 좌표 (기본: 서해 37°N 21°E)")
-        self.lat_entry = self._row(parent, "중심 위도 (N)", self._entry, default="37.00")
-        self.lon_entry = self._row(parent, "중심 경도 (E)", self._entry, default="21.00")
+    def _build_all_param_frames(self,p):
+        """모든 AttackPlugin의 param_defs로 GUI 패널을 동적 생성"""
+        for plugin in AttackRegistry.all():
+            key=plugin.meta.key
+            frame=ttk.Frame(p); frame.pack(fill="x")
+            self._param_widgets[key]={}
+            cat_style={"A":"H.TLabel","B":"H.TLabel","C":"A.TLabel",
+                       "D":"ML.TLabel","E":"ADV.TLabel","F":"ADV.TLabel"
+                       }.get(plugin.meta.category,"H.TLabel")
+            self._section(frame,f"{plugin.meta.label}  파라미터",style=cat_style)
+            for pd in plugin.param_defs():
+                if pd["type"]=="spin":
+                    w=self._row(frame,pd["label"],self._spin,
+                                lo=pd["min"],hi=pd["max"],
+                                default=pd["default"],step=pd.get("step",1.0))
+                elif pd["type"]=="combo":
+                    w=self._row(frame,pd["label"],self._combo,
+                                values=pd["values"],default=pd["default"])
+                else:  # entry
+                    w=self._row(frame,pd["label"],self._entry,default=str(pd["default"]))
+                self._param_widgets[key][pd["key"]]=w
+            # 패턴 숨김 기본
+            frame.pack_forget()
+            plugin._frame=frame  # type: ignore
 
-    def _build_movement_section(self, parent) -> None:
-        """★ 선단 이동 제어 섹션"""
-        self._section(parent, "★ 선단 이동 제어", color="accent")
-        self.move_speed = self._row(parent, "이동 속도 (kn)", self._spin,
-                                     from_=0.0, to=30.0, default=0.0, step=0.5)
-        self.move_heading = self._row(parent, "이동 방향 (도, 진북=0)", self._spin,
-                                       from_=0, to=359, default=0, step=5)
-        self.move_accel = self._row(parent, "가속도 (kn/분)", self._spin,
-                                     from_=0.0, to=5.0, default=0.0, step=0.1)
+    def _build_extra(self,p):
+        self._section(p,"추가 옵션")
+        row=ttk.Frame(p); row.pack(fill="x",padx=16,pady=4)
+        self._anchor=tk.BooleanVar(value=False)
+        ttk.Checkbutton(row,text="중앙 정박선 추가 (MMSI: 440123456)",
+                        variable=self._anchor).pack(anchor="w")
 
-    def _build_attack_section(self, parent) -> None:
-        self._section(parent, "생성 패턴")
-        row = ttk.Frame(parent)
-        row.pack(fill="x", padx=16, pady=4)
-        self.attack_var = tk.StringVar(value=ATTACK_OPTIONS[0][1])
-        combo = ttk.Combobox(row, textvariable=self.attack_var,
-                              values=[label for _, label in ATTACK_OPTIONS],
-                              state="readonly", font=("Consolas", 11))
-        combo.pack(fill="x")
-        combo.bind("<<ComboboxSelected>>", self._on_attack_change)
+    def _build_file(self,p):
+        self._section(p,"정상 신호 파일")
+        frow=ttk.Frame(p); frow.pack(fill="x",padx=16,pady=2)
+        ttk.Label(frow,text="NMEA 파일",width=26,anchor="w",style="Sub.TLabel").pack(side="left")
+        self._fpath=tk.StringVar(value=str(_DEFAULT_FILE) if _DEFAULT_FILE.exists() else "")
+        ttk.Entry(frow,textvariable=self._fpath).pack(side="left",fill="x",expand=True)
+        tk.Button(frow,text="찾기",bg="#172334",fg="#edf4ff",relief="flat",
+                  padx=10,pady=3,command=self._browse).pack(side="left",padx=(6,0))
+        self._fitv=self._row(p,"문장 간격 (초)",self._spin,lo=0.01,hi=5,default=0.1,step=0.01)
+        rrow=ttk.Frame(p); rrow.pack(fill="x",padx=16,pady=4)
+        self._frep=tk.BooleanVar(value=False)
+        ttk.Checkbutton(rrow,text="파일 끝 후 반복",variable=self._frep).pack(anchor="w")
 
-    def _build_circle_section(self, parent) -> None:
-        self.circle_frame = ttk.Frame(parent)
-        self.circle_frame.pack(fill="x")
-        self._section(self.circle_frame, "속도 이상 설정")
-        self.circle_count = self._row(self.circle_frame, "선박 수", self._spin,
-                                       from_=1, to=100, default=25, step=1)
-        self.circle_radius = self._row(self.circle_frame, "기본 속도 (kn)", self._spin,
-                                        from_=0.0, to=40.0, default=8.0, step=0.5)
-        self.circle_speed = self._row(self.circle_frame, "스파이크 속도 (kn)", self._spin,
-                                       from_=0.0, to=60.0, default=30.0, step=1.0)
-        self.circle_mode = self._row(self.circle_frame, "스파이크 방식", self._combo,
-                                      values=["간헐", "순간"], default="간헐")
-        self.circle_converge_rate = self._row(self.circle_frame, "스파이크 주기 (초)", self._spin,
-                                               from_=1.0, to=120.0, default=10.0, step=1.0)
+    def _build_controls(self,p):
+        ttk.Separator(p,orient="horizontal").pack(fill="x",padx=10,pady=8)
+        c=ttk.Frame(p); c.pack(fill="x",padx=10,pady=(0,4))
 
-    def _build_grid_section(self, parent) -> None:
-        self.grid_frame = ttk.Frame(parent)
-        self.grid_frame.pack(fill="x")
-        self._section(self.grid_frame, "정박 이동 이상 설정")
-        self.grid_rows = self._row(self.grid_frame, "선박 수", self._spin,
-                                    from_=1, to=100, default=30, step=1)
-        self.grid_cols = self._row(self.grid_frame, "클러스터 반경 (도)", self._spin,
-                                    from_=0.01, to=1.0, default=0.10, step=0.01)
-        self.grid_spacing = self._row(self.grid_frame, "이상 이동 속도 (kn)", self._spin,
-                                       from_=0.0, to=10.0, default=3.0, step=0.1)
-        self.grid_speed = self._row(self.grid_frame, "COG 방향 (도)", self._spin,
-                                     from_=0, to=359, default=90, step=5)
-        self.grid_heading = self._row(self.grid_frame, "경도 오프셋 (도)", self._spin,
-                                       from_=-1.0, to=1.0, default=0.0, step=0.01)
-        self.grid_rotate = self._row(self.grid_frame, "드리프트 강도", self._spin,
-                                      from_=-1.0, to=1.0, default=0.0, step=0.05)
+        def btn_row(parent,lbl,start_text,stop_text,start_cmd,stop_cmd,
+                    start_bg,stop_fg):
+            row=ttk.Frame(parent); row.pack(fill="x",pady=(0,5))
+            ttk.Label(row,text=lbl,width=10,anchor="w",style="Sub.TLabel").pack(side="left")
+            sb=tk.Button(row,text=start_text,bg=start_bg,fg="#08101a",
+                         font=("Consolas",10,"bold"),relief="flat",cursor="hand2",
+                         padx=12,pady=6,command=start_cmd)
+            sb.pack(side="left",fill="x",expand=True,padx=(0,4))
+            xb=tk.Button(row,text=stop_text,bg="#172334",fg=stop_fg,
+                         font=("Consolas",10,"bold"),relief="flat",cursor="hand2",
+                         padx=12,pady=6,command=stop_cmd)
+            xb.pack(side="left",fill="x",expand=True,padx=(4,0))
+            return sb,xb
 
-    def _build_spiral_section(self, parent) -> None:
-        self.spiral_frame = ttk.Frame(parent)
-        self.spiral_frame.pack(fill="x")
-        self._section(self.spiral_frame, "COG/HDG 불일치 설정")
-        self.spiral_count = self._row(self.spiral_frame, "선박 수", self._spin,
-                                       from_=3, to=60, default=20, step=1)
-        self.spiral_turns = self._row(self.spiral_frame, "불일치 각도 (도)", self._spin,
-                                       from_=90.0, to=180.0, default=150.0, step=5.0)
-        self.spiral_max_r = self._row(self.spiral_frame, "기본 속도 (kn)", self._spin,
-                                       from_=0.0, to=30.0, default=10.0, step=0.5)
-        self.spiral_speed = self._row(self.spiral_frame, "COG 변화 속도 (도/초)", self._spin,
-                                       from_=0.0, to=20.0, default=5.0, step=0.5)
-        self.spiral_expand = self._row(self.spiral_frame, "HDG 편차 (도)", self._spin,
-                                        from_=0.0, to=180.0, default=120.0, step=5.0)
+        self._gstart,self._gstop=btn_row(c,"생성","생성 시작","생성 중단",
+            self._start_gen,self._stop_gen,"#35d0ff","#ff7c7c")
+        self._fstart,self._fstop=btn_row(c,"파일","파일 시작","파일 중단",
+            self._start_file,self._stop_file,"#7ef0c9","#ffb36b")
 
-    def _build_random_section(self, parent) -> None:
-        self.random_frame = ttk.Frame(parent)
-        self.random_frame.pack(fill="x")
-        self._section(self.random_frame, "위치 점프 이상 설정")
-        self.random_count = self._row(self.random_frame, "선박 수", self._spin,
-                                       from_=1, to=100, default=30, step=1)
-        self.random_spread = self._row(self.random_frame, "점프 반경 (도)", self._spin,
-                                        from_=0.05, to=2.0, default=0.30, step=0.05)
-        self.random_converge_strength = self._row(self.random_frame, "점프 간격 (초)", self._spin,
-                                                   from_=1.0, to=60.0, default=10.0, step=0.5)
-        self.random_converge_lat = self._row(self.random_frame, "점프 기준 위도", self._entry, default="37.00")
-        self.random_converge_lon = self._row(self.random_frame, "점프 기준 경도", self._entry, default="21.00")
+        self._allstop=tk.Button(c,text="전체 중단",bg="#24354d",fg="#edf4ff",
+                                font=("Consolas",10,"bold"),relief="flat",cursor="hand2",
+                                padx=12,pady=6,command=self._stop_all)
+        self._allstop.pack(fill="x",pady=(0,5))
 
-    def _build_fn_dt_section(self, parent) -> None:
-        """[FN-1] dt 구간 점프 설정 패널"""
-        self.fn_dt_frame = ttk.Frame(parent)
-        self.fn_dt_frame.pack(fill="x")
-        self._section(self.fn_dt_frame, "[FN-1] dt 구간 점프  (주기 65~120초 권장)", color="accent")
-        ttk.Label(self.fn_dt_frame,
-                  text="  ▶ Check5/6 회피: dt>60이면 속도급변·위치점프 검사가 skip됨",
-                  style="Sub.TLabel").pack(anchor="w", padx=16, pady=(0, 4))
-        self.fn_dt_count = self._row(self.fn_dt_frame, "선박 수", self._spin,
-                                      from_=1, to=50, default=10, step=1)
-        self.fn_dt_jump_dist = self._row(self.fn_dt_frame, "점프 거리 (도, ~km×111)", self._spin,
-                                          from_=0.05, to=0.5, default=0.15, step=0.01)
-
-    def _build_fn_ramp_section(self, parent) -> None:
-        """[FN-2] 속도 단계 상승 설정 패널"""
-        self.fn_ramp_frame = ttk.Frame(parent)
-        self.fn_ramp_frame.pack(fill="x")
-        self._section(self.fn_ramp_frame, "[FN-2] 속도 단계 상승  (주기 30~55초 권장)", color="accent")
-        ttk.Label(self.fn_ramp_frame,
-                  text="  ▶ Check5 회피: Δsog≤9.9kn/메시지로 ramp-up, 탐지 임계(10.0) 미달",
-                  style="Sub.TLabel").pack(anchor="w", padx=16, pady=(0, 4))
-        self.fn_ramp_count = self._row(self.fn_ramp_frame, "선박 수", self._spin,
-                                        from_=1, to=50, default=10, step=1)
-        self.fn_ramp_start = self._row(self.fn_ramp_frame, "시작 속도 (kn)", self._spin,
-                                        from_=0.0, to=5.0, default=2.0, step=0.5)
-        self.fn_ramp_step = self._row(self.fn_ramp_frame, "단계 증가량 (kn, <10.0)", self._spin,
-                                       from_=1.0, to=9.9, default=9.5, step=0.1)
-        self.fn_ramp_max = self._row(self.fn_ramp_frame, "상한 속도 (kn, <30.0)", self._spin,
-                                      from_=5.0, to=29.9, default=29.0, step=1.0)
-
-    def _build_fn_cog_section(self, parent) -> None:
-        """[FN-3] COG/HDG 경계값 설정 패널"""
-        self.fn_cog_frame = ttk.Frame(parent)
-        self.fn_cog_frame.pack(fill="x")
-        self._section(self.fn_cog_frame, "[FN-3] COG/HDG 경계값  (91~99도 권장)", color="accent")
-        ttk.Label(self.fn_cog_frame,
-                  text="  ▶ Check4 회피: diff≤100도 미만은 탐지 안됨, 임계값 100도가 너무 느슨",
-                  style="Sub.TLabel").pack(anchor="w", padx=16, pady=(0, 4))
-        self.fn_cog_count = self._row(self.fn_cog_frame, "선박 수", self._spin,
-                                       from_=1, to=50, default=10, step=1)
-        self.fn_cog_mismatch = self._row(self.fn_cog_frame, "COG-HDG 불일치 (도)", self._spin,
-                                          from_=80.0, to=99.9, default=95.0, step=1.0)
-
-    def _build_fn_nav_section(self, parent) -> None:
-        """[FN-4] navStatus 회피 설정 패널"""
-        self.fn_nav_frame = ttk.Frame(parent)
-        self.fn_nav_frame.pack(fill="x")
-        self._section(self.fn_nav_frame, "[FN-4] navStatus 회피  (status 2/3/7/8/11/12)", color="accent")
-        ttk.Label(self.fn_nav_frame,
-                  text="  ▶ Check3 회피: navStatus 1/5/6 외에는 SOG≥0.5 이동해도 탐지 안됨",
-                  style="Sub.TLabel").pack(anchor="w", padx=16, pady=(0, 4))
-        self.fn_nav_count = self._row(self.fn_nav_frame, "선박 수", self._spin,
-                                       from_=1, to=50, default=12, step=1)
-        self.fn_nav_sog = self._row(self.fn_nav_frame, "SOG (kn, ≥0.5)", self._spin,
-                                     from_=0.5, to=20.0, default=3.0, step=0.5)
-
-    def _build_jbu_section(self, parent) -> None:
-        self.jbu_frame = ttk.Frame(parent)
-        self.jbu_frame.pack(fill="x")
-        self._section(self.jbu_frame, "JBU 글자 설정")
-        self.jbu_scale = self._row(self.jbu_frame, "글자 크기 배율", self._spin,
-                                    from_=0.5, to=5.0, default=1.0, step=0.1)
-
-    def _build_pincer_section(self, parent) -> None:
-        self.pincer_frame = ttk.Frame(parent)
-        self.pincer_frame.pack(fill="x")
-        self._section(self.pincer_frame, "집게 협공 설정")
-        self.pincer_count = self._row(self.pincer_frame, "선박 수 (양날)", self._spin,
-                                       from_=4, to=80, default=20, step=2)
-        self.pincer_width = self._row(self.pincer_frame, "날개 폭 (도)", self._spin,
-                                       from_=0.05, to=2.0, default=0.5, step=0.05)
-        self.pincer_depth = self._row(self.pincer_frame, "종심 (도)", self._spin,
-                                       from_=0.05, to=1.5, default=0.3, step=0.05)
-        self.pincer_speed = self._row(self.pincer_frame, "수렴 속도 (kn)", self._spin,
-                                       from_=1, to=30, default=8.0, step=0.5)
-
-    def _build_wave_section(self, parent) -> None:
-        self.wave_frame = ttk.Frame(parent)
-        self.wave_frame.pack(fill="x")
-        self._section(self.wave_frame, "파상 대형 설정")
-        self.wave_count = self._row(self.wave_frame, "선박 수", self._spin,
-                                     from_=3, to=60, default=24, step=3)
-        self.wave_lanes = self._row(self.wave_frame, "열 수 (종열)", self._spin,
-                                     from_=1, to=6, default=3, step=1)
-        self.wave_width = self._row(self.wave_frame, "전체 폭 (도)", self._spin,
-                                     from_=0.1, to=2.0, default=0.6, step=0.1)
-        self.wave_amplitude = self._row(self.wave_frame, "횡진폭 (도)", self._spin,
-                                         from_=0.01, to=0.5, default=0.15, step=0.01)
-        self.wave_speed = self._row(self.wave_frame, "전진 속도 (kn)", self._spin,
-                                     from_=1, to=30, default=10.0, step=0.5)
-        self.wave_freq = self._row(self.wave_frame, "사인파 주파수", self._spin,
-                                    from_=0.005, to=0.2, default=0.05, step=0.005)
-
-    def _build_extra_section(self, parent) -> None:
-        self._section(parent, "추가 옵션")
-        row = ttk.Frame(parent)
-        row.pack(fill="x", padx=16, pady=4)
-        self.anchor_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="중앙 정박선 추가 (MMSI: 440123456)",
-                         variable=self.anchor_var).pack(anchor="w")
-
-    def _build_file_section(self, parent) -> None:
-        self._section(parent, "정상 신호 파일")
-        file_row = ttk.Frame(parent)
-        file_row.pack(fill="x", padx=16, pady=2)
-        ttk.Label(file_row, text="NMEA 파일", width=26, anchor="w",
-                   style="Sub.TLabel").pack(side="left")
-        default_path = str(DEFAULT_SAMPLE_FILE if DEFAULT_SAMPLE_FILE.exists() else "")
-        self.file_path_var = tk.StringVar(value=default_path)
-        ttk.Entry(file_row, textvariable=self.file_path_var).pack(side="left", fill="x", expand=True)
-        tk.Button(file_row, text="찾기", bg="#172334", fg="#edf4ff", relief="flat",
-                   activebackground="#24354d", command=self._browse_file,
-                   padx=12, pady=4).pack(side="left", padx=(6, 0))
-        self.file_interval_spin = self._row(parent, "문장 간격(초)", self._spin,
-                                             from_=0.01, to=5.0, default=0.1, step=0.01)
-        repeat_row = ttk.Frame(parent)
-        repeat_row.pack(fill="x", padx=16, pady=4)
-        self.file_repeat_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(repeat_row, text="파일 끝까지 전송 후 반복",
-                         variable=self.file_repeat_var).pack(anchor="w")
-
-    def _build_control_section(self, parent) -> ttk.Frame:
-        wrapper = ttk.Frame(parent)
-        wrapper.pack(fill="x")
-        ttk.Separator(wrapper, orient="horizontal").pack(fill="x", padx=10, pady=10)
-        ctrl = ttk.Frame(wrapper)
-        ctrl.pack(fill="x", padx=10, pady=(0, 16))
-
-        # 생성 신호 버튼
-        gen_row = ttk.Frame(ctrl)
-        gen_row.pack(fill="x", pady=(0, 6))
-        ttk.Label(gen_row, text="생성 신호", width=12, anchor="w", style="Sub.TLabel").pack(side="left")
-        self.generated_start_btn = tk.Button(
-            gen_row, text="생성 시작", bg="#35d0ff", fg="#08101a",
-            font=("Consolas", 11, "bold"), activebackground="#67ddff",
-            relief="flat", cursor="hand2", padx=16, pady=7,
-            command=self.start_generated_sender)
-        self.generated_start_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self.generated_stop_btn = tk.Button(
-            gen_row, text="생성 중단", bg="#172334", fg="#ff7c7c",
-            font=("Consolas", 11, "bold"), activebackground="#24354d",
-            relief="flat", cursor="hand2", padx=16, pady=7,
-            command=self.stop_generated_sender)
-        self.generated_stop_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
-
-        # 파일 버튼
-        file_row = ttk.Frame(ctrl)
-        file_row.pack(fill="x", pady=(0, 6))
-        ttk.Label(file_row, text="정상 파일", width=12, anchor="w", style="Sub.TLabel").pack(side="left")
-        self.file_start_btn = tk.Button(
-            file_row, text="파일 시작", bg="#7ef0c9", fg="#08101a",
-            font=("Consolas", 11, "bold"), activebackground="#9af6d8",
-            relief="flat", cursor="hand2", padx=16, pady=7,
-            command=self.start_file_sender)
-        self.file_start_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self.file_stop_btn = tk.Button(
-            file_row, text="파일 중단", bg="#172334", fg="#ffb36b",
-            font=("Consolas", 11, "bold"), activebackground="#24354d",
-            relief="flat", cursor="hand2", padx=16, pady=7,
-            command=self.stop_file_sender)
-        self.file_stop_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
-
-        self.stop_all_btn = tk.Button(
-            ctrl, text="전체 중단", bg="#24354d", fg="#edf4ff",
-            font=("Consolas", 11, "bold"), activebackground="#304663",
-            relief="flat", cursor="hand2", padx=16, pady=7,
-            command=self.stop_all_senders)
-        self.stop_all_btn.pack(fill="x")
-        return wrapper
+        self._rtbtn=tk.Button(c,text="🎮  실시간 조작 창",bg="#1a2a1a",fg="#44ff88",
+                              font=("Consolas",10,"bold"),relief="flat",cursor="hand2",
+                              padx=12,pady=6,command=self._open_rt)
+        self._rtbtn.pack(fill="x",pady=(0,10))
 
     # ── 이벤트 ─────────────────────────────────────
-    def _browse_file(self) -> None:
-        initial_dir = DEFAULT_SAMPLE_FILE.parent if DEFAULT_SAMPLE_FILE.exists() else Path.cwd()
-        selected = filedialog.askopenfilename(
-            title="NMEA 파일 선택", initialdir=str(initial_dir),
-            filetypes=[("NMEA files", "*.txt *.nmea *.log"), ("All files", "*.*")])
-        if selected:
-            self.file_path_var.set(selected)
+    def _on_attack_change(self,event=None):
+        lbl=self._atk_var.get()
+        key=AttackRegistry.key_by_label(lbl)
+        plugin=AttackRegistry.get(key)
+        for p in AttackRegistry.all():
+            f=getattr(p,"_frame",None)
+            if f:
+                if p.meta.key==key:
+                    if not f.winfo_manager(): f.pack(fill="x")
+                else:
+                    if f.winfo_manager(): f.pack_forget()
+        # 메타 설명 업데이트
+        m=plugin.meta
+        self._meta_lbl.config(
+            text=f"목적: {m.purpose}\n회피: {m.evasion}")
 
-    def _on_attack_change(self, event=None) -> None:
-        attack_key = ATTACK_LABEL_TO_KEY[self.attack_var.get()]
-        frames = {
-            "speed_spike":     self.circle_frame,
-            "anchor_move":     self.grid_frame,
-            "course_mismatch": self.spiral_frame,
-            "position_jump":   self.random_frame,
-            "blind_dt_jump":   self.fn_dt_frame,
-            "blind_speed_ramp":self.fn_ramp_frame,
-            "blind_cog_border":self.fn_cog_frame,
-            "blind_nav_status":self.fn_nav_frame,
-        }
-        for key, frame in frames.items():
-            if key == attack_key:
-                if not frame.winfo_manager():
-                    frame.pack(fill="x")
-            elif frame.winfo_manager():
-                frame.pack_forget()
+    def _browse(self):
+        f=filedialog.askopenfilename(
+            title="NMEA 파일 선택",
+            filetypes=[("NMEA","*.txt *.nmea *.log"),("All","*.*")])
+        if f: self._fpath.set(f)
 
-    # ── 설정 수집 ───────────────────────────────────
-    def _get_common_cfg(self):
-        host = self.host_entry._var.get().strip()
-        if not host:
-            raise ValueError("대상 IP를 입력하세요.")
-        port = int(self.port_entry._var.get())
-        if not 1 <= port <= 65535:
-            raise ValueError("UDP 포트는 1~65535 범위여야 합니다.")
-        return {"host": host, "port": port}
+    def _open_rt(self):
+        if self._rt_win is None or not self._rt_win.winfo_exists():
+            self._rt_win=RealTimeControlWindow(self)
+        else:
+            self._rt_win.lift(); self._rt_win.focus_force()
 
-    def _get_generated_cfg(self):
-        cfg = self._get_common_cfg()
-        interval = float(self.interval_spin._var.get())
-        if interval <= 0:
-            raise ValueError("생성 신호 주기는 0보다 커야 합니다.")
-        attack_label = self.attack_var.get()
+    # ── cfg 수집 ────────────────────────────────────
+    def _common_cfg(self)->dict:
+        h=self._host._var.get().strip()
+        if not h: raise ValueError("IP를 입력하세요")
+        return {"host":h,"port":int(self._port._var.get())}
 
-        # 수렴 좌표 파싱
-        try:
-            rcl = float(self.random_converge_lat._var.get())
-            rcn = float(self.random_converge_lon._var.get())
-        except Exception:
-            rcl = float(self.lat_entry._var.get())
-            rcn = float(self.lon_entry._var.get())
-
-        cfg.update({
-            "interval": interval,
-            "center_lat": float(self.lat_entry._var.get()),
-            "center_lon": float(self.lon_entry._var.get()),
-            "attack_key": ATTACK_LABEL_TO_KEY[attack_label],
-            "attack_label": attack_label,
-            "add_anchor": self.anchor_var.get(),
-            # 이동 제어
-            "move_speed":       float(self.move_speed._var.get()),
-            "move_heading":     float(self.move_heading._var.get()),
-            "move_accel":       float(self.move_accel._var.get()),
-            # 원형
-            "speed_count":         min(200, max(1, int(float(self.circle_count._var.get())))),
-            "speed_base":          float(self.circle_radius._var.get()),
-            "speed_spike":         float(self.circle_speed._var.get()),
-            "speed_mode":          self.circle_mode._var.get(),
-            "speed_interval":      float(self.circle_converge_rate._var.get()),
-            # 정박 이동 이상
-            "anchor_count":        min(300, max(1, int(float(self.grid_rows._var.get())))),
-            "anchor_radius":       float(self.grid_cols._var.get()),
-            "anchor_speed":        float(self.grid_spacing._var.get()),
-            "anchor_cog":          float(self.grid_speed._var.get()),
-            "anchor_lon_offset":   float(self.grid_heading._var.get()),
-            "anchor_drift":        float(self.grid_rotate._var.get()),
-            # COG/HDG 불일치
-            "course_count":        min(200, max(3, int(float(self.spiral_count._var.get())))),
-            "course_mismatch":     float(self.spiral_turns._var.get()),
-            "course_speed":        float(self.spiral_max_r._var.get()),
-            "course_drift":        float(self.spiral_speed._var.get()),
-            "course_offset":       float(self.spiral_expand._var.get()),
-            # 위치 점프 이상
-            "jump_count":          min(300, max(1, int(float(self.random_count._var.get())))),
-            "jump_radius":         float(self.random_spread._var.get()),
-            "jump_interval":       float(self.random_converge_strength._var.get()),
-            "jump_center_lat":     rcl,
-            "jump_center_lon":     rcn,
-            # FN-1: dt 구간 점프
-            "fn_dt_count":         min(50, max(1, int(float(self.fn_dt_count._var.get())))),
-            "fn_dt_jump_dist":     float(self.fn_dt_jump_dist._var.get()),
-            # FN-2: 속도 단계 상승
-            "fn_ramp_count":       min(50, max(1, int(float(self.fn_ramp_count._var.get())))),
-            "fn_ramp_start":       float(self.fn_ramp_start._var.get()),
-            "fn_ramp_step":        float(self.fn_ramp_step._var.get()),
-            "fn_ramp_max":         float(self.fn_ramp_max._var.get()),
-            # FN-3: COG/HDG 경계값
-            "fn_cog_count":        min(50, max(1, int(float(self.fn_cog_count._var.get())))),
-            "fn_cog_mismatch":     float(self.fn_cog_mismatch._var.get()),
-            # FN-4: navStatus 회피
-            "fn_nav_count":        min(50, max(1, int(float(self.fn_nav_count._var.get())))),
-            "fn_nav_sog":          float(self.fn_nav_sog._var.get()),
-        })
+    def _gen_cfg(self)->dict:
+        cfg=self._common_cfg()
+        itv=float(self._itv._var.get())
+        if itv<=0: raise ValueError("주기 > 0")
+        lbl=self._atk_var.get(); key=AttackRegistry.key_by_label(lbl)
+        cfg.update({"interval":itv,"clat":float(self._lat._var.get()),
+                    "clon":float(self._lon._var.get()),
+                    "attack_key":key,"attack_label":lbl,
+                    "add_anchor":self._anchor.get(),
+                    "move_speed":float(self._mv_spd._var.get()),
+                    "move_heading":float(self._mv_hdg._var.get()),
+                    "move_accel":float(self._mv_acc._var.get())})
+        # 현재 패턴 파라미터
+        wmap=self._param_widgets.get(key,{})
+        for pkey,w in wmap.items():
+            try: cfg[pkey]=float(w._var.get())
+            except: cfg[pkey]=w._var.get()
         return cfg
 
-    def _get_file_cfg(self):
-        cfg = self._get_common_cfg()
-        file_path = Path(self.file_path_var.get().strip())
-        if not file_path.exists():
-            raise ValueError("정상 신호 파일 경로를 확인하세요.")
-        file_interval = float(self.file_interval_spin._var.get())
-        if file_interval <= 0:
-            raise ValueError("문장 간격은 0보다 커야 합니다.")
-        cfg.update({
-            "file_path": str(file_path),
-            "file_interval": file_interval,
-            "file_repeat": self.file_repeat_var.get(),
-        })
+    def _file_cfg(self)->dict:
+        cfg=self._common_cfg()
+        fp=self._fpath.get().strip()
+        if not Path(fp).exists(): raise ValueError("파일 없음")
+        itv=float(self._fitv._var.get())
+        if itv<=0: raise ValueError("파일 간격 > 0")
+        cfg.update({"file_path":fp,"file_interval":itv,"file_repeat":self._frep.get()})
         return cfg
 
-    # ── 채널 상태 ───────────────────────────────────
-    def _any_channel_running(self) -> bool:
-        return (
-            (self.generated_thread is not None and self.generated_thread.is_alive()) or
-            (self.file_thread is not None and self.file_thread.is_alive())
-        )
+    # ── 채널 제어 ───────────────────────────────────
+    def _any_running(self)->bool:
+        return (self._gen_thread is not None  and self._gen_thread.is_alive() or
+                self._file_thread is not None and self._file_thread.is_alive())
 
-    def _set_channel_state(self, channel: str, is_running: bool) -> None:
-        if channel == "generated":
-            if is_running:
-                self.generated_start_btn.config(state="disabled", bg="#172334", fg="#5f738c")
-                self.generated_stop_btn.config(state="normal")
+    def _set_ch(self,ch:str,running:bool):
+        if ch=="generated":
+            if running:
+                self._gstart.config(state="disabled",bg="#172334",fg="#5f738c")
+                self._gstop.config(state="normal")
             else:
-                self.generated_start_btn.config(state="normal", bg="#35d0ff", fg="#08101a")
-                self.generated_stop_btn.config(state="disabled")
+                self._gstart.config(state="normal",bg="#35d0ff",fg="#08101a")
+                self._gstop.config(state="disabled")
         else:
-            if is_running:
-                self.file_start_btn.config(state="disabled", bg="#172334", fg="#5f738c")
-                self.file_stop_btn.config(state="normal")
+            if running:
+                self._fstart.config(state="disabled",bg="#172334",fg="#5f738c")
+                self._fstop.config(state="normal")
             else:
-                self.file_start_btn.config(state="normal", bg="#7ef0c9", fg="#08101a")
-                self.file_stop_btn.config(state="disabled")
-        if is_running:
-            self.stop_all_btn.config(state="normal")
-        else:
-            self.stop_all_btn.config(state="normal" if self._any_channel_running() else "disabled")
+                self._fstart.config(state="normal",bg="#7ef0c9",fg="#08101a")
+                self._fstop.config(state="disabled")
+        self._allstop.config(state="normal" if self._any_running() else "disabled")
 
-    # ── 송신 제어 ───────────────────────────────────
-    def start_generated_sender(self) -> None:
-        if self.generated_thread is not None and self.generated_thread.is_alive():
-            self.log("[생성] 이미 실행 중입니다.", "error")
-            return
-        try:
-            cfg = self._get_generated_cfg()
-        except ValueError as exc:
-            messagebox.showerror("입력 오류", str(exc))
-            return
-        self.generated_stop_event = threading.Event()
-        self._set_channel_state("generated", True)
-        self.log("[생성 대기] 송신 스레드 시작", "start")
-        self.generated_thread = threading.Thread(
-            target=sender_worker_v3,
-            args=("generated", cfg, log_queue, self.generated_stop_event),
-            daemon=True,
-        )
-        self.generated_thread.start()
+    def _start_gen(self):
+        if self._gen_thread and self._gen_thread.is_alive():
+            self._log_msg("이미 실행 중","error"); return
+        try: cfg=self._gen_cfg()
+        except ValueError as e: messagebox.showerror("입력 오류",str(e)); return
+        self._gen_stop=threading.Event(); self._set_ch("generated",True)
+        self._gen_thread=threading.Thread(
+            target=sender_worker,args=("generated",cfg,self._gen_stop),daemon=True)
+        self._gen_thread.start()
 
-    def stop_generated_sender(self) -> None:
-        if self.generated_thread is not None and self.generated_thread.is_alive():
-            self.generated_stop_event.set()
-            self.log("[생성 중단] 사용자 중단 요청", "error")
+    def _stop_gen(self):
+        if self._gen_thread and self._gen_thread.is_alive():
+            self._gen_stop.set()
 
-    def start_file_sender(self) -> None:
-        if self.file_thread is not None and self.file_thread.is_alive():
-            self.log("[파일] 이미 실행 중입니다.", "error")
-            return
-        try:
-            cfg = self._get_file_cfg()
-        except ValueError as exc:
-            messagebox.showerror("입력 오류", str(exc))
-            return
-        self.file_stop_event = threading.Event()
-        self._set_channel_state("file", True)
-        self.log("[파일 대기] 송신 스레드 시작", "start")
-        self.file_thread = threading.Thread(
-            target=sender_worker_v3,
-            args=("file", cfg, log_queue, self.file_stop_event),
-            daemon=True,
-        )
-        self.file_thread.start()
+    def _start_file(self):
+        if self._file_thread and self._file_thread.is_alive():
+            self._log_msg("파일 이미 실행 중","error"); return
+        try: cfg=self._file_cfg()
+        except ValueError as e: messagebox.showerror("입력 오류",str(e)); return
+        self._file_stop=threading.Event(); self._set_ch("file",True)
+        self._file_thread=threading.Thread(
+            target=sender_worker,args=("file",cfg,self._file_stop),daemon=True)
+        self._file_thread.start()
 
-    def stop_file_sender(self) -> None:
-        if self.file_thread is not None and self.file_thread.is_alive():
-            self.file_stop_event.set()
-            self.log("[파일 중단] 사용자 중단 요청", "error")
+    def _stop_file(self):
+        if self._file_thread and self._file_thread.is_alive():
+            self._file_stop.set()
 
-    def stop_all_senders(self) -> None:
-        self.stop_generated_sender()
-        self.stop_file_sender()
+    def _stop_all(self): self._stop_gen(); self._stop_file()
 
-    def log(self, message: str, level: str = "info") -> None:
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_box.insert("end", f"[{timestamp}] {message}\n", level)
-        self.log_box.see("end")
+    def _log_msg(self,msg:str,level:str="info"):
+        ts=time.strftime("%H:%M:%S")
+        self._log.insert("end",f"[{ts}] {msg}\n",level); self._log.see("end")
 
-    def _poll_log(self) -> None:
-        while not log_queue.empty():
-            item = log_queue.get_nowait()
-            if item.get("kind") == "channel_state" and item.get("state") == "finished":
-                self._set_channel_state(item.get("channel", ""), False)
-                continue
-            if item.get("kind") == "state" and item.get("state") == "finished":
-                continue
-            self.log(item["message"], item.get("level", "info"))
-        self.after(200, self._poll_log)
+    def _poll(self):
+        while not _LOG_Q.empty():
+            item=_LOG_Q.get_nowait()
+            if item.get("kind")=="chan" and item.get("state")=="finished":
+                self._set_ch(item["channel"],False); continue
+            self._log_msg(item.get("message",""),item.get("level","info"))
+        self.after(200,self._poll)
 
-    def _on_close(self) -> None:
-        self.generated_stop_event.set()
-        self.file_stop_event.set()
-        self.destroy()
+    def _close(self): self._gen_stop.set(); self._file_stop.set(); self.destroy()
 
 
-if __name__ == "__main__":
+# ═══════════════════════════════════════════════════
+#  §9  진입점
+# ═══════════════════════════════════════════════════
+if __name__=="__main__":
     App().mainloop()
