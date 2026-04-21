@@ -8,23 +8,22 @@
 #include <unordered_map>
 #include <fstream>
 
-// 피처 순서 (15개 — 현재 model.onnx 기준):
-//   0  sog                속력 (knots)
-//   1  cog                진행 방향 (도)
-//   2  heading            선수 방향 (도)
-//   3  status             항행 상태
-//   4  dt                 이전 신호와 시간 차이 (초)
-//   5  dist_km            실제 이동 거리 (km)
-//   6  expected_dist_km   예상 이동 거리 (km)
-//   7  bearing_cog_diff   GPS 이동방향 vs COG 차이 (도)
-//   8  cog_hdg_diff       COG vs HDG 차이 (도, -1=미정의)
-//   9  sog_change         이전 대비 SOG 변화량 (knots)
-//  10  cog_change         이전 대비 COG 변화량 (도)
-//  11  sog_status_ratio   sog / status별 정상최대속도
-//  12  dist_expected_ratio 실제/예상 거리 비율
-//  13  cog_hdg_change     이전 대비 cog_hdg_diff 변화량
-//  14  cog_hdg_std        시퀀스 내 cog_hdg_diff 표준편차
-#define ML_FEATURE_COUNT 15
+// 피처 순서 (14개):
+//   0  sog               속력 (knots)
+//   1  cog               진행 방향 (도)
+//   2  heading           선수 방향 (도)
+//   3  status            항행 상태
+//   4  dt                이전 신호와 시간 차이 (초)
+//   5  dist_km           실제 이동 거리 (km)
+//   6  cog_hdg_diff      COG vs HDG 차이 (도, -1=미정의)
+//   7  sog_change        이전 대비 SOG 변화량 (knots)
+//   8  cog_hdg_change    이전 대비 cog_hdg_diff 변화량
+//   9  cog_hdg_std       시퀀스 내 cog_hdg_diff 표준편차
+//  10  speed_consistency 실제 이동거리 / SOG 기반 예상 거리
+//  11  sog_consistency   GPS 실제 속도 / 보고된 SOG
+//  12  lat_speed         위도 방향 변화율 (도/초)
+//  13  lon_speed         경도 방향 변화율 (도/초)
+#define ML_FEATURE_COUNT 14
 #define ML_SEQ_LEN       10
 
 struct MLScaler {
@@ -51,10 +50,10 @@ public:
     void PushFeature(int mmsi,
                      float sog, float cog, float heading,
                      float status, float dt, float dist_km,
-                     float expected_dist_km, float bearing_cog_diff,
-                     float cog_hdg_diff, float sog_change, float cog_change,
-                     float sog_status_ratio, float dist_expected_ratio,
-                     float cog_hdg_change, float cog_hdg_std);
+                     float cog_hdg_diff, float sog_change,
+                     float cog_hdg_change, float cog_hdg_std,
+                     float speed_consistency, float sog_consistency,
+                     float lat_speed, float lon_speed);
 
     bool DetectAnomaly(int mmsi, float &out_error);
 
