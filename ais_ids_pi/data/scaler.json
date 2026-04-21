@@ -5,9 +5,27 @@
     "heading",
     "status",
     "dt",
-    "dist_km"
+    "dist_km",
+    "expected_dist_km",
+    "bearing_cog_diff",
+    "cog_hdg_diff",
+    "sog_change",
+    "cog_change",
+    "sog_status_ratio",
+    "dist_expected_ratio",
+    "cog_hdg_change",
+    "cog_hdg_std"
   ],
   "min": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    -1.0,
+    -1.0,
     0.0,
     0.0,
     0.0,
@@ -16,11 +34,20 @@
     0.0
   ],
   "max": [
-    58.0,
+    73.6,
     359.9,
     511.0,
     15.0,
-    3597.0,
-    25.3213
+    599.0,
+    7.8156,
+    832.6381,
+    180.0,
+    180.0,
+    68.7,
+    180.0,
+    58.0,
+    123726100.0,
+    180.0,
+    127.2792
   ]
 }

@@ -2,6 +2,8 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <stdexcept>
+#include <cmath>
+#include <numeric>
 
 using json = nlohmann::json;
 
@@ -25,13 +27,12 @@ bool AIS_ML::Load(const std::string &model_path,
                   std::string &error_msg)
 {
     try {
-        m_session = new Ort::Session(m_env,
-            model_path.c_str(), m_session_options);
+        m_session = new Ort::Session(m_env, model_path.c_str(), m_session_options);
 
-        if (!LoadScaler(scaler_path, error_msg))    return false;
+        if (!LoadScaler(scaler_path, error_msg))       return false;
         if (!LoadThreshold(threshold_path, error_msg)) return false;
 
-        m_loaded = true;
+        m_loaded  = true;
         error_msg = "ML load success | model: " + model_path;
         return true;
     } catch (const std::exception &e) {
@@ -48,16 +49,11 @@ bool AIS_ML::LoadScaler(const std::string &path, std::string &error_msg)
             error_msg = "scaler file not found: " + path;
             return false;
         }
-
         json j;
         f >> j;
-
-        auto &min_arr = j["min"];
-        auto &max_arr = j["max"];
-
         for (int i = 0; i < ML_FEATURE_COUNT; i++) {
-            m_scaler.min_[i] = min_arr[i].get<float>();
-            m_scaler.max_[i] = max_arr[i].get<float>();
+            m_scaler.min_[i] = j["min"][i].get<float>();
+            m_scaler.max_[i] = j["max"][i].get<float>();
         }
         return true;
     } catch (const std::exception &e) {
@@ -82,10 +78,22 @@ bool AIS_ML::LoadThreshold(const std::string &path, std::string &error_msg)
     }
 }
 
-void AIS_ML::PushFeature(int mmsi, float sog, float cog, float heading,
-                         float status, float dt, float dist_km)
+void AIS_ML::PushFeature(int mmsi,
+                          float sog, float cog, float heading,
+                          float status, float dt, float dist_km,
+                          float expected_dist_km, float bearing_cog_diff,
+                          float cog_hdg_diff, float sog_change, float cog_change,
+                          float sog_status_ratio, float dist_expected_ratio,
+                          float cog_hdg_change, float cog_hdg_std)
 {
-    std::array<float, ML_FEATURE_COUNT> feat = {sog, cog, heading, status, dt, dist_km};
+    std::array<float, ML_FEATURE_COUNT> feat = {
+        sog, cog, heading, status,
+        dt, dist_km,
+        expected_dist_km, bearing_cog_diff,
+        cog_hdg_diff, sog_change, cog_change,
+        sog_status_ratio, dist_expected_ratio,
+        cog_hdg_change, cog_hdg_std
+    };
     auto &seq = m_sequences[mmsi];
     seq.push_back(feat);
     if ((int)seq.size() > ML_SEQ_LEN)
@@ -105,9 +113,8 @@ bool AIS_ML::DetectAnomaly(int mmsi, float &out_error)
     std::vector<float> input_data;
     input_data.reserve(ML_SEQ_LEN * ML_FEATURE_COUNT);
     for (auto &feat : seq) {
-        for (int i = 0; i < ML_FEATURE_COUNT; i++) {
+        for (int i = 0; i < ML_FEATURE_COUNT; i++)
             input_data.push_back(m_scaler.scale(i, feat[i]));
-        }
     }
 
     std::vector<int64_t> input_shape = {1, ML_SEQ_LEN, ML_FEATURE_COUNT};
@@ -121,7 +128,7 @@ bool AIS_ML::DetectAnomaly(int mmsi, float &out_error)
     );
 
     const char *input_names[]  = {"x"};
-    const char *output_names[] = {"linear"};
+    const char *output_names[] = {"output"};
 
     auto output_tensors = m_session->Run(
         Ort::RunOptions{nullptr},
@@ -136,7 +143,7 @@ bool AIS_ML::DetectAnomaly(int mmsi, float &out_error)
         float diff = output_data[i] - input_data[i];
         mse += diff * diff;
     }
-    mse /= n;
+    mse /= static_cast<float>(n);
     out_error = mse;
 
     return out_error > m_threshold;
