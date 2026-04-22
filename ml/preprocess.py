@@ -17,11 +17,11 @@ AIS 데이터 전처리 스크립트
   python preprocess.py jan.csv feb.csv mar.csv
 ──────────────────────────────────────────────────
 
-피처 (14개):
+피처 (12개):
     sog, cog, heading, status,
     dt, dist_km,
-    cog_hdg_diff, sog_change, cog_hdg_change, cog_hdg_std,
-    speed_consistency, sog_consistency,
+    cog_hdg_diff, sog_change, cog_hdg_change,
+    speed_consistency,
     lat_speed, lon_speed
 """
 
@@ -32,7 +32,6 @@ import os
 import statistics
 import sys
 from datetime import datetime
-from collections import deque
 
 # ── 입력 설정 (CLI 인수가 없을 때 사용) ──────────────────────────
 INPUT_GLOB  = "ais-*.csv"   # 현재 폴더의 ais-*.csv 전부
@@ -159,12 +158,10 @@ def fill_missing(rows: list) -> list:
 
 
 # ── 파생 피처 추가 ────────────────────────────────────────────────
-# 출력 피처 (14개):
-#   dt, dist_km, cog_hdg_diff, sog_change, cog_hdg_change, cog_hdg_std,
-#   speed_consistency, sog_consistency, lat_speed, lon_speed
+# 출력 피처 (12개):
+#   dt, dist_km, cog_hdg_diff, sog_change, cog_hdg_change,
+#   speed_consistency, lat_speed, lon_speed
 def add_derived_features(rows: list) -> list:
-    cog_hdg_window = deque(maxlen=10)
-
     for i, row in enumerate(rows):
         if i == 0:
             row["dt"]                 = 0.0
@@ -172,10 +169,7 @@ def add_derived_features(rows: list) -> list:
             row["cog_hdg_diff"]       = 0.0
             row["sog_change"]         = 0.0
             row["cog_hdg_change"]     = 0.0
-            cog_hdg_window.append(0.0)
-            row["cog_hdg_std"]        = 0.0
             row["speed_consistency"]  = 1.0
-            row["sog_consistency"]    = 1.0
             row["lat_speed"]          = 0.0
             row["lon_speed"]          = 0.0
             continue
@@ -226,15 +220,6 @@ def add_derived_features(rows: list) -> list:
         except Exception:
             row["cog_hdg_change"] = 0.0
 
-        # cog_hdg_std
-        try:
-            v = float(row["cog_hdg_diff"])
-            cog_hdg_window.append(v if v >= 0 else 0.0)
-        except Exception:
-            cog_hdg_window.append(0.0)
-        row["cog_hdg_std"] = round(statistics.stdev(cog_hdg_window), 4) \
-                             if len(cog_hdg_window) >= 2 else 0.0
-
         # speed_consistency: 실제 이동거리 / SOG 기반 예상 거리
         # 정상 ≈ 1.0 / 위치 조작이나 SOG 허위 보고 시 크게 벗어남
         # sog=0 이면 정지 중이므로 dist_km 도 0이어야 정상 → 비율 1.0 유지
@@ -248,18 +233,6 @@ def add_derived_features(rows: list) -> list:
         except Exception:
             row["speed_consistency"] = 1.0
 
-        # sog_consistency: GPS 실제 속도 / 보고된 SOG
-        # GPS 속도 = dist_km / (dt_h * 1.852)  [knots]
-        # 정상 ≈ 1.0 / GPS는 움직였는데 SOG=0 이거나 반대 경우 크게 벗어남
-        try:
-            sog  = float(row["sog"])
-            dt   = float(row["dt"])
-            dist = float(row["dist_km"])
-            dt_h = dt / 3600.0
-            gps_speed = dist / (dt_h * 1.852 + 1e-6)   # knots
-            row["sog_consistency"] = round(gps_speed / (sog + 1e-6), 4)
-        except Exception:
-            row["sog_consistency"] = 1.0
 
         # lat_speed: 위도 변화율 (도/초)
         # 위도/경도 방향을 분리해서 이동 방향 이상 탐지
@@ -398,8 +371,8 @@ def main():
         "dt", "dist_km",
         "cog_hdg_diff",
         "sog_change",
-        "cog_hdg_change", "cog_hdg_std",
-        "speed_consistency", "sog_consistency",
+        "cog_hdg_change",
+        "speed_consistency",
         "lat_speed", "lon_speed",
     ]
 

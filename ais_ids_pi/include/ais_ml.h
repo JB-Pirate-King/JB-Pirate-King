@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <fstream>
 
-// 피처 순서 (14개):
+// 피처 순서 (12개):
 //   0  sog               속력 (knots)
 //   1  cog               진행 방향 (도)
 //   2  heading           선수 방향 (도)
@@ -18,12 +18,10 @@
 //   6  cog_hdg_diff      COG vs HDG 차이 (도, -1=미정의)
 //   7  sog_change        이전 대비 SOG 변화량 (knots)
 //   8  cog_hdg_change    이전 대비 cog_hdg_diff 변화량
-//   9  cog_hdg_std       시퀀스 내 cog_hdg_diff 표준편차
-//  10  speed_consistency 실제 이동거리 / SOG 기반 예상 거리
-//  11  sog_consistency   GPS 실제 속도 / 보고된 SOG
-//  12  lat_speed         위도 방향 변화율 (도/초)
-//  13  lon_speed         경도 방향 변화율 (도/초)
-#define ML_FEATURE_COUNT 14
+//   9  speed_consistency 실제 이동거리 / SOG 기반 예상 거리
+//  10  lat_speed         위도 방향 변화율 (도/초)
+//  11  lon_speed         경도 방향 변화율 (도/초)
+#define ML_FEATURE_COUNT 12
 #define ML_SEQ_LEN       10
 
 struct MLScaler {
@@ -51,8 +49,8 @@ public:
                      float sog, float cog, float heading,
                      float status, float dt, float dist_km,
                      float cog_hdg_diff, float sog_change,
-                     float cog_hdg_change, float cog_hdg_std,
-                     float speed_consistency, float sog_consistency,
+                     float cog_hdg_change,
+                     float speed_consistency,
                      float lat_speed, float lon_speed);
 
     bool DetectAnomaly(int mmsi, float &out_error);
