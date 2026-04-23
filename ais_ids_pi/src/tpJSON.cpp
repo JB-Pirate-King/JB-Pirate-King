@@ -38,7 +38,6 @@
 
 #include "ais_ids_pi.h"
 #include "tpJSON.h"
-#include "ODAPI.h"
 #include "version.h"
 
 #include <stdio.h>
@@ -58,10 +57,7 @@ using nlohmann::json_schema::json_validator;
 #endif
 
 extern ais_ids_pi        *g_ais_ids_pi;
-extern ODAPI                *g_pODAPI;
-extern double               g_dVar;
-extern wxString             g_ReceivedODAPIMessage;
-extern wxJSONValue          g_ReceivedODAPIJSONMsg;
+extern double               g_dVar;extern wxJSONValue          g_ReceivedODAPIJSONMsg;
 extern wxString             g_ReceivedJSONMessage;
 extern wxJSONValue          g_ReceivedJSONJSONMsg;
 
@@ -158,14 +154,7 @@ void tpJSON::ProcessMessage(wxString &message_id, wxString &message_body)
         }
 
     }
-    if(message_id != _T("AIS_IDS_PI")) {
-        if(message_id == _T("OCPN_DRAW_PI_READY_FOR_REQUESTS")) {
-            if(message_body == _T("TRUE")) {
-                if(g_ais_ids_pi->m_bReadyForRequests)
-                    g_ais_ids_pi->GetODAPI();
-            }
-        }
-    } else if(message_id == wxS("AIS_IDS_PI")) {
+    if(message_id == wxS("AIS_IDS_PI")) {
 
         // now read the JSON text and store it in the 'root' structure
         // check for errors before retreiving values...
@@ -254,13 +243,6 @@ void tpJSON::ProcessMessage(wxString &message_id, wxString &message_body)
             jMsg[wxS("Date")] = PLUGIN_VERSION_DATE;
             writer.Write( jMsg, MsgString );
             SendPluginMessage( root[wxS("Source")].AsString(), MsgString );
-        } else if(!bFail && root[wxS("Msg")].AsString() == wxS("Version") && root[wxS("Type")].AsString() == wxS("Response")) {
-            g_ReceivedODAPIJSONMsg = root;
-            g_ReceivedODAPIMessage = message_body;
-        } else if(root[wxS("Msg")].AsString() == wxS("GetAPIAddresses") ) {
-            g_ReceivedODAPIJSONMsg = root;
-            g_ReceivedODAPIMessage = message_body;
-
         } else if(!bFail && root[wxS("Msg")].AsString() == wxS("CreateBoundary") && root[wxS("Type")].AsString() == wxS("Response")) {
             g_ReceivedJSONJSONMsg = root;
             g_ReceivedJSONMessage = message_body;
@@ -306,5 +288,3 @@ void tpJSON::CloseJSONOutputFile()
     delete m_ffOutputFile;
     m_ffOutputFile = NULL;
 }
-
-

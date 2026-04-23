@@ -73,46 +73,11 @@ void ais_ids::to_snapshot(AISTarget &target)
                 cog_hdg_change = std::abs(cog_hdg_diff - prev_cog_hdg_diff);
         }
 
-        // cog_hdg_std
-        float cog_hdg_std = 0.0f;
-        {
-            std::vector<float> chd_vals;
-            chd_vals.reserve(ML_SEQ_LEN);
-            auto &hist = ais_history[target.mmsi];
-            int start = (int)hist.size() - ML_SEQ_LEN;
-            if (start < 0) start = 0;
-            for (int hi = start; hi < (int)hist.size(); ++hi) {
-                if (hist[hi].hdg < 511) {
-                    double d = std::abs(hist[hi].cog - (double)hist[hi].hdg);
-                    if (d > 180.0) d = 360.0 - d;
-                    chd_vals.push_back((float)d);
-                } else {
-                    chd_vals.push_back(0.0f);
-                }
-            }
-            if (chd_vals.size() >= 2) {
-                float mean = 0.0f;
-                for (float v : chd_vals) mean += v;
-                mean /= (float)chd_vals.size();
-                float var = 0.0f;
-                for (float v : chd_vals) var += (v - mean) * (v - mean);
-                cog_hdg_std = std::sqrt(var / (float)(chd_vals.size() - 1));
-            }
-        }
-
         // speed_consistency: 실제 이동거리 / SOG 기반 예상 거리 (정상 ≈ 1.0)
         float speed_consistency = 1.0f;
         if (cur.sog >= 0.1f) {
             float expected = (float)(cur.sog * dt / 3600.0 * 1.852);
             speed_consistency = dist_km / (expected + 1e-6f);
-        }
-
-        // sog_consistency: GPS 실제 속도 / 보고된 SOG (정상 ≈ 1.0)
-        float sog_consistency = 1.0f;
-        {
-            float dt_h    = dt / 3600.0f;
-            float gps_spd = dist_km / (dt_h * 1.852f + 1e-6f);
-            sog_consistency = gps_spd / ((float)cur.sog + 1e-6f);
         }
 
         // lat_speed / lon_speed: 위도/경도 방향 변화율 (도/초)
@@ -124,8 +89,8 @@ void ais_ids::to_snapshot(AISTarget &target)
             (float)cur.hdg, (float)cur.navStatus,
             dt, dist_km,
             cog_hdg_diff, sog_change,
-            cog_hdg_change, cog_hdg_std,
-            speed_consistency, sog_consistency,
+            cog_hdg_change,
+            speed_consistency,
             lat_speed, lon_speed);
     }
 }

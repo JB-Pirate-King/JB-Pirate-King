@@ -4,11 +4,11 @@ AIS LSTM Autoencoder 학습 스크립트
 입력: ais_preprocessed.csv
 출력: model.pt, model.onnx, scaler.json, threshold.txt
 
-피처 (14개):
+피처 (12개):
     sog, cog, heading, status,
     dt, dist_km,
-    cog_hdg_diff, sog_change, cog_hdg_change, cog_hdg_std,
-    speed_consistency, sog_consistency,
+    cog_hdg_diff, sog_change, cog_hdg_change,
+    speed_consistency,
     lat_speed, lon_speed
 """
 
@@ -34,12 +34,12 @@ FEATURES = [
     "sog", "cog", "heading", "status",
     "dt", "dist_km",
     "cog_hdg_diff", "sog_change",
-    "cog_hdg_change", "cog_hdg_std",
-    "speed_consistency", "sog_consistency",
+    "cog_hdg_change",
+    "speed_consistency",
     "lat_speed", "lon_speed",
 ]
 
-SEQ_LEN      = 10       # C++ 쪽 ML_SEQ_LEN 과 반드시 일치
+SEQ_LEN      = 10
 HIDDEN_SIZE  = 64
 NUM_LAYERS   = 2
 BATCH_SIZE   = 256
@@ -48,7 +48,7 @@ LR           = 0.001
 PATIENCE     = 5
 VAL_RATIO    = 0.1
 THRESHOLD_PERCENTILE = 95
-SAMPLE_MMSI  = None
+SAMPLE_MMSI  = 10000
 SEQ_BREAK_DT = 600
 SEED         = 42
 

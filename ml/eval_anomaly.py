@@ -1,7 +1,7 @@
 """
 이상 신호 MSE 측정 + 피처 분석 스크립트
 
-[분석 1] 탐지율/오탐율 테이블 (기존)
+[분석 1] 탐지율/오탐율 테이블
 [분석 2] 피처 간 상관행렬 (Pearson)
 [분석 3] 시나리오별 재구성 오차 분해 (피처별 MSE)
 [분석 4] Permutation Importance
@@ -11,16 +11,23 @@
     python eval_anomaly.py --corr       # 상관행렬만
     python eval_anomaly.py --recon      # 재구성 오차 분해만
     python eval_anomaly.py --perm       # Permutation Importance만
+    python eval_anomaly.py --output result.txt  # 결과 파일 저장
+
+피처 (12개):
+    sog, cog, heading, status,
+    dt, dist_km,
+    cog_hdg_diff, sog_change, cog_hdg_change,
+    speed_consistency,
+    lat_speed, lon_speed
 """
 
 import argparse
 import json
 import math
 import random
-import statistics
 import numpy as np
 import onnxruntime as ort
-from collections import deque
+from tqdm import tqdm
 
 # matplotlib — 없으면 저장만, 없어도 텍스트 출력은 됨
 try:
@@ -47,22 +54,18 @@ def rjust(s: str, width: int) -> str:
 # ── 설정 ──────────────────────────────────────────────────────────
 FEATURES = [
     "sog", "cog", "heading", "status",
-    "dt", "dist_km", "expected_dist_km",
-    "bearing_cog_diff", "cog_hdg_diff",
-    "sog_change", "cog_change",
-    "sog_status_ratio",
-    "dist_expected_ratio",
+    "dt", "dist_km",
+    "cog_hdg_diff", "sog_change",
     "cog_hdg_change",
-    "cog_hdg_std",
+    "speed_consistency",
+    "lat_speed", "lon_speed",
 ]
 SEQ_LEN        = 10
 MODEL_FILE     = "model.onnx"
 SCALER_FILE    = "scaler.json"
 THRESHOLD_FILE = "threshold.txt"
-DATA_FILE      = "ais_preprocessed.csv"   # 상관행렬용 실제 데이터
-
-STATUS_MAX_SOG = {0:30., 1:1., 2:5., 3:10., 4:10., 5:1., 6:5., 7:15., 8:15.}
-DEFAULT_MAX_SOG = 30.0
+DATA_FILE      = "ais-2024-01-01_preprocessed.csv"
+_KN_TO_DPS     = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
 
 
 # ── 스케일러 ──────────────────────────────────────────────────────
@@ -82,8 +85,7 @@ def scale_seq(seq, mins, maxs):
 
 # ── ONNX 추론 ─────────────────────────────────────────────────────
 def infer(session, seq_scaled):
-    """MSE + 원본/재구성 배열 반환 — 오차 분해에 사용"""
-    x   = np.array(seq_scaled, dtype=np.float32)[np.newaxis]  # (1,SEQ,F)
+    x   = np.array(seq_scaled, dtype=np.float32)[np.newaxis]
     out = session.run(None, {"x": x})[0]
     mse = float(np.mean((out - x) ** 2))
     return mse, x, out
@@ -94,11 +96,7 @@ def infer_mse(session, seq_scaled):
 
 
 # ── 실제 정상 시퀀스 로더 ─────────────────────────────────────────
-def load_real_normal_seqs(mins, maxs, n_seqs=500, max_rows=200000) -> list:
-    """
-    ais_preprocessed.csv 에서 슬라이딩 윈도우로 실제 정상 시퀀스를 추출.
-    파일이 없으면 None 반환 → 호출부에서 합성 시퀀스로 fallback.
-    """
+def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
     import csv, os
     if not os.path.exists(DATA_FILE):
         return None
@@ -108,7 +106,7 @@ def load_real_normal_seqs(mins, maxs, n_seqs=500, max_rows=200000) -> list:
     with open(DATA_FILE, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
-            if i >= max_rows:
+            if max_rows is not None and i >= max_rows:
                 break
             try:
                 record = [float(row[feat]) for feat in FEATURES]
@@ -116,7 +114,6 @@ def load_real_normal_seqs(mins, maxs, n_seqs=500, max_rows=200000) -> list:
             except (ValueError, KeyError):
                 continue
 
-    # MMSI별 슬라이딩 윈도우로 시퀀스 생성
     dt_idx = FEATURES.index("dt")
     all_seqs = []
     for records in mmsi_rows.values():
@@ -136,55 +133,64 @@ def load_real_normal_seqs(mins, maxs, n_seqs=500, max_rows=200000) -> list:
     if not all_seqs:
         return None
 
-    # 요청 개수만큼 랜덤 샘플
     random.shuffle(all_seqs)
-    sampled = all_seqs[:n_seqs]
+    sampled = all_seqs if n_seqs is None else all_seqs[:n_seqs]
     scaled  = [scale_seq(seq, mins, maxs) for seq in sampled]
     print(f"  실제 정상 시퀀스 로드: {len(scaled):,}개 (전체 풀: {len(all_seqs):,})")
     return scaled
 
 
-SEQ_BREAK_DT = 600  # preprocess.py 와 동일
+SEQ_BREAK_DT = 3600
 
 
 # ── 시퀀스 생성 헬퍼 ──────────────────────────────────────────────
-def _sog_status_ratio(sog, status):
-    mx = STATUS_MAX_SOG.get(int(status), DEFAULT_MAX_SOG)
-    return sog / mx if mx > 0 else 0.0
-
 def _cog_hdg_diff(cog, hdg):
     if hdg >= 511: return -1.0
     d = abs(cog - hdg)
     return 360 - d if d > 180 else d
 
 def _build_derived(step_list):
-    window = deque(maxlen=10)
     result = []
-    prev_sog, prev_cog, prev_chd = step_list[0]["sog"], step_list[0]["cog"], 0.0
+    prev_sog, prev_chd = step_list[0]["sog"], 0.0
+    prev_lat = step_list[0].get("lat", 37.0)
+    prev_lon = step_list[0].get("lon", 126.0)
     for i, s in enumerate(step_list):
         sog, cog = s["sog"], s["cog"]
         hdg    = s.get("hdg", 511)
         status = s.get("status", 0)
-        dt, dist, exp = s["dt"], s["dist_km"], s["expected_dist"]
-        bcog   = s.get("bearing_cog_diff", -1.0)
+        dt, dist = s["dt"], s["dist_km"]
+        lat    = s.get("lat", prev_lat)
+        lon    = s.get("lon", prev_lon)
         chd    = _cog_hdg_diff(cog, hdg)
         sog_ch = abs(sog - prev_sog) if i > 0 else 0.0
-        cog_d  = abs(cog - prev_cog) if i > 0 else 0.0
-        if cog_d > 180: cog_d = 360 - cog_d
-        ssr = _sog_status_ratio(sog, status)
-        der = dist / (exp + 1e-6)
         chd_change = abs(chd - prev_chd) if (i > 0 and chd >= 0 and prev_chd >= 0) else 0.0
-        window.append(chd if chd >= 0 else 0.0)
-        chd_std = statistics.stdev(window) if len(window) >= 2 else 0.0
+
+        if i == 0 or sog < 0.1:
+            speed_cons = 1.0
+        else:
+            expected = sog * dt / 3600.0 * 1.852
+            speed_cons = round(dist / (expected + 1e-6), 4)
+
+        if i == 0:
+            lat_spd = lon_spd = 0.0
+        else:
+            lat_spd = round((lat - prev_lat) / (dt + 1e-6), 6)
+            lon_spd = round((lon - prev_lon) / (dt + 1e-6), 6)
+
         result.append([sog, cog, hdg if hdg < 511 else 0., status,
-                        dt, dist, exp, bcog, chd,
-                        sog_ch, cog_d, ssr, der, chd_change, chd_std])
-        prev_sog, prev_cog = sog, cog
+                        dt, dist, chd, sog_ch, chd_change,
+                        speed_cons, lat_spd, lon_spd])
+        prev_sog = sog
         prev_chd = chd if chd >= 0 else prev_chd
+        prev_lat, prev_lon = lat, lon
     return result
 
 
-# ── 시나리오 ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# 시나리오 함수
+# ══════════════════════════════════════════════════════════════════
+
+# ── 기존 ──────────────────────────────────────────────────────────
 def make_normal_seq():
     sog, cog = random.uniform(5,15), random.uniform(0,360)
     lat, lon = 37., 126.
@@ -194,7 +200,7 @@ def make_normal_seq():
         lat += math.cos(math.radians(cog))*dist/111.
         lon += math.sin(math.radians(cog))*dist/111.
         steps.append({"sog":sog,"cog":cog,"hdg":int(cog+random.uniform(-5,5))%360,
-                       "status":0,"dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+                       "status":0,"dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
     return _build_derived(steps)
 
 def make_cog_hdg_mismatch_seq():
@@ -206,7 +212,7 @@ def make_cog_hdg_mismatch_seq():
         lat += math.cos(math.radians(cog))*dist/111.
         lon += math.sin(math.radians(cog))*dist/111.
         steps.append({"sog":sog,"cog":cog,"hdg":int((cog+mm)%360),"status":0,
-                       "dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+                       "dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
         cog = (cog+random.uniform(-10,10))%360
     return _build_derived(steps)
 
@@ -219,7 +225,7 @@ def make_anchor_move_seq():
         lat += math.cos(math.radians(cog))*dist/111.
         lon += math.sin(math.radians(cog))*dist/111.
         steps.append({"sog":spd,"cog":cog,"hdg":int((cog+random.uniform(60,180))%360),
-                       "status":1,"dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+                       "status":1,"dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
         cog = (cog+random.uniform(-30,30))%360
     return _build_derived(steps)
 
@@ -235,7 +241,7 @@ def make_speed_spike_seq():
         lat += math.cos(math.radians(cog))*dist/111.
         lon += math.sin(math.radians(cog))*dist/111.
         steps.append({"sog":sog,"cog":cog,"hdg":int(cog+random.uniform(-5,5))%360,
-                       "status":0,"dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+                       "status":0,"dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
         if random.random()<.2: cog=(cog+random.uniform(-30,30))%360
     return _build_derived(steps)
 
@@ -250,18 +256,20 @@ def make_position_jump_seq():
         lat += math.cos(math.radians(cog))*dist/111.
         lon += math.sin(math.radians(cog))*dist/111.
         steps.append({"sog":spd,"cog":cog,"hdg":int(cog+random.uniform(-5,5))%360,
-                       "status":0,"dt":dt,"dist_km":dist,"expected_dist":spd*dt/3600*1.852,
-                       "bearing_cog_diff":0.})
+                       "status":0,"dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
         cog = random.uniform(0,360)
     return _build_derived(steps)
 
 def make_fn_dt_jump_seq():
+    lat, lon = 37., 126.
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(61,299); sog = random.choice([2.,18.,3.,20.])
         d  = random.uniform(.08,.20)*111.; cog = random.uniform(0,360)
+        lat += math.cos(math.radians(cog))*d/111.
+        lon += math.sin(math.radians(cog))*d/111.
         steps.append({"sog":sog,"cog":cog,"hdg":int(cog),"status":0,
-                       "dt":dt,"dist_km":d,"expected_dist":sog*dt/3600*1.852,"bearing_cog_diff":0.})
+                       "dt":dt,"dist_km":d,"lat":lat,"lon":lon})
     return _build_derived(steps)
 
 def make_fn_speed_ramp_seq():
@@ -273,7 +281,7 @@ def make_fn_speed_ramp_seq():
         lat += math.cos(math.radians(cog))*dist/111.
         lon += math.sin(math.radians(cog))*dist/111.
         steps.append({"sog":sog,"cog":cog,"hdg":int(cog),"status":0,
-                       "dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+                       "dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
         sog = 2. if sog >= 29. else min(sog+9.5, 29.)
     return _build_derived(steps)
 
@@ -286,7 +294,7 @@ def make_fn_cog_border_seq():
         lat += math.cos(math.radians(cog))*dist/111.
         lon += math.sin(math.radians(cog))*dist/111.
         steps.append({"sog":sog,"cog":cog,"hdg":int((cog+mm)%360),"status":0,
-                       "dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+                       "dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
         if random.random()<.1: cog=(cog+random.uniform(-10,10))%360
     return _build_derived(steps)
 
@@ -300,35 +308,418 @@ def make_fn_nav_status_seq():
         lat += math.cos(math.radians(cog))*dist/111.
         lon += math.sin(math.radians(cog))*dist/111.
         steps.append({"sog":sog,"cog":cog,"hdg":int(cog),"status":status,
-                       "dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+                       "dt":dt,"dist_km":dist,"lat":lat,"lon":lon})
         if random.random()<.05: cog=(cog+random.uniform(-15,15))%360
     return _build_derived(steps)
 
-def make_high_sog_status_seq():
-    status = random.choice([1,5]); sog, cog = random.uniform(3,15), random.uniform(0,360)
+
+# ── D: ML 우회 v1 ─────────────────────────────────────────────────
+def make_ml_low_slow_seq():
+    """D1 Low&Slow: 모든 규칙 임계값 동시 하회"""
+    sog = random.uniform(0.3, 2.0)
+    cog = random.uniform(0, 360)
+    hdg_offset = random.uniform(50, 95)
     lat, lon = 37., 126.
     steps = []
     for _ in range(SEQ_LEN):
-        dt = random.uniform(10,30); dist = sog*dt/3600*1.852
-        lat += math.cos(math.radians(cog))*dist/111.
-        lon += math.sin(math.radians(cog))*dist/111.
-        steps.append({"sog":sog,"cog":cog,"hdg":int(cog+random.uniform(-5,5))%360,
-                       "status":status,"dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+        dt = random.uniform(10, 30)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog,
+                       "hdg": int((cog + hdg_offset) % 360),
+                       "status": 0, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+        sog = max(0.1, sog + random.uniform(-0.15, 0.15))
+        cog = (cog + random.uniform(-2, 2)) % 360
+        hdg_offset = min(95, max(50, hdg_offset + random.uniform(-2, 2)))
     return _build_derived(steps)
 
-def make_oscillating_hdg_seq():
-    sog, cog = random.uniform(5,12), random.uniform(0,360)
+def make_ml_temporal_seq():
+    """D2 Temporal Camouflage: 정상 N개 사이 이상 1개 삽입"""
+    norm_n = random.randint(5, 10)
+    anom_sog = random.uniform(35, 45)
+    base_sog = random.uniform(5, 12)
+    cog = random.uniform(0, 360)
     lat, lon = 37., 126.
     steps = []
     for i in range(SEQ_LEN):
-        dt = random.uniform(10,30); dist = sog*dt/3600*1.852
-        lat += math.cos(math.radians(cog))*dist/111.
-        lon += math.sin(math.radians(cog))*dist/111.
-        steps.append({"sog":sog,"cog":cog,"hdg":int((cog+(90 if i%2==0 else -90))%360),
-                       "status":0,"dt":dt,"dist_km":dist,"expected_dist":dist,"bearing_cog_diff":0.})
+        is_anom = (i % (norm_n + 1) == 0)
+        sog = anom_sog if is_anom else base_sog + random.uniform(-0.5, 0.5)
+        hdg = int((cog + 160) % 360) if is_anom else int(cog)
+        dt = random.uniform(5, 30)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": hdg,
+                       "status": 0, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+        cog = (cog + (random.uniform(-30, 30) if is_anom else random.uniform(-5, 5))) % 360
     return _build_derived(steps)
 
+def make_ml_gradual_drift_seq():
+    """D3 Gradual Drift: GPS 노이즈 수준 이동 누적"""
+    step_deg = random.uniform(0.0003, 0.0006)
+    drift_dir = random.uniform(0, 360)
+    lat = 37. + random.uniform(-0.1, 0.1)
+    lon = 126. + random.uniform(-0.1, 0.1)
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(10, 30)
+        sog = random.uniform(0, 0.3)
+        cog = random.uniform(0, 360)
+        r = math.radians(drift_dir)
+        lat += math.cos(r) * step_deg + random.uniform(-step_deg * 0.3, step_deg * 0.3)
+        lon += math.sin(r) * step_deg * 1.2 + random.uniform(-step_deg * 0.3, step_deg * 0.3)
+        dist = step_deg * 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 1, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+def make_ml_mimicry_seq():
+    """D4 Feature Mimicry: 정상 SOG 프로파일 복사 + 실제 위치 다른 방향 이동"""
+    profile = [8.0, 8.2, 8.5, 8.3, 8.1, 7.9, 8.0, 8.2, 8.4, 8.3]
+    hidden_sog = random.uniform(10, 20)
+    hidden_dir = random.uniform(0, 360)
+    cog = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        report_sog = profile[i % len(profile)]
+        dt = random.uniform(10, 30)
+        actual_dist = hidden_sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(hidden_dir)) * actual_dist / 111.
+        lon += math.sin(math.radians(hidden_dir)) * actual_dist / 111.
+        steps.append({"sog": report_sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": actual_dist, "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-3, 3)) % 360
+    return _build_derived(steps)
+
+
+# ── E: ML 우회 v2 (구조적) ───────────────────────────────────────
+def make_adv_smooth_seq():
+    """E1 Smooth Trajectory: CTRV 운동 유지 → jerk ≈ 0"""
+    sog = random.uniform(10, 20)
+    cog = random.uniform(0, 360)
+    omega = random.uniform(1, 3) * random.choice([-1, 1])
+    lat, lon = 37., 126.
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(5, 20)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+        cog = (cog + omega * dt) % 360
+    return _build_derived(steps)
+
+def make_adv_desync_seq():
+    """E2 Fleet Desync: 분산된 타이밍으로 fleet 상관 파괴"""
+    base_sog = random.uniform(8, 16)
+    spike_sog = random.uniform(30, 42)
+    spike_offset = random.uniform(0, 40)
+    spike_interval = random.uniform(30, 70)
+    cog = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        t_elapsed = i * 15 + spike_offset
+        in_spike = (t_elapsed % spike_interval) < (spike_interval * 0.12)
+        sog = spike_sog if in_spike else base_sog + random.uniform(-0.3, 0.3)
+        dt = random.uniform(5, 20)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog,
+                       "hdg": int(cog + random.uniform(-4, 4)) % 360,
+                       "status": 0, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+        if random.random() < 0.08:
+            cog = (cog + random.uniform(-8, 8)) % 360
+    return _build_derived(steps)
+
+def make_adv_window_edge_seq():
+    """E3 Window Edge: window 경계마다 이상 1회로 score 희석"""
+    wsize = SEQ_LEN
+    norm_sog = random.uniform(8, 14)
+    anom_sog = random.uniform(38, 46)
+    cog = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        is_edge = (i % wsize == wsize - 1)
+        sog = anom_sog if is_edge else norm_sog + random.uniform(-0.4, 0.4)
+        if is_edge:
+            cog = (cog + 175 + random.uniform(-3, 3)) % 360
+        dt = random.uniform(5, 20)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+def make_adv_contextual_seq():
+    """E4 Contextual Blend: 어선 조업 패턴 위장"""
+    _FISH_PHASES = [
+        (5.0, 120, 0.0,  0),
+        (3.5, 180, 12.0, 7),
+        (1.5,  90, 0.0,  7),
+        (10.0, 60, 0.0,  0),
+        (0.4, 150, 4.0,  7),
+    ]
+    phase_idx = random.randint(0, len(_FISH_PHASES) - 1)
+    phase_elapsed = 0.0
+    hidden_sog = random.uniform(2, 4)
+    hidden_dir = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    cog = random.uniform(0, 360)
+    steps = []
+    for _ in range(SEQ_LEN):
+        ph = _FISH_PHASES[phase_idx]
+        sog, duration, turn_rate, nav = ph
+        dt = random.uniform(10, 30)
+        phase_elapsed += dt
+        if phase_elapsed >= duration:
+            phase_elapsed = 0.0
+            phase_idx = (phase_idx + 1) % len(_FISH_PHASES)
+        if turn_rate > 0:
+            cog = (cog + turn_rate * dt * 0.5) % 360
+        actual_dist = hidden_sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(hidden_dir)) * actual_dist / 111.
+        lon += math.sin(math.radians(hidden_dir)) * actual_dist / 111.
+        steps.append({"sog": sog + random.uniform(-0.3, 0.3), "cog": cog,
+                       "hdg": int(cog + random.uniform(-5, 5)) % 360,
+                       "status": nav, "dt": dt, "dist_km": actual_dist,
+                       "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+def make_adv_shadow_seq():
+    """E5 Shadow Vessel: 연안화물 프로파일 + 실제 항로각"""
+    _COASTAL_HDGS = [45, 90, 135, 225, 270, 315]
+    sog = random.uniform(10, 14)
+    base_cog = random.choice(_COASTAL_HDGS) + random.uniform(-10, 10)
+    lat = 37. + random.uniform(-0.3, 0.3)
+    lon = 126. + random.uniform(-0.3, 0.3)
+    target_lat = lat + random.uniform(0.05, 0.15)
+    target_lon = lon + random.uniform(0.05, 0.15)
+    cog = base_cog
+    steps = []
+    for _ in range(SEQ_LEN):
+        dl = target_lat - lat; dn = target_lon - lon
+        want_cog = math.degrees(math.atan2(dn, dl) + 1e-9) % 360
+        cog = (0.85 * cog + 0.15 * want_cog) % 360
+        dt = random.uniform(10, 30)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog + random.uniform(-1.5, 1.5), "cog": cog,
+                       "hdg": int(cog + random.uniform(-3, 3)) % 360,
+                       "status": 0, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+
+# ── F: 고급 공격 ──────────────────────────────────────────────────
+def make_feat_smoothing_seq():
+    """F1 Feature Smoothing: Δ피처 전부 정상 범위 내 클램핑"""
+    dsog_max = random.uniform(2.0, 4.0)
+    dcog_max = random.uniform(3.0, 7.0)
+    dpos_max = 0.01
+    sog = random.uniform(5, 12)
+    cog = random.uniform(0, 360)
+    lat = 37. + random.uniform(-0.05, 0.05)
+    lon = 126. + random.uniform(-0.05, 0.05)
+    target_lat = lat + random.uniform(0.1, 0.25)
+    target_lon = lon + random.uniform(0.1, 0.25)
+    steps = []
+    for _ in range(SEQ_LEN):
+        dl = target_lat - lat; dn = target_lon - lon
+        dist_to_target = math.sqrt(dl**2 + dn**2) + 1e-9
+        want_cog = math.degrees(math.atan2(dn, dl) + 1e-9) % 360
+        want_sog = min(15.0, dist_to_target / (_KN_TO_DPS * 15.0))
+        dcog = want_cog - cog
+        if dcog > 180: dcog -= 360
+        elif dcog < -180: dcog += 360
+        dcog = max(-dcog_max, min(dcog_max, dcog))
+        cog = (cog + dcog) % 360
+        dsog = max(-dsog_max, min(dsog_max, want_sog - sog))
+        sog = max(0, sog + dsog)
+        dt = random.uniform(10, 25)
+        step = min(sog * _KN_TO_DPS * dt, dpos_max)
+        lat += math.cos(math.radians(cog)) * step
+        lon += math.sin(math.radians(cog)) * step * 1.2
+        dist_km = step * 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist_km, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+def make_intermittent_spoof_seq():
+    """F2 Intermittent Spoofing: 정상/이상 교번으로 score 희석"""
+    tn = random.uniform(20, 40)
+    ta = random.uniform(3, 8)
+    anom_sog = random.uniform(40, 50)
+    anom_nav = random.choice([4, 5, 6])
+    base_sog = random.uniform(5, 12)
+    cog = random.uniform(0, 360)
+    elapsed = random.uniform(0, tn)
+    lat, lon = 37., 126.
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt = random.uniform(5, 20)
+        t = elapsed % (tn + ta)
+        in_attack = t < ta
+        sog = anom_sog if in_attack else base_sog + random.uniform(-0.5, 0.5)
+        nav = anom_nav if in_attack else 0
+        cog = (cog + (random.uniform(-60, 60) if in_attack else random.uniform(-3, 3))) % 360
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": nav, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+        elapsed += dt
+    return _build_derived(steps)
+
+def make_traj_stitch_seq():
+    """F3 Trajectory Stitching: 선형 보간으로 C1 연속 궤적"""
+    hdg_a = random.uniform(0, 360)
+    hdg_b = (hdg_a + random.uniform(120, 240)) % 360
+    sog = random.uniform(8, 15)
+    stitch_steps = random.randint(3, 5)
+    lat = 37. + random.uniform(-0.05, 0.05)
+    lon = 126. + random.uniform(-0.05, 0.05)
+    cog = hdg_a
+    switch_at = random.randint(2, SEQ_LEN - stitch_steps - 1)
+    steps = []
+    for i in range(SEQ_LEN):
+        dt = random.uniform(10, 25)
+        dist = sog * dt / 3600 * 1.852
+        if i < switch_at:
+            cog = hdg_a + random.uniform(-2, 2)
+        elif i < switch_at + stitch_steps:
+            t = (i - switch_at) / stitch_steps
+            dcog = hdg_b - hdg_a
+            if dcog > 180: dcog -= 360
+            elif dcog < -180: dcog += 360
+            cog = (hdg_a + dcog * t + random.uniform(-1, 1)) % 360
+        else:
+            cog = hdg_b + random.uniform(-2, 2)
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+def make_time_skew_seq():
+    """F4 Time Skew: 보고 SOG 정상, 실제 Δpos/Δt 불일치"""
+    rep_sog = random.uniform(8, 14)
+    burst_n = random.randint(3, 5)
+    burst_dist_per_step = random.uniform(0.015, 0.025)
+    cog = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        dt = random.uniform(5, 20)
+        in_burst = (i % (burst_n * 3)) < burst_n
+        if in_burst:
+            act_dist = burst_dist_per_step * 111.
+            lat += math.cos(math.radians(cog)) * burst_dist_per_step
+            lon += math.sin(math.radians(cog)) * burst_dist_per_step * 1.2
+        else:
+            act_dist = rep_sog * dt * 0.05 / 3600 * 1.852
+            lat += math.cos(math.radians(cog)) * act_dist / 111.
+            lon += math.sin(math.radians(cog)) * act_dist / 111.
+        steps.append({"sog": rep_sog + random.uniform(-0.3, 0.3), "cog": cog,
+                       "hdg": int(cog), "status": 0, "dt": dt,
+                       "dist_km": act_dist, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+def make_multi_coord_seq():
+    """F5 Multi-Ship Coordination: 개별 정상 + fleet-level 수렴"""
+    _COASTAL_HDGS = [45, 90, 135, 225, 270, 315]
+    base_cog = random.choice(_COASTAL_HDGS) + random.uniform(-10, 10)
+    bias = random.uniform(0.2, 0.4)
+    sog = random.uniform(8, 13)
+    lat = 37. + random.uniform(-0.1, 0.1)
+    lon = 126. + random.uniform(-0.1, 0.1)
+    target_lat = lat + random.uniform(0.1, 0.2)
+    target_lon = lon + random.uniform(0.1, 0.2)
+    cog = base_cog
+    steps = []
+    for _ in range(SEQ_LEN):
+        dl = target_lat - lat; dn = target_lon - lon
+        tc = math.degrees(math.atan2(dn, dl) + 1e-9) % 360
+        cog = ((1 - bias) * base_cog + bias * tc + random.uniform(-5, 5)) % 360
+        dt = random.uniform(10, 25)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog + random.uniform(-0.4, 0.4), "cog": cog,
+                       "hdg": int(cog + random.uniform(-4, 4)) % 360,
+                       "status": 0, "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+def make_ais_gap_seq():
+    """F6 AIS Gap: 신호 소실 → 위치 도약 재등장"""
+    sog = random.uniform(8, 14)
+    cog = random.uniform(0, 360)
+    gap_at = random.randint(2, SEQ_LEN - 3)
+    gap_dt = random.uniform(300, 600)
+    jump_dist = random.uniform(0.15, 0.4)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        if i == gap_at:
+            ang = random.uniform(0, 360)
+            lat += math.cos(math.radians(ang)) * jump_dist
+            lon += math.sin(math.radians(ang)) * jump_dist * 1.2
+            dist = jump_dist * 111.
+            steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                           "status": 0, "dt": gap_dt, "dist_km": dist,
+                           "lat": lat, "lon": lon})
+        else:
+            dt = random.uniform(10, 30)
+            dist = sog * dt / 3600 * 1.852
+            lat += math.cos(math.radians(cog)) * dist / 111.
+            lon += math.sin(math.radians(cog)) * dist / 111.
+            steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                           "status": 0, "dt": dt, "dist_km": dist,
+                           "lat": lat, "lon": lon})
+            cog = (cog + random.uniform(-3, 3)) % 360
+    return _build_derived(steps)
+
+def make_lstm_beat_seq():
+    """F7 LSTM Beat: Δ피처 1σ 내로 클램핑하며 천천히 이동"""
+    sigma_sog = random.uniform(0.3, 0.6)
+    sigma_cog = random.uniform(2.0, 4.0)
+    sog = random.uniform(6, 12)
+    cog = random.uniform(0, 360)
+    lat = 37. + random.uniform(-0.05, 0.05)
+    lon = 126. + random.uniform(-0.05, 0.05)
+    target_lat = lat + random.uniform(0.2, 0.35)
+    target_lon = lon + random.uniform(0.2, 0.35)
+    steps = []
+    for _ in range(SEQ_LEN):
+        dl = target_lat - lat; dn = target_lon - lon
+        want_cog = math.degrees(math.atan2(dn, dl) + 1e-9) % 360
+        dcog = want_cog - cog
+        if dcog > 180: dcog -= 360
+        elif dcog < -180: dcog += 360
+        dcog = max(-sigma_cog, min(sigma_cog, dcog * 0.15))
+        cog = (cog + dcog) % 360
+        dsog = random.gauss(0, sigma_sog) * 0.3
+        sog = max(2.0, min(20.0, sog + dsog))
+        dt = random.uniform(10, 25)
+        step = min(sog * _KN_TO_DPS * dt, 0.002)
+        lat += math.cos(math.radians(cog)) * step
+        lon += math.sin(math.radians(cog)) * step * 1.2
+        dist_km = step * 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist_km,
+                       "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+
+# ── SCENARIO_MAKERS ───────────────────────────────────────────────
 SCENARIO_MAKERS = [
+    # 기존
     ("정상",          make_normal_seq,           False),
     ("COG/HDG불일치", make_cog_hdg_mismatch_seq, True),
     ("정박이동",      make_anchor_move_seq,       True),
@@ -338,32 +729,54 @@ SCENARIO_MAKERS = [
     ("FN2-속도단계", make_fn_speed_ramp_seq,     True),
     ("FN3-COG경계", make_fn_cog_border_seq,     True),
     ("FN4-status",  make_fn_nav_status_seq,     True),
-    ("고속정박",     make_high_sog_status_seq,   True),
-    ("HDG진동",      make_oscillating_hdg_seq,   True),
+    # D: ML 우회 v1
+    ("D1-LowSlow",   make_ml_low_slow_seq,       True),
+    ("D2-Temporal",  make_ml_temporal_seq,       True),
+    ("D3-GradDrift", make_ml_gradual_drift_seq,  True),
+    ("D4-Mimicry",   make_ml_mimicry_seq,        True),
+    # E: ML 우회 v2
+    ("E1-Smooth",    make_adv_smooth_seq,        True),
+    ("E2-Desync",    make_adv_desync_seq,        True),
+    ("E3-WinEdge",   make_adv_window_edge_seq,   True),
+    ("E4-Contextual",make_adv_contextual_seq,    True),
+    ("E5-Shadow",    make_adv_shadow_seq,        True),
+    # F: 고급 공격
+    ("F1-FeatSmooth",make_feat_smoothing_seq,    True),
+    ("F2-Intermit",  make_intermittent_spoof_seq,True),
+    ("F3-TrajStitch",make_traj_stitch_seq,       True),
+    ("F4-TimeSkew",  make_time_skew_seq,         True),
+    ("F5-MultiCoord",make_multi_coord_seq,       True),
+    ("F6-AISGap",    make_ais_gap_seq,           True),
+    ("F7-LSTMBeat",  make_lstm_beat_seq,         True),
 ]
 
 
 # ══════════════════════════════════════════════════════════════════
 # 분석 1: 탐지율/오탐율 테이블
 # ══════════════════════════════════════════════════════════════════
-def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=500):
+def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
     print("\n" + "="*60)
     print("  [분석 1] 탐지율 / 오탐율 테이블")
     print("="*60)
 
+    N_ANOM = 500
+
     all_errors = []
-    for name, maker, is_anom in SCENARIO_MAKERS:
+    for name, maker, is_anom in tqdm(SCENARIO_MAKERS, desc="분석1 시나리오", unit="개"):
         if not is_anom and real_seqs is not None:
-            # 정상: 실제 데이터 사용
-            errs = np.array([infer_mse(session, seq) for seq in real_seqs[:N]])
+            seqs = real_seqs if N is None else real_seqs[:N]
+            errs = np.array([infer_mse(session, seq)
+                             for seq in tqdm(seqs, desc=f"  {name}", leave=False, unit="seq")])
         else:
+            n = N_ANOM if N is None else N
             errs = np.array([infer_mse(session, scale_seq(maker(), mins, maxs))
-                             for _ in range(N)])
+                             for _ in tqdm(range(n), desc=f"  {name}", leave=False, unit="seq")])
         all_errors.append((name, errs))
 
     ne      = all_errors[0][1]
-    fp_rate = np.sum(ne > threshold) / N * 100
-    print(f"\n  임계값: {threshold:.6f}  |  오탐율: {fp_rate:.1f}%\n")
+    N_ne    = len(ne)
+    fp_rate = np.sum(ne > threshold) / N_ne * 100
+    print(f"\n  임계값: {threshold:.6f}  |  정상 시퀀스: {N_ne:,}개  |  오탐율: {fp_rate:.1f}%\n")
 
     col_w = 16
     sep   = "─" * (12 + col_w * len(all_errors))
@@ -373,7 +786,7 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=500):
     for label, fn in [
         ("평균 MSE",  lambda e: f"{e.mean():.6f}"),
         ("95th %ile", lambda e: f"{np.percentile(e,95):.6f}"),
-        ("탐지율",    lambda e: f"{np.sum(e>threshold)/N*100:.1f}%"),
+        ("탐지율",    lambda e: f"{np.sum(e>threshold)/len(e)*100:.1f}%"),
     ]:
         print(rjust(label,12) + "".join(rjust(fn(e), col_w) for _, e in all_errors))
     print(sep)
@@ -385,9 +798,9 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=500):
     print("  " + "─"*(12+9+16*len(anom)))
     for pct in [99,98,97,95,90]:
         thr = np.percentile(ne, pct)
-        fp  = np.sum(ne>thr)/N*100
+        fp  = np.sum(ne>thr)/N_ne*100
         row = rjust(f"{thr:.6f}",12) + rjust(f"{fp:.1f}%",9)
-        row += "".join(rjust(f"{np.sum(e>thr)/N*100:.1f}%",16) for _,e in anom)
+        row += "".join(rjust(f"{np.sum(e>thr)/len(e)*100:.1f}%",16) for _,e in anom)
         print("  "+row)
     print("\n→ threshold.txt 를 위 값 중 적절한 것으로 교체하세요.")
     return all_errors
@@ -396,7 +809,7 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=500):
 # ══════════════════════════════════════════════════════════════════
 # 분석 2: 피처 간 상관행렬 (Pearson)
 # ══════════════════════════════════════════════════════════════════
-def analysis_correlation(max_rows=50000):
+def analysis_correlation():
     print("\n" + "="*60)
     print("  [분석 2] 피처 간 상관행렬 (Pearson)")
     print("="*60)
@@ -407,19 +820,18 @@ def analysis_correlation(max_rows=50000):
         return None
 
     data = {f: [] for f in FEATURES}
+    row_count = 0
     with open(DATA_FILE, encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            if i >= max_rows: break
+        for row in reader:
             try:
                 for feat in FEATURES:
                     data[feat].append(float(row[feat]))
+                row_count += 1
             except (ValueError, KeyError):
                 continue
 
-    n = len(data[FEATURES[0]])
-    print(f"  사용 행 수: {n:,}")
-
+    print(f"  사용 행 수: {row_count:,} (전체)")
     arr  = np.array([data[f] for f in FEATURES], dtype=np.float32)
     corr = np.corrcoef(arr)
 
@@ -457,26 +869,29 @@ def analysis_correlation(max_rows=50000):
 # ══════════════════════════════════════════════════════════════════
 # 분석 3: 시나리오별 재구성 오차 분해 (피처별 MSE)
 # ══════════════════════════════════════════════════════════════════
-def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=300):
+def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
     print("\n" + "="*60)
     print("  [분석 3] 시나리오별 재구성 오차 분해 (피처별 MSE)")
     print("="*60)
 
+    N_ANOM = 500
+
     scenario_feat_mse = {}
-    for name, maker, is_anom in SCENARIO_MAKERS:
+    for name, maker, is_anom in tqdm(SCENARIO_MAKERS, desc="분석3 시나리오", unit="개"):
         feat_mse = np.zeros(len(FEATURES))
         if not is_anom and real_seqs is not None:
-            seqs = real_seqs[:N]
-            for seq in seqs:
+            seqs = real_seqs if N is None else real_seqs[:N]
+            for seq in tqdm(seqs, desc=f"  {name}", leave=False, unit="seq"):
                 _, x, out = infer(session, seq)
                 feat_mse += ((out - x) ** 2).mean(axis=(0, 1))
             feat_mse /= len(seqs)
         else:
-            for _ in range(N):
+            n = N_ANOM if N is None else N
+            for _ in tqdm(range(n), desc=f"  {name}", leave=False, unit="seq"):
                 seq = scale_seq(maker(), mins, maxs)
                 _, x, out = infer(session, seq)
                 feat_mse += ((out - x) ** 2).mean(axis=(0, 1))
-            feat_mse /= N
+            feat_mse /= n
         scenario_feat_mse[name] = feat_mse
 
     col_w = 13
@@ -492,8 +907,8 @@ def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=300):
     print(sep)
 
     if HAS_MPL:
-        mat   = np.array([scenario_feat_mse[n] for n in names])   # (S, F)
-        mat_n = mat / (mat.max(axis=1, keepdims=True) + 1e-9)      # 시나리오 내 상대값
+        mat   = np.array([scenario_feat_mse[n] for n in names])
+        mat_n = mat / (mat.max(axis=1, keepdims=True) + 1e-9)
 
         fig, axes = plt.subplots(1, 2, figsize=(18, 7))
         for ax, data, title in [
@@ -519,68 +934,132 @@ def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=300):
 # ══════════════════════════════════════════════════════════════════
 # 분석 4: Permutation Importance
 # ══════════════════════════════════════════════════════════════════
-def analysis_permutation(session, mins, maxs, real_seqs=None, N=300, repeat=5):
+def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
     print("\n" + "="*60)
     print("  [분석 4] Permutation Importance")
     print("="*60)
 
     if real_seqs is not None:
-        seqs_scaled = real_seqs[:N]
-        print(f"  실제 정상 시퀀스 {len(seqs_scaled)}개 × 반복 {repeat}회\n")
+        seqs_scaled = real_seqs if N is None else real_seqs[:N]
+        print(f"  실제 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회")
     else:
-        seqs_scaled = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(N)]
-        print(f"  합성 정상 시퀀스 {N}개 × 반복 {repeat}회 (CSV 없음)\n")
+        n = 5000 if N is None else N
+        seqs_scaled = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(n)]
+        print(f"  합성 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회 (CSV 없음)")
 
-    arr = np.array(seqs_scaled, dtype=np.float32)  # (N, SEQ_LEN, F)
+    N_ANOM = 500
+    anom_scenarios = [(name, maker) for name, maker, is_anom in SCENARIO_MAKERS if is_anom]
+    print(f"  이상 시나리오 {len(anom_scenarios)}개 × {N_ANOM:,}개 × 반복 {repeat}회\n")
 
-    def batch_mse(x_arr):
-        return np.mean([infer_mse(session, x_arr[i].tolist()) for i in range(len(x_arr))])
+    arr_normal = np.array(seqs_scaled, dtype=np.float32)
+    n_normal   = len(arr_normal)
 
-    baseline = batch_mse(arr)
-    print(f"  baseline MSE (정상): {baseline:.6f}")
+    anom_arrays = {}
+    for name, maker in tqdm(anom_scenarios, desc="이상 시퀀스 생성", unit="시나리오"):
+        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        anom_arrays[name] = np.array(seqs, dtype=np.float32)
 
-    importance = np.zeros(len(FEATURES))
-    for fi in range(len(FEATURES)):
+    def batch_mse(x_arr, desc="추론"):
+        return np.mean([infer_mse(session, x_arr[i].tolist())
+                        for i in tqdm(range(len(x_arr)), desc=f"  {desc}", leave=False, unit="seq")])
+
+    print("\n  [4-A] 정상 기준 (ΔMSE↑ = 정상 재구성에 중요)")
+    baseline_normal = batch_mse(arr_normal, desc="baseline 정상")
+    print(f"  baseline MSE (정상): {baseline_normal:.6f}")
+
+    imp_normal = np.zeros(len(FEATURES))
+    for fi in tqdm(range(len(FEATURES)), desc="정상 기준 피처", unit="피처"):
         delta_sum = 0.
-        for _ in range(repeat):
-            shuffled = arr.copy()
-            shuffled[:, :, fi] = arr[np.random.permutation(N), :, fi]
-            delta_sum += batch_mse(shuffled) - baseline
-        importance[fi] = delta_sum / repeat
+        for r in range(repeat):
+            shuffled = arr_normal.copy()
+            shuffled[:, :, fi] = arr_normal[np.random.permutation(n_normal), :, fi]
+            delta_sum += batch_mse(shuffled, desc=f"{FEATURES[fi]} r{r+1}") - baseline_normal
+        imp_normal[fi] = delta_sum / repeat
 
-    order = np.argsort(importance)[::-1]
-    print(f"\n  {'순위':>4}  {'피처':<25}  {'ΔMSE':>10}  상대 중요도")
-    print("  " + "─"*65)
-    max_imp = max(importance[order[0]], 1e-9)
-    for rank, fi in enumerate(order):
-        bar = "█" * max(int(importance[fi] / max_imp * 25), 0)
-        print(f"  {rank+1:>4}  {FEATURES[fi]:<25}  {importance[fi]:>+10.6f}  {bar}")
+    order_n = np.argsort(imp_normal)[::-1]
+    print(f"\n  {'순위':>4}  {'피처':<25}  {'ΔMSE(정상)':>12}  상대 중요도")
+    print("  " + "─"*68)
+    max_n = max(imp_normal[order_n[0]], 1e-9)
+    for rank, fi in enumerate(order_n):
+        bar = "█" * max(int(imp_normal[fi] / max_n * 20), 0)
+        print(f"  {rank+1:>4}  {FEATURES[fi]:<25}  {imp_normal[fi]:>+12.6f}  {bar}")
+
+    print("\n  [4-B] 이상 기준 (ΔMSE↓ = 이상 탐지에 실제로 기여하는 피처)")
+    baseline_anom = {}
+    for name, arr in tqdm(anom_arrays.items(), desc="baseline 이상", unit="시나리오"):
+        baseline_anom[name] = batch_mse(arr, desc=f"baseline {name}")
+
+    imp_anom = np.zeros((len(FEATURES), len(anom_scenarios)))
+    for fi in tqdm(range(len(FEATURES)), desc="이상 기준 피처", unit="피처"):
+        for si, (name, _) in enumerate(anom_scenarios):
+            arr_a = anom_arrays[name]
+            n_a   = len(arr_a)
+            delta_sum = 0.
+            for r in range(repeat):
+                shuffled = arr_a.copy()
+                shuffled[:, :, fi] = arr_a[np.random.permutation(n_a), :, fi]
+                delta_sum += batch_mse(shuffled, desc=f"{FEATURES[fi]}/{name} r{r+1}") - baseline_anom[name]
+            imp_anom[fi, si] = delta_sum / repeat
+
+    imp_anom_mean = imp_anom.mean(axis=1)
+    order_a = np.argsort(imp_anom_mean)
+
+    print(f"\n  {'순위':>4}  {'피처':<25}  {'평균 ΔMSE':>12}  탐지 기여도")
+    print("  " + "─"*68)
+    min_a = min(imp_anom_mean[order_a[0]], -1e-9)
+    for rank, fi in enumerate(order_a):
+        bar = "█" * max(int(imp_anom_mean[fi] / min_a * 20), 0)
+        sign = "▼" if imp_anom_mean[fi] < 0 else " "
+        print(f"  {rank+1:>4}  {FEATURES[fi]:<25}  {imp_anom_mean[fi]:>+12.6f} {sign} {bar}")
+
+    print(f"\n  [시나리오별 ΔMSE]")
+    col_w = 14
+    header = "피처".ljust(25) + "".join(rjust(n, col_w) for n, _ in anom_scenarios)
+    sep    = "─" * len(header)
+    print("  " + sep + "\n  " + header + "\n  " + sep)
+    for fi, feat in enumerate(FEATURES):
+        row = feat.ljust(25)
+        for si in range(len(anom_scenarios)):
+            row += rjust(f"{imp_anom[fi, si]:+.4f}", col_w)
+        print("  " + row)
+    print("  " + sep)
 
     if HAS_MPL:
-        fig, ax = plt.subplots(figsize=(9, 6))
-        colors = ["#e74c3c" if importance[fi] >= 0 else "#3498db" for fi in order]
-        ax.barh([FEATURES[fi] for fi in order[::-1]],
-                [importance[fi] for fi in order[::-1]],
-                color=colors[::-1])
-        ax.axvline(0, color="black", linewidth=0.8)
-        ax.set_xlabel("ΔMSE (shuffled - baseline)")
-        ax.set_title("Permutation Importance (normal sequences)")
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        colors_n = ["#e74c3c" if imp_normal[fi] >= 0 else "#3498db" for fi in order_n]
+        axes[0].barh([FEATURES[fi] for fi in order_n[::-1]],
+                     [imp_normal[fi] for fi in order_n[::-1]], color=colors_n[::-1])
+        axes[0].axvline(0, color="black", linewidth=0.8)
+        axes[0].set_xlabel("ΔMSE (shuffled - baseline)")
+        axes[0].set_title("Permutation Importance\n(정상 기준: 재구성 의존도)")
+
+        colors_a = ["#e74c3c" if imp_anom_mean[fi] >= 0 else "#2ecc71" for fi in order_a[::-1]]
+        axes[1].barh([FEATURES[fi] for fi in order_a[::-1]],
+                     [imp_anom_mean[fi] for fi in order_a[::-1]], color=colors_a)
+        axes[1].axvline(0, color="black", linewidth=0.8)
+        axes[1].set_xlabel("ΔMSE (shuffled - baseline)")
+        axes[1].set_title("Permutation Importance\n(이상 기준: 탐지 기여도, 음수=기여)")
+
         plt.tight_layout()
         plt.savefig("permutation_importance.png", dpi=150)
         plt.close()
         print("\n  → permutation_importance.png 저장")
 
-    return importance
+    return imp_normal, imp_anom
 
 
 # ══════════════════════════════════════════════════════════════════
 # 메인
 # ══════════════════════════════════════════════════════════════════
 def main():
+    import sys, os
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--corr",  action="store_true")
-    parser.add_argument("--recon", action="store_true")
-    parser.add_argument("--perm",  action="store_true")
+    parser.add_argument("--corr",   action="store_true")
+    parser.add_argument("--recon",  action="store_true")
+    parser.add_argument("--perm",   action="store_true")
+    parser.add_argument("--output", type=str, default="eval_result.txt",
+                        help="텍스트 결과 저장 파일명 (기본: eval_result.txt)")
     args = parser.parse_args()
     run_all = not any([args.corr, args.recon, args.perm])
 
@@ -589,33 +1068,50 @@ def main():
         threshold = float(f.read())
     session = ort.InferenceSession(MODEL_FILE, providers=["CPUExecutionProvider"])
 
-    if not HAS_MPL:
-        print("  ⚠ matplotlib 없음 — 그래프 저장 건너뜀 (pip install matplotlib)")
+    # ── stdout → 터미널 + 파일 동시 출력 ────────────────────────
+    class Tee:
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data); s.flush()
+        def flush(self):
+            for s in self.streams: s.flush()
 
-    # 실제 정상 시퀀스 한 번만 로드 (없으면 None → 합성으로 fallback)
-    print("\n실제 정상 시퀀스 로드 중...")
-    real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=500)
-    if real_seqs is None:
-        print(f"  ⚠ {DATA_FILE} 없음 — 합성 정상 시퀀스 사용")
+    out_file = open(args.output, "w", encoding="utf-8")
+    sys.stdout = Tee(sys.__stdout__, out_file)
 
-    if run_all:
-        analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
-        analysis_correlation()
-        analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-        analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
-    else:
-        if args.corr:  analysis_correlation()
-        if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-        if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+    try:
+        if not HAS_MPL:
+            print("  ⚠ matplotlib 없음 — 그래프 저장 건너뜀 (pip install matplotlib)")
 
-    print("\n완료!")
-    if HAS_MPL:
-        import os
-        saved = [f for f in ["feature_correlation.png",
-                              "reconstruction_error.png",
-                              "permutation_importance.png"] if os.path.exists(f)]
-        if saved:
-            print("저장된 그래프:", ", ".join(saved))
+        print("\n실제 정상 시퀀스 로드 중...")
+        real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=3000)
+        if real_seqs is None:
+            print(f"  ⚠ {DATA_FILE} 없음 — 합성 정상 시퀀스 사용")
+
+        if run_all:
+            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
+            analysis_correlation()
+            analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
+            analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+        else:
+            if args.corr:  analysis_correlation()
+            if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
+            if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+
+        print("\n완료!")
+        if HAS_MPL:
+            saved = [f for f in ["feature_correlation.png",
+                                  "reconstruction_error.png",
+                                  "permutation_importance.png"] if os.path.exists(f)]
+            if saved:
+                print("저장된 그래프:", ", ".join(saved))
+        print(f"\n→ 텍스트 결과 저장: {args.output}")
+
+    finally:
+        sys.stdout = sys.__stdout__
+        out_file.close()
 
 
 if __name__ == "__main__":
