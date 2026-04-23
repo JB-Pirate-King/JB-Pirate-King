@@ -64,7 +64,7 @@ SEQ_LEN        = 10
 MODEL_FILE     = "model.onnx"
 SCALER_FILE    = "scaler.json"
 THRESHOLD_FILE = "threshold.txt"
-DATA_FILE      = "ais-2024-01-01_preprocessed.csv"
+DATA_FILE      = "ais_preprocessed.csv"
 _KN_TO_DPS     = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
 
 
@@ -1086,19 +1086,20 @@ def main():
             print("  ⚠ matplotlib 없음 — 그래프 저장 건너뜀 (pip install matplotlib)")
 
         print("\n실제 정상 시퀀스 로드 중...")
-        real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=3000)
-        if real_seqs is None:
+        real_seqs_all = load_real_normal_seqs(mins, maxs, n_seqs=None)
+        if real_seqs_all is None:
             print(f"  ⚠ {DATA_FILE} 없음 — 합성 정상 시퀀스 사용")
+        real_seqs = real_seqs_all[:5000] if real_seqs_all and len(real_seqs_all) > 5000 else real_seqs_all
 
         if run_all:
-            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
+            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs_all)
             analysis_correlation()
             analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-            analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+            analysis_permutation(session, mins, maxs, real_seqs=real_seqs, repeat=10)
         else:
             if args.corr:  analysis_correlation()
             if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-            if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+            if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs, repeat=10)
 
         print("\n완료!")
         if HAS_MPL:
