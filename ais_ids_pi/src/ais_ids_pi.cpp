@@ -57,7 +57,6 @@
 #include "version.h"
 #include "wxWTranslateCatalog.h"
 
-#include "ODAPI.h"
 #include "tpJSON.h"
 #include "tpicons.h"
 #include "tpControlDialogImpl.h"
@@ -91,7 +90,6 @@ wxString                *g_tplocale;
 void                    *g_ppimgr;
 
 tpJSON                  *g_ptpJSON;
-ODAPI                   *g_ptpAPI;
 double                  g_dVar;
 int                     g_iLocaleDepth;
 wxString                *g_tpLocale;
@@ -102,8 +100,6 @@ wxFont                  *g_pFontData;
 wxFont                  *g_pFontLabel;
 wxFont                  *g_pFontSmall;
 
-wxString                g_ReceivedODAPIMessage;
-wxJSONValue             g_ReceivedODAPIJSONMsg;
 wxString                g_ReceivedJSONMessage;
 wxJSONValue             g_ReceivedJSONJSONMsg;
 
@@ -200,40 +196,12 @@ int ais_ids_pi::Init(void)
     m_bShowRedDots = false;
     g_tplocale = NULL;
     m_bReadyForRequests = false;
-    m_bDoneODAPIVersionCall = false;
     m_btpDialog = false;
     m_tpControlDialogImpl = NULL;
     m_cursor_lat = 0.0;
     m_cursor_lon = 0.0;
     m_click_lat = 0.0;
     m_click_lon = 0.0;
-    m_bOD_FindPointInAnyBoundary = false;
-    m_bODFindClosestBoundaryLineCrossing = false;
-    m_bODFindFirstBoundaryLineCrossing = false;
-    m_bODCreateBoundary = false;
-    m_bODCreateBoundaryPoint = false;
-    m_bODCreateTextPoint = false;
-    m_bODAddPointIcon = false;
-    m_bODDeletePointIcon = false;
-    m_bODFindAllPathsGUIDS = false;
-    m_pOD_FindPointInAnyBoundary = NULL;
-    m_pODFindClosestBoundaryLineCrossing = NULL;
-    m_pODFindFirstBoundaryLineCrossing = NULL;
-    m_pODFindFirstBoundaryLineCrossing = NULL;
-    m_pODCreateBoundary = NULL;
-    m_pODCreateBoundaryPoint = NULL;
-    m_pODCreateTextPoint = NULL;
-    m_pODDeleteBoundary = NULL;
-    m_pODDeleteBoundaryPoint = NULL;
-    m_pODDeleteTextPoint = NULL;
-    m_pODAddPointIcon = NULL;
-    m_pODDeletePointIcon = NULL;
-    m_pODFindAllPathsGUIDS = NULL;
-    m_iODVersionMajor = 0;
-    m_iODVersionMinor = 0;
-    m_iODVersionPatch = 0;
-    m_iODAPIVersionMajor = 0;
-    m_iODAPIVersionMinor = 0;
     m_bSaveIncommingJSONMessages = false;
     m_fnOutputJSON = wxEmptyString;
     m_fnInputJSON = wxEmptyString;
@@ -285,8 +253,6 @@ int ais_ids_pi::Init(void)
     wxColour l_fontcolour = GetFontColour_PlugIn( wxS("tp_Label") );
     l_fontcolour = GetFontColour_PlugIn( wxS("tp_Data") );
 
-    m_pOD_FindPointInAnyBoundary = NULL;
-    m_pODFindClosestBoundaryLineCrossing = NULL;
 
     return (
         WANTS_CURSOR_LATLON       |
@@ -487,7 +453,6 @@ void ais_ids_pi::ToggleToolbarIcon( void )
         m_btpDialog = true;
         m_bShowRedDots = true;
         SetToolbarItemState( m_ais_ids_button_id, true  );
-        if(!m_bDoneODAPIVersionCall) GetODAPI();
         m_tpControlDialogImpl->SetPanels();
         m_tpControlDialogImpl->Show();
     }
@@ -557,224 +522,6 @@ void ais_ids_pi::LoadConfig()
         m_tpControlDialogImpl->SetIncommingJSONMessages(m_bSaveIncommingJSONMessages);
     }
 }
-void ais_ids_pi::GetODAPI()
-{
-    wxJSONValue jMsg;
-    wxJSONWriter writer;
-    wxString    MsgString;
-
-    jMsg[wxT("Source")] = "AIS_IDS_PI";
-    jMsg[wxT("Type")] = wxT("Request");
-    jMsg[wxT("Msg")] = wxT("Version");
-    jMsg[wxT("MsgId")] = wxT("Version");
-    writer.Write( jMsg, MsgString );
-    SendPluginMessage( wxS("OCPN_DRAW_PI"), MsgString );
-    if(g_ReceivedODAPIMessage != wxEmptyString &&  g_ReceivedODAPIJSONMsg[wxT("MsgId")].AsString() == wxS("Version")) {
-        m_iODVersionMajor = g_ReceivedODAPIJSONMsg[wxS("Major")].AsInt();
-        m_iODVersionMinor = g_ReceivedODAPIJSONMsg[wxS("Minor")].AsInt();
-        m_iODVersionPatch = g_ReceivedODAPIJSONMsg[wxS("Patch")].AsInt();
-    }
-    m_bDoneODAPIVersionCall = true;
-
-    wxJSONValue jMsg1;
-    jMsg1[wxT("Source")] = wxT("AIS_IDS_PI");
-    jMsg1[wxT("Type")] = wxT("Request");
-    jMsg1[wxT("Msg")] = wxS("GetAPIAddresses");
-    jMsg1[wxT("MsgId")] = wxS("GetAPIAddresses");
-    writer.Write( jMsg1, MsgString );
-    SendPluginMessage( wxS("OCPN_DRAW_PI"), MsgString );
-    if(g_ReceivedODAPIMessage != wxEmptyString &&  g_ReceivedODAPIJSONMsg[wxT("MsgId")].AsString() == wxS("GetAPIAddresses")) {
-        m_iODAPIVersionMajor = g_ReceivedODAPIJSONMsg[_T("ODAPIVersionMajor")].AsInt();
-        m_iODAPIVersionMinor = g_ReceivedODAPIJSONMsg[_T("ODAPIVersionMinor")].AsInt();
-
-        wxString sptr = g_ReceivedODAPIJSONMsg[_T("OD_FindPointInAnyBoundary")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pOD_FindPointInAnyBoundary);
-            m_bOD_FindPointInAnyBoundary = true;
-        }
-
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_FindClosestBoundaryLineCrossing")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODFindClosestBoundaryLineCrossing);
-            m_bODFindClosestBoundaryLineCrossing = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_FindFirstBoundaryLineCrossing")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODFindFirstBoundaryLineCrossing);
-            m_bODFindFirstBoundaryLineCrossing = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_CreateBoundary")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODCreateBoundary);
-            m_bODCreateBoundary = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_CreateBoundaryPoint")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODCreateBoundaryPoint);
-            m_bODCreateBoundaryPoint = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_CreateTextPoint")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODCreateTextPoint);
-            m_bODCreateTextPoint = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_DeleteBoundary")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODDeleteBoundary);
-            m_bODDeleteBoundary = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_DeleteBoundaryPoint")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODDeleteBoundaryPoint);
-            m_bODDeleteBoundaryPoint = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_DeleteTextPoint")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODDeleteTextPoint);
-            m_bODDeleteTextPoint = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_AddPointIcon")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODAddPointIcon);
-            m_bODAddPointIcon = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_DeletePointIcon")].AsString();
-        if(sptr != _T("null")) {
-            sscanf(sptr.To8BitData().data(), "%p", &m_pODDeletePointIcon);
-            m_bODDeletePointIcon = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_FindAllPathsGUIDS")].AsString();
-        if(sptr != _T("null")) {
-          sscanf(sptr.To8BitData().data(), "%p", &m_pODFindAllPathsGUIDS);
-          m_bODFindAllPathsGUIDS = true;
-        }
-        sptr = g_ReceivedODAPIJSONMsg[_T("OD_FindAllPointsGUIDS")].AsString();
-        if(sptr != _T("null")) {
-          sscanf(sptr.To8BitData().data(), "%p", &m_pODFindAllPointsGUIDS);
-          m_bODFindAllPointsGUIDS = true;
-        }
-    }
-
-    wxString l_msg;
-    wxString l_avail;
-    wxString l_notavail;
-    l_msg.Printf(_("OD Version: Major: %i, Minor: %i, Patch: %i, ODAPI Version: Major: %i, Minor: %i\n"), m_iODVersionMajor, m_iODVersionMinor, m_iODVersionPatch, m_iODAPIVersionMajor, m_iODAPIVersionMinor);
-    if(m_bOD_FindPointInAnyBoundary) l_avail.Append(_("OD_FindPointInAnyBoundary\n"));
-    if(m_bODFindClosestBoundaryLineCrossing) l_avail.Append(_("OD_FindClosestBoundaryLineCrossing\n"));
-    if(m_bODFindFirstBoundaryLineCrossing) l_avail.Append(_("OD_FindFirstBoundaryLineCrossing\n"));
-    if(m_bODCreateBoundary) l_avail.Append(_("OD_CreateBoundary\n"));
-    if(m_bODCreateBoundaryPoint) l_avail.Append(_("OD_CreateBoundaryPoint\n"));
-    if(m_bODCreateTextPoint) l_avail.Append(_("OD_CreateTextPoint\n"));
-    if(m_bODAddPointIcon) l_avail.Append(_("OD_AddPointIcon\n"));
-    if(m_bODDeletePointIcon) l_avail.Append(_("OD_DeletePointIcon\n"));
-    if(m_bODFindAllPathsGUIDS) l_avail.Append(_("OD_FindAllPathsGUIDS\n"));
-    if(m_bODFindAllPointsGUIDS) l_avail.Append(_("OD_FindAllPointsGUIDS\n"));
-    if(l_avail.Length() > 0) {
-        l_msg.Append(_("The following ODAPI's are available: \n"));
-        l_msg.Append(l_avail);
-    }
-
-    if(!m_bOD_FindPointInAnyBoundary) l_notavail.Append(_("OD_FindPointInAnyBoundary\n"));
-    if(!m_bODFindClosestBoundaryLineCrossing) l_notavail.Append(_("OD_FindClosestBoundaryLineCrossing\n"));
-    if(!m_bODFindFirstBoundaryLineCrossing) l_notavail.Append(_("OD_FindFirstBoundaryLineCrossing\n"));
-    if(!m_bODCreateBoundary) l_notavail.Append(_("OD_CreateBoundary\n"));
-    if(!m_bODCreateBoundaryPoint) l_notavail.Append(_("OD_CreateBoundaryPoint\n"));
-    if(!m_bODCreateTextPoint) l_notavail.Append(_("OD_CreateTextPoint\n"));
-    if(!m_bODAddPointIcon) l_notavail.Append(_("OD_AddPointIcon\n"));
-    if(!m_bODDeletePointIcon) l_notavail.Append(_("OD_DeletePointIcon\n"));
-    if(!m_bODFindAllPathsGUIDS) l_notavail.Append(_("OD_FindAllPathsGUIDS\n"));
-    if(!m_bODFindAllPointsGUIDS) l_notavail.Append(_("OD_FindAllPointsGUIDS"));
-    if(l_notavail.Length() > 0) {
-        l_msg.Append(_("The following ODAPI's are not available:\n"));
-        l_msg.Append(l_notavail);
-    }
-
-    OCPNMessageBox_PlugIn( m_parent_window, l_msg, _("AIS_IDS"), (long) wxYES );
-
-}
-
-void ais_ids_pi::FindClosestBoundaryLineCrossing(FindClosestBoundaryLineCrossing_t *pFCPBLC)
-{
-    if((*m_pODFindClosestBoundaryLineCrossing)(pFCPBLC)) {
-        delete pFCPBLC;
-    }
-    delete pFCPBLC;
-}
-
-void ais_ids_pi::GetGUIDList(GUIDList_t *pGL)
-{
-  if(pGL->GUIDType == "" || pGL->GUIDType == "Boundary" || pGL->GUIDType == "EBL") {
-    pGL->GUIDList = (*m_pODFindAllPathsGUIDS)(pGL);
-  }
-
-  if(pGL->GUIDType == "Boundary Point" || pGL->GUIDType == "Text Point") {
-    pGL->GUIDList = (*m_pODFindAllPointsGUIDS)(pGL);
-  }
-
-}
-
-bool ais_ids_pi::CreateBoundaryPoint(CreateBoundaryPoint_t* pCBP)
-{
-    bool l_bRet = (*m_pODCreateBoundaryPoint)(pCBP);
-    DEBUGST("Boundary Point created: ");
-    DEBUGEND(l_bRet);
-    return true;
-}
-
-bool ais_ids_pi::CreateBoundary(CreateBoundary_t* pCB)
-{
-    wxString l_GUID;
-    bool l_bRet = (*m_pODCreateBoundary)(pCB);
-    DEBUGST("Boundary GUID: ");
-    DEBUGEND(pCB->GUID);
-    return l_bRet;;
-}
-
-bool ais_ids_pi::CreateTextPoint(CreateTextPoint_t* pCTP)
-{
-    wxString l_GUID;
-    bool l_bRet = (*m_pODCreateTextPoint)(pCTP);
-    DEBUGST("Text Point GUID: ");
-    DEBUGEND(l_GUID);
-    return true;
-}
-
-bool ais_ids_pi::DeleteBoundaryPoint(DeleteBoundaryPoint_t* pDBP)
-{
-    bool l_bRet = (*m_pODDeleteBoundaryPoint)(pDBP);
-    DEBUGST("Boundary Point Deleted: ");
-    DEBUGEND(l_bRet);
-    return true;
-}
-
-bool ais_ids_pi::DeleteBoundary(DeleteBoundary_t* pDB)
-{
-    bool l_bRet = (*m_pODDeleteBoundary)(pDB);
-    DEBUGST("Boundary deleted: ");
-    DEBUGEND(l_bRet);
-    return true;
-}
-
-bool ais_ids_pi::DeleteTextPoint(DeleteTextPoint_t* pDTP)
-{
-    bool l_bRet = (*m_pODDeleteTextPoint)(pDTP);
-    DEBUGST("Text Point created: ");
-    DEBUGEND(l_bRet);
-    return true;
-}
-
-void ais_ids_pi::AddPointIcon(AddPointIcon_t* pAPI)
-{
-    (*m_pODAddPointIcon)(pAPI);
-    return;
-}
-
-void ais_ids_pi::DeletePointIcon(DeletePointIcon_t* pDPI)
-{
-    (*m_pODDeletePointIcon)(pDPI);
-    return;
-}
-
 bool ais_ids_pi::ImportJSONFile()
 {
     wxFFile l_ffile;

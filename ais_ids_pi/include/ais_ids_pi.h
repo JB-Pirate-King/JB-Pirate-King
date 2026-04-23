@@ -142,7 +142,6 @@ std::cout << x  << std::endl ; } while (0)
 #include <wx/dynarray.h>
 #include <unordered_set>
 
-#include "ODAPI.h"
 #include "globals.h"
 
 #include "ais_ids.h"
@@ -213,21 +212,10 @@ public:
     void SetToolbarTool( void );
     void ToggleToolbarIcon( void);
 
-    void    GetODAPI( void );
 
-    void FindClosestBoundaryLineCrossing(FindClosestBoundaryLineCrossing_t *pFCPIAB);
-    bool CreateBoundaryPoint(CreateBoundaryPoint_t *pCBP);
-    bool CreateBoundary(CreateBoundary_t *pCB);
-    bool CreateTextPoint(CreateTextPoint_t *pCTP);
-    bool DeleteBoundaryPoint(DeleteBoundaryPoint_t *pDBP);;
-    bool DeleteBoundary(DeleteBoundary_t *pDB);
-    bool DeleteTextPoint(DeleteTextPoint_t *pDTP);
-    void AddPointIcon(AddPointIcon_t *API);
-    void DeletePointIcon(DeletePointIcon_t *p_DPI);
     bool ImportJSONFile(void);
     void UpdateCloseAfterSave(bool bCloseAfterSave);
     void UpdateAppendToFile(bool bAppendToFile);
-    void GetGUIDList(GUIDList_t *pGL);
     void SetAISSentence(wxString &sentence);
     bool RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
                                           int canvasIndex, int priority);
@@ -246,28 +234,9 @@ public:
 
     bool    eventsEnabled;
     bool    m_bReadyForRequests;
-    bool    m_bDoneODAPIVersionCall;
     int     m_iCallerId;
     bool    m_btpDialog;
     int     m_ais_ids_button_id;
-    int     m_iODVersionMajor;
-    int     m_iODVersionMinor;
-    int     m_iODVersionPatch;
-    int     m_iODAPIVersionMajor;
-    int     m_iODAPIVersionMinor;
-    bool    m_bOD_FindPointInAnyBoundary;
-    bool    m_bODFindClosestBoundaryLineCrossing;
-    bool    m_bODFindFirstBoundaryLineCrossing;
-    bool    m_bODCreateBoundary;
-    bool    m_bODCreateBoundaryPoint;
-    bool    m_bODCreateTextPoint;
-    bool    m_bODDeleteBoundary;
-    bool    m_bODDeleteBoundaryPoint;
-    bool    m_bODDeleteTextPoint;
-    bool    m_bODAddPointIcon;
-    bool    m_bODDeletePointIcon;
-    bool    m_bODFindAllPathsGUIDS;
-    bool    m_bODFindAllPointsGUIDS;
     wxFileName  m_fnInputJSON;
     wxFileName  m_fnOutputJSON;
     bool    m_bSaveIncommingJSONMessages;
@@ -301,19 +270,6 @@ private:
     double  m_click_lat;
     double  m_click_lon;
 
-    OD_FindPointInAnyBoundary           m_pOD_FindPointInAnyBoundary;
-    OD_FindClosestBoundaryLineCrossing  m_pODFindClosestBoundaryLineCrossing;
-    OD_FindFirstBoundaryLineCrossing    m_pODFindFirstBoundaryLineCrossing;
-    OD_CreateBoundary                   m_pODCreateBoundary;
-    OD_CreateBoundaryPoint              m_pODCreateBoundaryPoint;
-    OD_CreateTextPoint                  m_pODCreateTextPoint;
-    OD_DeleteBoundaryPoint              m_pODDeleteBoundaryPoint;
-    OD_DeleteBoundary                   m_pODDeleteBoundary;
-    OD_DeleteTextPoint                  m_pODDeleteTextPoint;
-    OD_AddPointIcon                     m_pODAddPointIcon;
-    OD_DeletePointIcon                  m_pODDeletePointIcon;
-    OD_FindAllPathsGUIDS                m_pODFindAllPathsGUIDS;
-    OD_FindAllPointsGUIDS               m_pODFindAllPointsGUIDS;
 };
 
 #endif
