@@ -1,6 +1,8 @@
 // ais_ids.cpp
 
 #include "ais_ids.h"
+#include <nlohmann/json.hpp>
+#include <fstream>
 
 ais_ids::ais_ids(const std::string &data_dir)
 {
@@ -8,12 +10,65 @@ ais_ids::ais_ids(const std::string &data_dir)
     ais_ml     = new AIS_ML();
 
     if (!data_dir.empty()) {
-        ais_ml->Load(
-            data_dir + "model.onnx",
-            data_dir + "scaler.json",
-            data_dir + "threshold.txt",
-            ml_error_msg
-        );
+        // 앙상블 설정 파일이 있으면 가중 앙상블 모드로 로드,
+        // 없으면 기존 단일 모델 모드로 폴백.
+        // 앙상블 설정 파일 형식 (ensemble_config.json):
+        // {
+        //   "models":    ["model_dcdetect.onnx", "model_tranad.onnx"],
+        //   "scaler":    "scaler_dcdetect.json",
+        //   "threshold": "threshold_weighted_ensemble.txt",
+        //   "weights":   [0.7, 0.3]
+        // }
+        const std::string ensemble_cfg = data_dir + "ensemble_config.json";
+        std::ifstream cfg_file(ensemble_cfg);
+
+        if (cfg_file.is_open()) {
+            // ── 앙상블 모드 ──────────────────────────────────
+            try {
+                nlohmann::json cfg;
+                cfg_file >> cfg;
+
+                std::vector<std::string> model_paths;
+                for (auto &m : cfg["models"])
+                    model_paths.push_back(data_dir + m.get<std::string>());
+
+                // scaler는 모델별로 각각 지정 (scalers 배열),
+                // 없으면 첫 번째 모델명 기반으로 자동 생성
+                std::vector<std::string> scaler_paths;
+                if (cfg.contains("scalers")) {
+                    for (auto &s : cfg["scalers"])
+                        scaler_paths.push_back(data_dir + s.get<std::string>());
+                } else if (cfg.contains("scaler")) {
+                    // 하위 호환: 단일 scaler → 모든 모델에 동일 적용
+                    std::string sc = data_dir + cfg["scaler"].get<std::string>();
+                    scaler_paths.assign(model_paths.size(), sc);
+                }
+
+                std::string threshold_path = data_dir + cfg["threshold"].get<std::string>();
+
+                std::vector<float> weights;
+                if (cfg.contains("weights")) {
+                    for (auto &w : cfg["weights"])
+                        weights.push_back(w.get<float>());
+                }
+
+                ais_ml->LoadWeightedEnsemble(
+                    model_paths, scaler_paths, threshold_path, weights, ml_error_msg);
+
+            } catch (const std::exception &e) {
+                ml_error_msg = "ensemble_config.json parse error: " + std::string(e.what());
+            }
+        } else {
+            // ── 단일 모델 모드 (기존 동작) ───────────────────
+            ais_ml->Load(
+                data_dir + "model.onnx",
+                data_dir + "scaler.json",
+                data_dir + "threshold.txt",
+                ml_error_msg
+            );
+        }
+
+        // ML 로드 결과는 LateInit()에서 AIS 로그 창에 출력
     }
 }
 
@@ -49,28 +104,6 @@ void ais_ids::to_snapshot(AISTarget &target)
                     * std::sin(dLon/2)  * std::sin(dLon/2);
         float dist_km = (float)(6371.0 * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1-a)));
 
-        // expected_dist_km
-        float expected_dist_km = (float)(cur.sog * dt / 3600.0 * 1.852);
-
-        // bearing_cog_diff
-        float bearing_cog_diff = -1.0f;
-        if (cur.sog >= 0.5) {
-            double lat1r = prev.lat * M_PI / 180.0;
-            double lat2r = cur.lat  * M_PI / 180.0;
-            double dLonr = (cur.lon - prev.lon) * M_PI / 180.0;
-            double bearing = std::fmod(
-                std::atan2(
-                    std::sin(dLonr) * std::cos(lat2r),
-                    std::cos(lat1r) * std::sin(lat2r)
-                        - std::sin(lat1r) * std::cos(lat2r) * std::cos(dLonr)
-                ) * 180.0 / M_PI + 360.0,
-                360.0
-            );
-            double diff = std::abs(bearing - cur.cog);
-            if (diff > 180.0) diff = 360.0 - diff;
-            bearing_cog_diff = (float)diff;
-        }
-
         // cog_hdg_diff
         float cog_hdg_diff = -1.0f;
         if (cur.hdg < 511) {
@@ -81,24 +114,6 @@ void ais_ids::to_snapshot(AISTarget &target)
 
         // sog_change
         float sog_change = std::abs((float)cur.sog - (float)prev.sog);
-
-        // cog_change
-        float cog_diff_val = std::abs(cur.cog - prev.cog);
-        if (cog_diff_val > 180.0) cog_diff_val = 360.0 - cog_diff_val;
-        float cog_change = (float)cog_diff_val;
-
-        // sog_status_ratio
-        static const float STATUS_MAX_SOG[] = {
-            30.0f, 1.0f, 5.0f, 10.0f, 10.0f, 1.0f, 5.0f, 15.0f, 15.0f,
-        };
-        int status_idx = (int)cur.navStatus;
-        float max_sog  = (status_idx >= 0 && status_idx <= 8)
-                         ? STATUS_MAX_SOG[status_idx] : 30.0f;
-        float sog_status_ratio = (max_sog > 0.0f)
-                                 ? (float)cur.sog / max_sog : 0.0f;
-
-        // dist_expected_ratio
-        float dist_expected_ratio = dist_km / (expected_dist_km + 1e-6f);
 
         // cog_hdg_change
         float cog_hdg_change = 0.0f;
@@ -113,41 +128,25 @@ void ais_ids::to_snapshot(AISTarget &target)
                 cog_hdg_change = std::abs(cog_hdg_diff - prev_cog_hdg_diff);
         }
 
-        // cog_hdg_std
-        float cog_hdg_std = 0.0f;
-        {
-            std::vector<float> chd_vals;
-            chd_vals.reserve(ML_SEQ_LEN);
-            auto &hist = ais_history[target.mmsi];
-            int start = (int)hist.size() - ML_SEQ_LEN;
-            if (start < 0) start = 0;
-            for (int hi = start; hi < (int)hist.size(); ++hi) {
-                if (hist[hi].hdg < 511) {
-                    double d = std::abs(hist[hi].cog - (double)hist[hi].hdg);
-                    if (d > 180.0) d = 360.0 - d;
-                    chd_vals.push_back((float)d);
-                } else {
-                    chd_vals.push_back(0.0f);
-                }
-            }
-            if (chd_vals.size() >= 2) {
-                float mean = 0.0f;
-                for (float v : chd_vals) mean += v;
-                mean /= (float)chd_vals.size();
-                float var = 0.0f;
-                for (float v : chd_vals) var += (v - mean) * (v - mean);
-                cog_hdg_std = std::sqrt(var / (float)(chd_vals.size() - 1));
-            }
+        // speed_consistency: 실제 이동거리 / SOG 기반 예상 거리 (정상 ≈ 1.0)
+        float speed_consistency = 1.0f;
+        if (cur.sog >= 0.1f) {
+            float expected = (float)(cur.sog * dt / 3600.0 * 1.852);
+            speed_consistency = dist_km / (expected + 1e-6f);
         }
+
+        // lat_speed / lon_speed: 위도/경도 방향 변화율 (도/초)
+        float lat_speed = (float)((cur.lat - prev.lat) / (dt + 1e-6));
+        float lon_speed = (float)((cur.lon - prev.lon) / (dt + 1e-6));
 
         ais_ml->PushFeature(target.mmsi,
             (float)cur.sog, (float)cur.cog,
             (float)cur.hdg, (float)cur.navStatus,
             dt, dist_km,
-            expected_dist_km, bearing_cog_diff,
-            cog_hdg_diff, sog_change, cog_change,
-            sog_status_ratio, dist_expected_ratio,
-            cog_hdg_change, cog_hdg_std);
+            cog_hdg_diff, sog_change,
+            cog_hdg_change,
+            speed_consistency,
+            lat_speed, lon_speed);
     }
 }
 
@@ -237,8 +236,12 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     // ── 8. ML 이상 탐지 ────────────────────────────────────────
     if (ais_ml->IsLoaded()) {
         float ml_error = 0.0f;
-        if (ais_ml->DetectAnomaly(mmsi, ml_error))
-            return wxString::Format("ML anomaly detected (MMSI: %d) (Error: %.6f)", mmsi, ml_error);
+        if (ais_ml->DetectAnomaly(mmsi, ml_error)) {
+            const char *mode = ais_ml->IsEnsemble() ? "ENSEMBLE" : "SINGLE";
+            return wxString::Format(
+                "ML anomaly detected [%s] (MMSI: %d) (Score: %.6f / Threshold: %.6f)",
+                mode, mmsi, ml_error, ais_ml->GetThreshold());
+        }
     }
 
     return wxEmptyString;

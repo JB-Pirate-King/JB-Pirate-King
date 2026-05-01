@@ -71,10 +71,11 @@ set(TITLE_NAME "ais_ids")
 set(PACKAGE_CONTACT "Jon Gough")
 set(PACKAGE "ais_ids")
 set(SHORT_DESCRIPTION
-    "Plugin to test examples of the ODAPI and JSON interface for ODRAW"
+    "AIS Intrusion Detection System plugin for OpenCPN"
 )
 set(LONG_DESCRIPTION
-    "ais_ids Plugin is used to test out the ODraw API and demonstrate how to use it successfully from another plugin"
+    "Detects anomalous AIS signals in real-time using an LSTM Autoencoder model. "
+    "Analyzes vessel movement patterns and flags suspicious behavior automatically."
 )
 
 set(VERSION_MAJOR "1")

@@ -17,11 +17,12 @@ AIS 데이터 전처리 스크립트
   python preprocess.py jan.csv feb.csv mar.csv
 ──────────────────────────────────────────────────
 
-피처 (15개):
-    sog, cog, heading, status, dt, dist_km,
-    expected_dist_km, bearing_cog_diff, cog_hdg_diff,
-    sog_change, cog_change, sog_status_ratio,
-    dist_expected_ratio, cog_hdg_change, cog_hdg_std
+피처 (12개):
+    sog, cog, heading, status,
+    dt, dist_km,
+    cog_hdg_diff, sog_change, cog_hdg_change,
+    speed_consistency,
+    lat_speed, lon_speed
 """
 
 import csv
@@ -31,7 +32,6 @@ import os
 import statistics
 import sys
 from datetime import datetime
-from collections import deque
 
 # ── 입력 설정 (CLI 인수가 없을 때 사용) ──────────────────────────
 INPUT_GLOB  = "ais-*.csv"   # 현재 폴더의 ais-*.csv 전부
@@ -41,7 +41,7 @@ INPUT_FILES = []             # 파일 명시적 목록
 OUTPUT_FILE = "ais_preprocessed.csv"
 
 MIN_SEQ_LEN  = 10
-SEQ_BREAK_DT = 600
+SEQ_BREAK_DT = 3600
 
 USE_COLS = [
     "mmsi", "base_date_time",
@@ -158,24 +158,20 @@ def fill_missing(rows: list) -> list:
 
 
 # ── 파생 피처 추가 ────────────────────────────────────────────────
+# 출력 피처 (12개):
+#   dt, dist_km, cog_hdg_diff, sog_change, cog_hdg_change,
+#   speed_consistency, lat_speed, lon_speed
 def add_derived_features(rows: list) -> list:
-    cog_hdg_window = deque(maxlen=10)
-
     for i, row in enumerate(rows):
         if i == 0:
-            row["dt"] = row["dist_km"] = row["expected_dist_km"] = 0.0
-            row["bearing_cog_diff"] = -1.0
-            row["cog_hdg_diff"] = row["sog_change"] = row["cog_change"] = 0.0
-            try:
-                sog = float(row["sog"]); status = int(float(row["status"]))
-                mx  = STATUS_MAX_SOG.get(status, DEFAULT_MAX_SOG)
-                row["sog_status_ratio"] = round(sog / mx, 4) if mx > 0 else 0.0
-            except Exception:
-                row["sog_status_ratio"] = 0.0
-            row["dist_expected_ratio"] = 1.0
-            row["cog_hdg_change"] = 0.0
-            cog_hdg_window.append(0.0)
-            row["cog_hdg_std"] = 0.0
+            row["dt"]                 = 0.0
+            row["dist_km"]            = 0.0
+            row["cog_hdg_diff"]       = 0.0
+            row["sog_change"]         = 0.0
+            row["cog_hdg_change"]     = 0.0
+            row["speed_consistency"]  = 1.0
+            row["lat_speed"]          = 0.0
+            row["lon_speed"]          = 0.0
             continue
 
         prev = rows[i - 1]
@@ -188,7 +184,7 @@ def add_derived_features(rows: list) -> list:
         except Exception:
             row["dt"] = 0.0
 
-        # dist_km
+        # dist_km (Haversine)
         try:
             lat1 = math.radians(float(prev["latitude"]))
             lat2 = math.radians(float(row["latitude"]))
@@ -198,29 +194,6 @@ def add_derived_features(rows: list) -> list:
             row["dist_km"] = round(6371.0 * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 4)
         except Exception:
             row["dist_km"] = 0.0
-
-        # expected_dist_km
-        try:
-            row["expected_dist_km"] = round(float(row["sog"]) * float(row["dt"]) / 3600.0 * 1.852, 4)
-        except Exception:
-            row["expected_dist_km"] = 0.0
-
-        # bearing_cog_diff
-        try:
-            if float(row["sog"]) < 0.5:
-                row["bearing_cog_diff"] = -1.0
-            else:
-                la1 = math.radians(float(prev["latitude"]))
-                la2 = math.radians(float(row["latitude"]))
-                dlo = math.radians(float(row["longitude"]) - float(prev["longitude"]))
-                bearing = math.degrees(math.atan2(
-                    math.sin(dlo) * math.cos(la2),
-                    math.cos(la1) * math.sin(la2) - math.sin(la1) * math.cos(la2) * math.cos(dlo)
-                )) % 360.0
-                diff = abs(bearing - float(row["cog"]))
-                row["bearing_cog_diff"] = round(360.0 - diff if diff > 180.0 else diff, 1)
-        except Exception:
-            row["bearing_cog_diff"] = -1.0
 
         # cog_hdg_diff
         try:
@@ -233,31 +206,11 @@ def add_derived_features(rows: list) -> list:
         except Exception:
             row["cog_hdg_diff"] = -1.0
 
-        # sog_change / cog_change
+        # sog_change
         try:
             row["sog_change"] = round(abs(float(row["sog"]) - float(prev["sog"])), 4)
         except Exception:
             row["sog_change"] = 0.0
-        try:
-            diff = abs(float(row["cog"]) - float(prev["cog"]))
-            row["cog_change"] = round(360.0 - diff if diff > 180.0 else diff, 4)
-        except Exception:
-            row["cog_change"] = 0.0
-
-        # sog_status_ratio
-        try:
-            sog = float(row["sog"]); status = int(float(row["status"]))
-            mx  = STATUS_MAX_SOG.get(status, DEFAULT_MAX_SOG)
-            row["sog_status_ratio"] = round(sog / mx, 4) if mx > 0 else 0.0
-        except Exception:
-            row["sog_status_ratio"] = 0.0
-
-        # dist_expected_ratio
-        try:
-            row["dist_expected_ratio"] = round(
-                float(row["dist_km"]) / (float(row["expected_dist_km"]) + 1e-6), 4)
-        except Exception:
-            row["dist_expected_ratio"] = 1.0
 
         # cog_hdg_change
         try:
@@ -267,14 +220,36 @@ def add_derived_features(rows: list) -> list:
         except Exception:
             row["cog_hdg_change"] = 0.0
 
-        # cog_hdg_std
+        # speed_consistency: 실제 이동거리 / SOG 기반 예상 거리
+        # 정상 ≈ 1.0 / 위치 조작이나 SOG 허위 보고 시 크게 벗어남
+        # sog=0 이면 정지 중이므로 dist_km 도 0이어야 정상 → 비율 1.0 유지
         try:
-            v = float(row["cog_hdg_diff"])
-            cog_hdg_window.append(v if v >= 0 else 0.0)
+            sog      = float(row["sog"])
+            dt       = float(row["dt"])
+            dist     = float(row["dist_km"])
+            expected = sog * dt / 3600.0 * 1.852
+            row["speed_consistency"] = round(dist / (expected + 1e-6), 4) \
+                                       if sog >= 0.1 else 1.0
         except Exception:
-            cog_hdg_window.append(0.0)
-        row["cog_hdg_std"] = round(statistics.stdev(cog_hdg_window), 4) \
-                             if len(cog_hdg_window) >= 2 else 0.0
+            row["speed_consistency"] = 1.0
+
+
+        # lat_speed: 위도 변화율 (도/초)
+        # 위도/경도 방향을 분리해서 이동 방향 이상 탐지
+        try:
+            dlat = float(row["latitude"]) - float(prev["latitude"])
+            dt   = float(row["dt"])
+            row["lat_speed"] = round(dlat / (dt + 1e-6), 6)
+        except Exception:
+            row["lat_speed"] = 0.0
+
+        # lon_speed: 경도 변화율 (도/초)
+        try:
+            dlon = float(row["longitude"]) - float(prev["longitude"])
+            dt   = float(row["dt"])
+            row["lon_speed"] = round(dlon / (dt + 1e-6), 6)
+        except Exception:
+            row["lon_speed"] = 0.0
 
     return rows
 
@@ -393,11 +368,12 @@ def main():
         print(f"  {f}")
 
     out_cols = USE_COLS + [
-        "dt", "dist_km", "expected_dist_km",
-        "bearing_cog_diff", "cog_hdg_diff",
-        "sog_change", "cog_change",
-        "sog_status_ratio", "dist_expected_ratio",
-        "cog_hdg_change", "cog_hdg_std",
+        "dt", "dist_km",
+        "cog_hdg_diff",
+        "sog_change",
+        "cog_hdg_change",
+        "speed_consistency",
+        "lat_speed", "lon_speed",
     ]
 
     part_outputs  = []   # 개별 출력 경로 목록

@@ -1,0 +1,12 @@
+{
+  "models": [
+    "model_dcdetect.onnx",
+    "model_tranad.onnx"
+  ],
+  "scalers": [
+    "scaler_dcdetect.json",
+    "scaler_tranad.json"
+  ],
+  "threshold": "threshold_weighted_ensemble.txt",
+  "weights":   [0.7, 0.3]
+}

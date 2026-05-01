@@ -6,15 +6,12 @@
     "status",
     "dt",
     "dist_km",
-    "expected_dist_km",
-    "bearing_cog_diff",
     "cog_hdg_diff",
     "sog_change",
-    "cog_change",
-    "sog_status_ratio",
-    "dist_expected_ratio",
     "cog_hdg_change",
-    "cog_hdg_std"
+    "speed_consistency",
+    "lat_speed",
+    "lon_speed"
   ],
   "min": [
     0.0,
@@ -23,31 +20,25 @@
     0.0,
     0.0,
     0.0,
-    0.0,
-    -1.0,
     -1.0,
     0.0,
     0.0,
     0.0,
-    0.0,
-    0.0,
-    0.0
+    -0.000192,
+    -0.000257
   ],
   "max": [
-    73.6,
+    41.7,
     359.9,
     511.0,
     15.0,
     599.0,
-    7.8156,
-    832.6381,
+    5.4629,
     180.0,
-    180.0,
-    68.7,
-    180.0,
-    58.0,
-    123726100.0,
-    180.0,
-    127.2792
+    31.3,
+    179.8,
+    108.0283,
+    0.000158,
+    0.000259
   ]
 }
