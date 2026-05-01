@@ -1,0 +1,2 @@
+0.000707769142172765
+# weights: {'dcdetect': 0.6, 'tranad': 0.2, 'conv1d': 0.2}

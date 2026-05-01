@@ -280,6 +280,26 @@ void ais_ids_pi::LateInit(void)
 {
     SendPluginMessage(wxS("AIS_IDS_PI_READY_FOR_REQUESTS"), wxS("TRUE"));
     m_bReadyForRequests = true;
+
+    // ── ML 로드 상태를 AIS 로그 창에 출력 ──────────────────
+    if (aisIds && aisIds->ais_ml) {
+        if (aisIds->ais_ml->IsLoaded()) {
+            if (aisIds->ais_ml->IsEnsemble()) {
+                m_tpControlDialogImpl->SendMessage(wxString::Format(
+                    "[ML] Mode      : WEIGHTED ENSEMBLE (%zu models)",
+                    aisIds->ais_ml->GetEnsembleSize()));
+            } else {
+                m_tpControlDialogImpl->SendMessage("[ML] Mode      : SINGLE MODEL");
+            }
+            m_tpControlDialogImpl->SendMessage(wxString::Format(
+                "[ML] Threshold : %.6f", aisIds->ais_ml->GetThreshold()));
+            m_tpControlDialogImpl->SendMessage(wxString::Format(
+                "[ML] %s", wxString(aisIds->ml_error_msg)));
+        } else {
+            m_tpControlDialogImpl->SendMessage(wxString::Format(
+                "[ML] Load FAILED: %s", wxString(aisIds->ml_error_msg)));
+        }
+    }
     return;
 }
 
@@ -597,7 +617,8 @@ bool ais_ids_pi::RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp,
             if (!t) continue;
             // Check if the target is an anomaly before drawing
             wxString anomaly = aisIds->detect_anomaly_ais(t->MMSI);
-            m_tpControlDialogImpl->SendMessage(anomaly);
+            if (!anomaly.IsEmpty())
+                m_tpControlDialogImpl->SendMessage(anomaly);
             if (anomaly.IsEmpty()) continue;
             wxPoint p;
             GetCanvasPixLL(vp, &p, t->Lat, t->Lon);

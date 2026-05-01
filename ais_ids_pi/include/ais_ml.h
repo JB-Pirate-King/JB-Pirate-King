@@ -35,16 +35,36 @@ struct MLScaler {
     }
 };
 
+// ── 앙상블 모델 항목 ──────────────────────────────────────────────
+struct EnsembleModel {
+    Ort::Session *session;  // ONNX 세션
+    MLScaler      scaler;   // 모델별 독립 스케일러
+    float         weight;   // 가중치 (정규화된 값, 합산 = 1.0)
+};
+
 class AIS_ML {
 public:
     AIS_ML();
     ~AIS_ML();
 
+    // ── 단일 모델 로드 (기존 인터페이스 유지) ────────────────────
     bool Load(const std::string &model_path,
               const std::string &scaler_path,
               const std::string &threshold_path,
               std::string &error_msg);
 
+    // ── 가중 앙상블 로드 ─────────────────────────────────────────
+    // model_paths  : ONNX 파일 경로 목록 (순서 = weights 순서)
+    // scaler_path  : 공통 scaler.json (동일 데이터로 학습했으므로 공유)
+    // threshold_path: threshold_weighted_ensemble.txt
+    // weights      : 각 모델 가중치 (비어있으면 균등 분배, 자동 정규화)
+    bool LoadWeightedEnsemble(const std::vector<std::string> &model_paths,
+                              const std::vector<std::string> &scaler_paths,
+                              const std::string &threshold_path,
+                              const std::vector<float> &weights,
+                              std::string &error_msg);
+
+    // ── 피처 추가 (단일/앙상블 공통) ────────────────────────────
     void PushFeature(int mmsi,
                      float sog, float cog, float heading,
                      float status, float dt, float dist_km,
@@ -53,26 +73,47 @@ public:
                      float speed_consistency,
                      float lat_speed, float lon_speed);
 
+    // ── 이상 탐지 (단일/앙상블 자동 분기) ───────────────────────
+    // out_error: 단일=MSE, 앙상블=가중 평균 MSE
     bool DetectAnomaly(int mmsi, float &out_error);
 
-    bool   IsLoaded()        const { return m_loaded; }
-    float  GetThreshold()    const { return m_threshold; }
+    bool   IsLoaded()     const { return m_loaded; }
+    float  GetThreshold() const { return m_threshold; }
+    bool   IsEnsemble()    const { return m_ensemble_mode; }
+    size_t GetEnsembleSize() const { return m_ensemble.size(); }
+
     size_t GetSequenceSize(int mmsi) const {
         auto it = m_sequences.find(mmsi);
         return (it != m_sequences.end()) ? it->second.size() : 0;
     }
 
 private:
+    // ── 공통 ──────────────────────────────────────────────────────
     Ort::Env            m_env;
-    Ort::Session       *m_session;
     Ort::SessionOptions m_session_options;
+
+    // 단일 모델 전용 스케일러 (앙상블 모드에서는 EnsembleModel::scaler 사용)
     MLScaler            m_scaler;
     float               m_threshold;
     bool                m_loaded;
+    bool                m_ensemble_mode;
 
-    // MMSI → 슬라이딩 윈도우 시퀀스
+    // ── 단일 모델 ─────────────────────────────────────────────────
+    Ort::Session       *m_session;
+
+    // ── 앙상블 모델 목록 ──────────────────────────────────────────
+    std::vector<EnsembleModel> m_ensemble;
+
+    // ── MMSI → 슬라이딩 윈도우 시퀀스 ───────────────────────────
     std::unordered_map<int, std::deque<std::array<float, ML_FEATURE_COUNT>>> m_sequences;
 
-    bool LoadScaler   (const std::string &path, std::string &error_msg);
-    bool LoadThreshold(const std::string &path, std::string &error_msg);
+    // ── 내부 헬퍼 ────────────────────────────────────────────────
+    bool LoadScaler    (const std::string &path, std::string &error_msg);
+    bool LoadScalerInto(const std::string &path, MLScaler &out, std::string &error_msg);
+    bool LoadThreshold (const std::string &path, std::string &error_msg);
+
+    // 입력 피처를 스케일러로 변환 후 세션 추론 → MSE 반환
+    float RunSession(Ort::Session *session,
+                     const MLScaler &scaler,
+                     const std::deque<std::array<float, ML_FEATURE_COUNT>> &seq) const;
 };

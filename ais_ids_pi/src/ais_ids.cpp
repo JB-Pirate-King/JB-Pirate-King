@@ -1,6 +1,8 @@
 // ais_ids.cpp
 
 #include "ais_ids.h"
+#include <nlohmann/json.hpp>
+#include <fstream>
 
 ais_ids::ais_ids(const std::string &data_dir)
 {
@@ -8,12 +10,65 @@ ais_ids::ais_ids(const std::string &data_dir)
     ais_ml     = new AIS_ML();
 
     if (!data_dir.empty()) {
-        ais_ml->Load(
-            data_dir + "model.onnx",
-            data_dir + "scaler.json",
-            data_dir + "threshold.txt",
-            ml_error_msg
-        );
+        // 앙상블 설정 파일이 있으면 가중 앙상블 모드로 로드,
+        // 없으면 기존 단일 모델 모드로 폴백.
+        // 앙상블 설정 파일 형식 (ensemble_config.json):
+        // {
+        //   "models":    ["model_dcdetect.onnx", "model_tranad.onnx"],
+        //   "scaler":    "scaler_dcdetect.json",
+        //   "threshold": "threshold_weighted_ensemble.txt",
+        //   "weights":   [0.7, 0.3]
+        // }
+        const std::string ensemble_cfg = data_dir + "ensemble_config.json";
+        std::ifstream cfg_file(ensemble_cfg);
+
+        if (cfg_file.is_open()) {
+            // ── 앙상블 모드 ──────────────────────────────────
+            try {
+                nlohmann::json cfg;
+                cfg_file >> cfg;
+
+                std::vector<std::string> model_paths;
+                for (auto &m : cfg["models"])
+                    model_paths.push_back(data_dir + m.get<std::string>());
+
+                // scaler는 모델별로 각각 지정 (scalers 배열),
+                // 없으면 첫 번째 모델명 기반으로 자동 생성
+                std::vector<std::string> scaler_paths;
+                if (cfg.contains("scalers")) {
+                    for (auto &s : cfg["scalers"])
+                        scaler_paths.push_back(data_dir + s.get<std::string>());
+                } else if (cfg.contains("scaler")) {
+                    // 하위 호환: 단일 scaler → 모든 모델에 동일 적용
+                    std::string sc = data_dir + cfg["scaler"].get<std::string>();
+                    scaler_paths.assign(model_paths.size(), sc);
+                }
+
+                std::string threshold_path = data_dir + cfg["threshold"].get<std::string>();
+
+                std::vector<float> weights;
+                if (cfg.contains("weights")) {
+                    for (auto &w : cfg["weights"])
+                        weights.push_back(w.get<float>());
+                }
+
+                ais_ml->LoadWeightedEnsemble(
+                    model_paths, scaler_paths, threshold_path, weights, ml_error_msg);
+
+            } catch (const std::exception &e) {
+                ml_error_msg = "ensemble_config.json parse error: " + std::string(e.what());
+            }
+        } else {
+            // ── 단일 모델 모드 (기존 동작) ───────────────────
+            ais_ml->Load(
+                data_dir + "model.onnx",
+                data_dir + "scaler.json",
+                data_dir + "threshold.txt",
+                ml_error_msg
+            );
+        }
+
+        // ML 로드 결과는 LateInit()에서 AIS 로그 창에 출력
     }
 }
 
@@ -181,8 +236,12 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     // ── 8. ML 이상 탐지 ────────────────────────────────────────
     if (ais_ml->IsLoaded()) {
         float ml_error = 0.0f;
-        if (ais_ml->DetectAnomaly(mmsi, ml_error))
-            return wxString::Format("ML anomaly detected (MMSI: %d) (Error: %.6f)", mmsi, ml_error);
+        if (ais_ml->DetectAnomaly(mmsi, ml_error)) {
+            const char *mode = ais_ml->IsEnsemble() ? "ENSEMBLE" : "SINGLE";
+            return wxString::Format(
+                "ML anomaly detected [%s] (MMSI: %d) (Score: %.6f / Threshold: %.6f)",
+                mode, mmsi, ml_error, ais_ml->GetThreshold());
+        }
     }
 
     return wxEmptyString;
