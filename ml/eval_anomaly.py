@@ -1,24 +1,29 @@
 """
-이상 신호 MSE 측정 + 피처 분석 스크립트
+AIS 이상 탐지 평가 스크립트
 
-[분석 1] 탐지율/오탐율 테이블
+[분석 1] 탐지율/오탐율 테이블 (시나리오별)
 [분석 2] 피처 간 상관행렬 (Pearson)
 [분석 3] 시나리오별 재구성 오차 분해 (피처별 MSE)
-[분석 4] Permutation Importance
+[분석 4] Permutation Importance (정상/이상 기준 이중 분석)
 
-사용법:
-    python eval_anomaly.py              # 전체 실행
-    python eval_anomaly.py --corr       # 상관행렬만
-    python eval_anomaly.py --recon      # 재구성 오차 분해만
-    python eval_anomaly.py --perm       # Permutation Importance만
-    python eval_anomaly.py --output result.txt  # 결과 파일 저장
+단일 모델 평가:
+    python eval_anomaly.py --model dcdetect
+    python eval_anomaly.py --model tranad --corr    # 상관행렬만
+    python eval_anomaly.py --model conv1d --recon   # 재구성 오차만
+    python eval_anomaly.py --model usad --perm      # Permutation Importance만
 
-피처 (12개):
-    sog, cog, heading, status,
-    dt, dist_km,
-    cog_hdg_diff, sog_change, cog_hdg_change,
-    speed_consistency,
-    lat_speed, lon_speed
+OR 앙상블 평가 (개별 임계값 기준):
+    python eval_anomaly.py --ensemble conv1d tranad
+    python eval_anomaly.py --ensemble dcdetect tranad conv1d
+
+가중 앙상블 평가 (목표 오탐율 자동 맞춤):
+    python eval_anomaly.py --weighted dcdetect tranad --weights 0.7 0.3 --target_fp 5.0
+    python eval_anomaly.py --weighted dcdetect tranad conv1d --weights 0.6 0.2 0.2
+
+결과 파일:
+    eval_result_{model}.txt
+    eval_result_{model1}_{model2}_ensemble.txt
+    eval_result_{model1}_{model2}_weighted.txt
 """
 
 import argparse
@@ -64,8 +69,23 @@ SEQ_LEN        = 10
 MODEL_FILE     = "model.onnx"
 SCALER_FILE    = "scaler.json"
 THRESHOLD_FILE = "threshold.txt"
-DATA_FILE      = "ais_preprocessed.csv"
+DATA_FILE      = "ais-2024-01-01_preprocessed.csv"
+SEQ_BREAK_DT   = 600   # 이 시간(초) 이상 간격이면 새 세그먼트로 분리
 _KN_TO_DPS     = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
+
+# ── --model 인자로 파일명 자동 설정 ──────────────────────────────
+# python eval_anomaly.py --model usad
+# python eval_anomaly.py --model tranad
+# python eval_anomaly.py --model conv1d
+# python eval_anomaly.py              ← 기존 model.onnx 사용
+_KNOWN_MODELS = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"]
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--model", type=str, default=None, choices=_KNOWN_MODELS)
+_args_pre, _ = _pre.parse_known_args()
+if _args_pre.model:
+    MODEL_FILE     = f"model_{_args_pre.model}.onnx"
+    SCALER_FILE    = f"scaler_{_args_pre.model}.json"
+    THRESHOLD_FILE = f"threshold_{_args_pre.model}.txt"
 
 
 # ── 스케일러 ──────────────────────────────────────────────────────
@@ -139,8 +159,6 @@ def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
     print(f"  실제 정상 시퀀스 로드: {len(scaled):,}개 (전체 풀: {len(all_seqs):,})")
     return scaled
 
-
-SEQ_BREAK_DT = 3600
 
 
 # ── 시퀀스 생성 헬퍼 ──────────────────────────────────────────────
@@ -751,6 +769,208 @@ SCENARIO_MAKERS = [
 ]
 
 
+
+
+# ══════════════════════════════════════════════════════════════════
+# 가중 평균 앙상블 (목표 오탐율 자동 맞춤)
+# ══════════════════════════════════════════════════════════════════
+def infer_weighted_score(sessions, weights, seq_scaled):
+    """가중 평균 MSE 스코어 반환"""
+    mses = [infer_mse(s, seq_scaled) for s in sessions]
+    # 각 모델 MSE를 정규화 후 가중합
+    score = sum(w * m for w, m in zip(weights, mses))
+    return score, mses
+
+def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
+                                 target_fp=5.0, real_seqs=None):
+    print("\n" + "="*60)
+    print(f"  [가중 앙상블] {' + '.join(model_names)}")
+    print(f"  weights: {dict(zip(model_names, [round(w,3) for w in weights]))}")
+    print(f"  목표 오탐율: {target_fp}%")
+    print("="*60)
+
+    N_ANOM = 500  # 시나리오당 생성할 이상 시퀀스 수
+
+    # 정상 시퀀스 스코어 수집
+    if real_seqs is not None:
+        normal_scores = [infer_weighted_score(sessions, weights, seq)[0]
+                         for seq in tqdm(real_seqs, desc="정상 시퀀스", leave=False)]
+    else:
+        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(3000)]
+        normal_scores = [infer_weighted_score(sessions, weights, seq)[0]
+                         for seq in tqdm(normal_seqs, desc="정상 시퀀스", leave=False)]
+
+    N_ne = len(normal_scores)
+
+    # 목표 오탐율에 맞는 임계값 자동 계산
+    thr = float(np.percentile(normal_scores, 100 - target_fp))
+    actual_fp = sum(1 for s in normal_scores if s > thr) / N_ne * 100
+    print(f"  자동 설정 임계값: {thr:.6f}  실제 오탐율: {actual_fp:.1f}%")
+
+    # 개별 모델 단독 오탐율 참고
+    # (가중 앙상블에서는 개별 임계값 안 씀, 참고용)
+    anom_scenarios = [(name, maker) for name, maker, is_anom in SCENARIO_MAKERS if is_anom]
+
+    # 시나리오별 탐지율
+    col_w = 16
+    print(f"\n  {'시나리오':<20}" + "".join(f"{n:>{col_w}}" for n in model_names) + f"{'가중앙상블':>{col_w}}")
+    sep = "─" * (20 + col_w * (len(model_names) + 1))
+    print("  " + sep)
+
+    for sc_name, maker in tqdm(anom_scenarios, desc="시나리오", unit="개"):
+        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        scores_and_mses = [infer_weighted_score(sessions, weights, seq) for seq in seqs]
+        ens_rate = sum(1 for score, _ in scores_and_mses if score > thr) / N_ANOM * 100
+
+        # 개별 단독 탐지율 (참고용 — 정상 스코어의 target_fp 퍼센타일 임계값 기준)
+        indiv_normal_mses = [
+            [infer_mse(sessions[i], seq) for seq in (real_seqs or
+             [scale_seq(make_normal_seq(), mins, maxs) for _ in range(500)])]
+            for i in range(len(sessions))
+        ]
+        indiv_rates = []
+        for i in range(len(sessions)):
+            indiv_thr_i = float(np.percentile(indiv_normal_mses[i], 100 - target_fp))
+            indiv_scores = [infer_mse(sessions[i], seq) for seq in seqs]
+            rate = sum(1 for s in indiv_scores if s > indiv_thr_i) / N_ANOM * 100
+            indiv_rates.append(rate)
+
+        row = f"  {sc_name:<20}"
+        row += "".join(f"{r:>{col_w}.1f}%" for r in indiv_rates)
+        row += f"{ens_rate:>{col_w}.1f}%"
+        print(row)
+
+    print("  " + sep)
+
+    # 목표 오탐율 1~10% 전체 스캔
+    print(f"\n  [오탐율 1~10% 가중 앙상블 탐지율]")
+    sc_names = [n for n, _ in anom_scenarios]
+    anom_seqs = {}
+    for sc_name, maker in tqdm(anom_scenarios, desc="시퀀스 생성", leave=False):
+        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs) for _ in range(200)]
+
+    # 시나리오별 스코어 미리 계산
+    anom_scores = {}
+    for sc_name in sc_names:
+        anom_scores[sc_name] = [infer_weighted_score(sessions, weights, seq)[0]
+                                 for seq in anom_seqs[sc_name]]
+
+    header = f"  {'오탐율':>6}" + "".join(rjust(n, 14) for n in sc_names)
+    sep2   = "─" * len(header)
+    print(); print("  " + sep2); print(header); print("  " + sep2)
+
+    for fp_t in range(1, 11):
+        t = float(np.percentile(normal_scores, 100 - fp_t))
+        actual = sum(1 for s in normal_scores if s > t) / N_ne * 100
+        row = f"  {actual:>5.1f}%"
+        for sc_name in sc_names:
+            det = sum(1 for s in anom_scores[sc_name] if s > t) / 200 * 100
+            row += rjust(f"{det:.1f}%", 14)
+        print(row)
+    print("  " + sep2)
+    print("\n→ 가중 앙상블: score = " +
+          " + ".join(f"{w:.2f}×MSE({n})" for w,n in zip(weights, model_names)))
+    print(f"→ 임계값 저장: threshold_weighted_ensemble.txt")
+    with open("threshold_weighted_ensemble.txt", "w") as f:
+        f.write(f"{thr}\n# weights: {dict(zip(model_names, weights))}")
+
+# ══════════════════════════════════════════════════════════════════
+# 앙상블 탐지 (OR 연산)
+# ══════════════════════════════════════════════════════════════════
+def infer_mse_ensemble(sessions, thresholds, seq_scaled):
+    """두 모델 중 하나라도 임계값 초과하면 이상 (OR)"""
+    mses = [infer_mse(s, seq_scaled) for s in sessions]
+    detected = any(mse > thr for mse, thr in zip(mses, thresholds))
+    return mses, detected
+
+def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, real_seqs=None):
+    print("\n" + "="*60)
+    print(f"  [앙상블] {' + '.join(model_names)} OR 탐지율 테이블")
+    print("="*60)
+
+    N_ANOM = 500
+    label = "+".join(model_names)
+
+    # 각 모델 개별 오탐율
+    if real_seqs is not None:
+        normal_results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in tqdm(real_seqs, desc="정상 시퀀스", leave=False)]
+    else:
+        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(3000)]
+        normal_results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in tqdm(normal_seqs, desc="정상 시퀀스", leave=False)]
+
+    fp_count  = sum(1 for _, det in normal_results if det)
+    N_ne      = len(normal_results)
+    fp_rate   = fp_count / N_ne * 100
+
+    # 개별 오탐율
+    for i, (name, thr) in enumerate(zip(model_names, thresholds)):
+        indiv_fp = sum(1 for mses, _ in normal_results if mses[i] > thr) / N_ne * 100
+        print(f"  {name} 단독 오탐율: {indiv_fp:.1f}%  (임계값: {thr:.6f})")
+    print(f"  OR 앙상블 오탐율: {fp_rate:.1f}%")
+
+    # 시나리오별 탐지율
+    col_w = 16
+    anom_scenarios = [(name, maker) for name, maker, is_anom in SCENARIO_MAKERS if is_anom]
+
+    print(f"\n  {'시나리오':<20}" + "".join(f"{'  '+n:>{col_w}}" for n in model_names) + f"{'앙상블':>{col_w}}")
+    sep = "─" * (20 + col_w * (len(model_names) + 1))
+    print("  " + sep)
+
+    for sc_name, maker in tqdm(anom_scenarios, desc="시나리오", unit="개"):
+        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in seqs]
+        indiv_rates = []
+        for i, thr in enumerate(thresholds):
+            rate = sum(1 for mses, _ in results if mses[i] > thr) / N_ANOM * 100
+            indiv_rates.append(rate)
+        ens_rate = sum(1 for _, det in results if det) / N_ANOM * 100
+        row = f"  {sc_name:<20}"
+        row += "".join(f"{r:>{col_w}.1f}%" for r in indiv_rates)
+        row += f"{ens_rate:>{col_w}.1f}%"
+        print(row)
+
+    print("  " + sep)
+
+    # 오탐율 1~10% 전체 시나리오 탐지율 테이블
+    print(f"\n  [오탐율 1~10% 기준 앙상블 탐지율]")
+    print(f"  ({'·'.join(model_names)} 각각 동일 퍼센타일 임계값 사용, N=200/시나리오)")
+
+    normal_mses = [[mses[i] for mses, _ in normal_results] for i in range(len(sessions))]
+
+    # 오탐율 1~10% → 퍼센타일 99~90
+    fp_targets = list(range(1, 11))   # 1,2,...,10
+    pct_list   = [100 - fp for fp in fp_targets]  # 99,98,...,90
+
+    # 시나리오별 시퀀스 미리 생성 (반복 방지)
+    anom_seqs = {}
+    for sc_name, maker in tqdm(anom_scenarios, desc="시나리오 시퀀스 생성", leave=False):
+        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs) for _ in range(200)]
+
+    # 헤더
+    sc_names = [n for n, _ in anom_scenarios]
+    print()
+    header = f"  {'오탐율':>6}" + "".join(rjust(n, 14) for n in sc_names)
+    sep2   = "─" * len(header)
+    print("  " + sep2)
+    print(header)
+    print("  " + sep2)
+
+    for fp_target, pct in zip(fp_targets, pct_list):
+        thrs = [float(np.percentile(mses_list, pct)) for mses_list in normal_mses]
+        # 실제 오탐율 계산
+        actual_fp = sum(1 for mses, _ in normal_results
+                        if any(mses[i] > thrs[i] for i in range(len(sessions)))) / N_ne * 100
+        row = f"  {actual_fp:>5.1f}%"
+        for sc_name, _ in anom_scenarios:
+            det = sum(1 for seq in anom_seqs[sc_name]
+                      if any(infer_mse(sessions[i], seq) > thrs[i]
+                             for i in range(len(sessions)))) / 200 * 100
+            row += rjust(f"{det:.1f}%", 14)
+        print(row)
+
+    print("  " + sep2)
+    print("\n→ 앙상블은 OR 연산: 두 모델 중 하나라도 임계값 초과 시 이상 판정")
+
 # ══════════════════════════════════════════════════════════════════
 # 분석 1: 탐지율/오탐율 테이블
 # ══════════════════════════════════════════════════════════════════
@@ -1055,18 +1275,67 @@ def main():
     import sys, os
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model",  type=str, default=None, choices=_KNOWN_MODELS,
+                        help="모델명 (usad/tranad/conv1d/lstm) — 파일명 자동 설정")
+    parser.add_argument("--weighted", type=str, nargs="+", default=None,
+                        metavar="MODEL", choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"],
+                        help="가중 앙상블 모델 (예: --weighted dcdetect anomtrans --weights 0.6 0.4)")
+    parser.add_argument("--weights", type=float, nargs="+", default=None,
+                        help="가중 앙상블 가중치 (기본: 균등)")
+    parser.add_argument("--target_fp", type=float, default=5.0,
+                        help="목표 오탐율 %% (기본: 5.0)")
+    parser.add_argument("--ensemble", type=str, nargs="+", default=None,
+                        metavar="MODEL", choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"],
+                        help="앙상블 모델 목록 (예: --ensemble conv1d tranad)")
     parser.add_argument("--corr",   action="store_true")
     parser.add_argument("--recon",  action="store_true")
     parser.add_argument("--perm",   action="store_true")
-    parser.add_argument("--output", type=str, default="eval_result.txt",
-                        help="텍스트 결과 저장 파일명 (기본: eval_result.txt)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="텍스트 결과 저장 파일명 (기본: eval_result_{model}.txt)")
     args = parser.parse_args()
     run_all = not any([args.corr, args.recon, args.perm])
 
-    mins, maxs = load_scaler(SCALER_FILE)
-    with open(THRESHOLD_FILE) as f:
-        threshold = float(f.read())
-    session = ort.InferenceSession(MODEL_FILE, providers=["CPUExecutionProvider"])
+    # output 기본값: 모델명 포함
+    if args.output is None:
+        if args.weighted:
+            args.output = f"eval_result_{'_'.join(args.weighted)}_weighted.txt"
+        elif args.ensemble:
+            args.output = f"eval_result_{'_'.join(args.ensemble)}_ensemble.txt"
+        else:
+            args.output = f"eval_result_{args.model or 'lstm'}.txt"
+
+    # ── 앙상블 모드 ──────────────────────────────────────────────
+    # python eval_anomaly.py --ensemble conv1d tranad
+    # (--model 대신 --ensemble 사용)
+    IS_WEIGHTED = bool(args.weighted)
+    IS_ENSEMBLE = bool(args.ensemble) and not IS_WEIGHTED
+
+    if IS_WEIGHTED:
+        model_names = args.weighted
+        w_sessions, w_scalers = [], []
+        for name in model_names:
+            w_sessions.append(ort.InferenceSession(f"model_{name}.onnx", providers=["CPUExecutionProvider"]))
+            w_scalers.append(load_scaler(f"scaler_{name}.json"))
+        mins, maxs = w_scalers[0]
+        n_models = len(model_names)
+        weights = args.weights if args.weights and len(args.weights)==n_models                   else [1.0/n_models]*n_models
+        # 정규화
+        wsum = sum(weights)
+        weights = [w/wsum for w in weights]
+    elif IS_ENSEMBLE:
+        model_names = args.ensemble
+        sessions, thresholds, scalers = [], [], []
+        for name in model_names:
+            sessions.append(ort.InferenceSession(f"model_{name}.onnx", providers=["CPUExecutionProvider"]))
+            with open(f"threshold_{name}.txt") as f:
+                thresholds.append(float(f.read()))
+            scalers.append(load_scaler(f"scaler_{name}.json"))
+        mins, maxs = scalers[0]
+    else:
+        mins, maxs = load_scaler(SCALER_FILE)
+        with open(THRESHOLD_FILE) as f:
+            threshold = float(f.read())
+        session = ort.InferenceSession(MODEL_FILE, providers=["CPUExecutionProvider"])
 
     # ── stdout → 터미널 + 파일 동시 출력 ────────────────────────
     class Tee:
@@ -1086,20 +1355,24 @@ def main():
             print("  ⚠ matplotlib 없음 — 그래프 저장 건너뜀 (pip install matplotlib)")
 
         print("\n실제 정상 시퀀스 로드 중...")
-        real_seqs_all = load_real_normal_seqs(mins, maxs, n_seqs=None)
-        if real_seqs_all is None:
+        real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=3000)
+        if real_seqs is None:
             print(f"  ⚠ {DATA_FILE} 없음 — 합성 정상 시퀀스 사용")
-        real_seqs = real_seqs_all[:5000] if real_seqs_all and len(real_seqs_all) > 5000 else real_seqs_all
 
-        if run_all:
-            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs_all)
+        if IS_WEIGHTED:
+            analysis_detection_weighted(w_sessions, model_names, weights, mins, maxs,
+                                        target_fp=args.target_fp, real_seqs=real_seqs)
+        elif IS_ENSEMBLE:
+            analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, real_seqs=real_seqs)
+        elif run_all:
+            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
             analysis_correlation()
             analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-            analysis_permutation(session, mins, maxs, real_seqs=real_seqs, repeat=10)
+            analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
         else:
             if args.corr:  analysis_correlation()
             if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-            if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs, repeat=10)
+            if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
 
         print("\n완료!")
         if HAS_MPL:
