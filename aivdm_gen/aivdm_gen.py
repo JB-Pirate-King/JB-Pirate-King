@@ -11,13 +11,13 @@
 ║  │    ↓                                                     │   ║
 ║  │  SimEngine  ←→  RealTimeState  ←→  RealTimeControlWin   │   ║
 ║  │    ↓                                                     │   ║
-║  │  SenderWorker  →  UDP Socket  →  OpenCPN                 │   ║
+║  │  SenderWorker  →  TCP Socket  →  OpenCPN/IDS             │   ║
 ║  └──────────────────────────────────────────────────────────┘   ║
 ║  모듈 역할                                                       ║
 ║   AttackPlugin  : 메타데이터 + make/update 인터페이스            ║
 ║   AttackRegistry: 데코레이터 기반 자동 등록                      ║
 ║   SimEngine     : tick 루프, RT 오버라이드 적용                  ║
-║   SenderWorker  : UDP 전송 스레드                                ║
+║   SenderWorker  : TCP 전송 스레드                                ║
 ║   App           : tkinter GUI (좌=설정, 우=로그)                 ║
 ║   RealTimeControlWindow : 별도 Toplevel 실시간 조작              ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -180,6 +180,17 @@ def _sleep(ev:threading.Event,sec:float)->bool:
         if r<=0: return True
         time.sleep(min(0.05,r))
     return False
+
+def _open_tcp(host:str,port:int)->socket.socket:
+    sock=socket.create_connection((host,port),timeout=10)
+    sock.settimeout(None)
+    sock.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
+    return sock
+
+def _tcp_send(sock:socket.socket,msg:str)->None:
+    if not msg.endswith("\n"):
+        msg+="\r\n"
+    sock.sendall(msg.encode("ascii"))
 
 # ══════════════════════════════════════════════════
 #  §4  AttackPlugin 기반 + Registry
@@ -1681,7 +1692,7 @@ class LSTMBeat(AttackPlugin):
 #  §6  SimEngine
 # ═══════════════════════════════════════════════════
 class SimEngine:
-    """송신 루프 — 패턴·RT 오버라이드·UDP 전송을 캡슐화"""
+    """송신 루프 — 패턴·RT 오버라이드·TCP 전송을 캡슐화"""
 
     def __init__(self, cfg:dict, log_q:queue.Queue, stop:threading.Event):
         self.cfg=cfg; self.log_q=log_q; self.stop=stop
@@ -1716,8 +1727,8 @@ class SimEngine:
         fleet=plugin.make(cfg)
         name_sent:set[int]=set()
         iteration=0; start=time.time()
-        _qlog(f"[SimEngine] {plugin.meta.label} | {len(fleet)}척 | {host}:{port}","start")
-        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+        _qlog(f"[SimEngine] {plugin.meta.label} | {len(fleet)}척 | TCP {host}:{port}","start")
+        with _open_tcp(host,port) as sock:
             while not self.stop.is_set():
                 iteration+=1; t0=time.time(); elapsed=t0-start
                 plugin.update(fleet,elapsed,interval,cfg)
@@ -1726,10 +1737,10 @@ class SimEngine:
                 for v in fleet:
                     if self.stop.is_set(): return
                     if v.mmsi not in name_sent:
-                        sock.sendto(v.name_msg().encode("ascii"),(host,port))
+                        _tcp_send(sock,v.name_msg())
                         name_sent.add(v.mmsi)
                         if not _sleep(self.stop,0.01): return
-                    sock.sendto(v.pos_msg().encode("ascii"),(host,port))
+                    _tcp_send(sock,v.pos_msg())
                     sent+=1
                     if not _sleep(self.stop,0.004): return
                 dt=time.time()-t0
@@ -1745,12 +1756,12 @@ def _file_loop(cfg:dict,log_q:queue.Queue,stop:threading.Event)->None:
     interval=float(cfg["file_interval"]); repeat=bool(cfg["file_repeat"])
     _qlog(f"[파일] {Path(cfg['file_path']).name} | {len(msgs)}개","start")
     cycle=0
-    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+    with _open_tcp(host,port) as sock:
         while not stop.is_set():
             cycle+=1
             for i,msg in enumerate(msgs,1):
                 if stop.is_set(): return
-                sock.sendto(msg.encode("ascii"),(host,port))
+                _tcp_send(sock,msg)
                 _qlog(f"[파일 {i:04d}] {msg.strip()}","info")
                 if not _sleep(stop,interval): return
             if not repeat:
@@ -1984,7 +1995,7 @@ class App(tk.Tk):
     def _build_network(self,p):
         self._section(p,"네트워크")
         self._host  =self._row(p,"대상 IP",          self._entry,default="127.0.0.1")
-        self._port  =self._row(p,"UDP 포트",          self._entry,default="1111")
+        self._port  =self._row(p,"TCP 포트",          self._entry,default="10110")
         self._itv   =self._row(p,"송신 주기 (초)",   self._spin,lo=0.2,hi=120,default=2.0,step=0.1)
 
     def _build_center(self,p):
