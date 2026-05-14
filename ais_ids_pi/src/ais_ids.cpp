@@ -130,14 +130,14 @@ void ais_ids::to_snapshot(AISTarget &target)
 
         // speed_consistency: 실제 이동거리 / SOG 기반 예상 거리 (정상 ≈ 1.0)
         float speed_consistency = 1.0f;
-        if (cur.sog >= 0.1f) {
+        if (dt > 0.0f && cur.sog >= 0.1f) {
             float expected = (float)(cur.sog * dt / 3600.0 * 1.852);
             speed_consistency = dist_km / (expected + 1e-6f);
         }
 
         // lat_speed / lon_speed: 위도/경도 방향 변화율 (도/초)
-        float lat_speed = (float)((cur.lat - prev.lat) / (dt + 1e-6));
-        float lon_speed = (float)((cur.lon - prev.lon) / (dt + 1e-6));
+        float lat_speed = (dt > 0.0f) ? (float)((cur.lat - prev.lat) / dt) : 0.0f;
+        float lon_speed = (dt > 0.0f) ? (float)((cur.lon - prev.lon) / dt) : 0.0f;
 
         ais_ml->PushFeature(target.mmsi,
             (float)cur.sog, (float)cur.cog,
@@ -159,9 +159,12 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     AISTarget &latest = history.back();
     time_t now = wxDateTime::Now().GetTicks();
 
-    // 마지막 수신 후 600초 이상 경과 시 정상 처리
-    if (now - latest.rxTime > 600)
+    // 마지막 수신 후 600초 이상 경과 시 시퀀스 정리 후 정상 처리
+    if (now - latest.rxTime > 600) {
+        if (ais_ml->IsLoaded())
+            ais_ml->ClearSequence(mmsi);
         return wxEmptyString;
+    }
 
     // ── 0. 위치 데이터 없음 ───────────────────────────────────
     // if (latest.lat >= 91.0 || latest.lon >= 181.0)

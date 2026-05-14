@@ -183,17 +183,17 @@ def _build_derived(step_list):
         sog_ch = abs(sog - prev_sog) if i > 0 else 0.0
         chd_change = abs(chd - prev_chd) if (i > 0 and chd >= 0 and prev_chd >= 0) else 0.0
 
-        if i == 0 or sog < 0.1:
+        if i == 0 or dt <= 0.0 or sog < 0.1:
             speed_cons = 1.0
         else:
             expected = sog * dt / 3600.0 * 1.852
             speed_cons = round(dist / (expected + 1e-6), 4)
 
-        if i == 0:
+        if i == 0 or dt <= 0.0:
             lat_spd = lon_spd = 0.0
         else:
-            lat_spd = round((lat - prev_lat) / (dt + 1e-6), 6)
-            lon_spd = round((lon - prev_lon) / (dt + 1e-6), 6)
+            lat_spd = round((lat - prev_lat) / dt, 6)
+            lon_spd = round((lon - prev_lon) / dt, 6)
 
         result.append([sog, cog, hdg if hdg < 511 else 0., status,
                         dt, dist, chd, sog_ch, chd_change,
@@ -737,35 +737,37 @@ def make_lstm_beat_seq():
 
 # ── SCENARIO_MAKERS ───────────────────────────────────────────────
 SCENARIO_MAKERS = [
+    # (name, maker, is_anom, is_holdout)
+    # is_holdout=True → 지도학습 학습 데이터에서 제외, 평가 전용
     # 기존
-    ("정상",          make_normal_seq,           False),
-    ("COG/HDG불일치", make_cog_hdg_mismatch_seq, True),
-    ("정박이동",      make_anchor_move_seq,       True),
-    ("속도이상",      make_speed_spike_seq,       True),
-    ("위치점프",      make_position_jump_seq,     True),
-    ("FN1-dt점프",   make_fn_dt_jump_seq,        True),
-    ("FN2-속도단계", make_fn_speed_ramp_seq,     True),
-    ("FN3-COG경계", make_fn_cog_border_seq,     True),
-    ("FN4-status",  make_fn_nav_status_seq,     True),
+    ("정상",          make_normal_seq,           False, False),
+    ("COG/HDG불일치", make_cog_hdg_mismatch_seq, True,  False),
+    ("정박이동",      make_anchor_move_seq,       True,  False),
+    ("속도이상",      make_speed_spike_seq,       True,  False),
+    ("위치점프",      make_position_jump_seq,     True,  False),
+    ("FN1-dt점프",   make_fn_dt_jump_seq,        True,  False),
+    ("FN2-속도단계", make_fn_speed_ramp_seq,     True,  False),
+    ("FN3-COG경계", make_fn_cog_border_seq,     True,  False),
+    ("FN4-status",  make_fn_nav_status_seq,     True,  False),
     # D: ML 우회 v1
-    ("D1-LowSlow",   make_ml_low_slow_seq,       True),
-    ("D2-Temporal",  make_ml_temporal_seq,       True),
-    ("D3-GradDrift", make_ml_gradual_drift_seq,  True),
-    ("D4-Mimicry",   make_ml_mimicry_seq,        True),
+    ("D1-LowSlow",   make_ml_low_slow_seq,       True,  False),
+    ("D2-Temporal",  make_ml_temporal_seq,       True,  False),
+    ("D3-GradDrift", make_ml_gradual_drift_seq,  True,  False),
+    ("D4-Mimicry",   make_ml_mimicry_seq,        True,  False),
     # E: ML 우회 v2
-    ("E1-Smooth",    make_adv_smooth_seq,        True),
-    ("E2-Desync",    make_adv_desync_seq,        True),
-    ("E3-WinEdge",   make_adv_window_edge_seq,   True),
-    ("E4-Contextual",make_adv_contextual_seq,    True),
-    ("E5-Shadow",    make_adv_shadow_seq,        True),
-    # F: 고급 공격
-    ("F1-FeatSmooth",make_feat_smoothing_seq,    True),
-    ("F2-Intermit",  make_intermittent_spoof_seq,True),
-    ("F3-TrajStitch",make_traj_stitch_seq,       True),
-    ("F4-TimeSkew",  make_time_skew_seq,         True),
-    ("F5-MultiCoord",make_multi_coord_seq,       True),
-    ("F6-AISGap",    make_ais_gap_seq,           True),
-    ("F7-LSTMBeat",  make_lstm_beat_seq,         True),
+    ("E1-Smooth",    make_adv_smooth_seq,        True,  False),
+    ("E2-Desync",    make_adv_desync_seq,        True,  False),
+    ("E3-WinEdge",   make_adv_window_edge_seq,   True,  False),
+    ("E4-Contextual",make_adv_contextual_seq,    True,  False),
+    ("E5-Shadow",    make_adv_shadow_seq,        True,  False),
+    # F: 고급 공격 — 홀드아웃 (학습 미포함, 평가 전용)
+    ("F1-FeatSmooth",make_feat_smoothing_seq,    True,  True),
+    ("F2-Intermit",  make_intermittent_spoof_seq,True,  True),
+    ("F3-TrajStitch",make_traj_stitch_seq,       True,  True),
+    ("F4-TimeSkew",  make_time_skew_seq,         True,  True),
+    ("F5-MultiCoord",make_multi_coord_seq,       True,  True),
+    ("F6-AISGap",    make_ais_gap_seq,           True,  True),
+    ("F7-LSTMBeat",  make_lstm_beat_seq,         True,  True),
 ]
 
 
@@ -809,7 +811,7 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
 
     # 개별 모델 단독 오탐율 참고
     # (가중 앙상블에서는 개별 임계값 안 씀, 참고용)
-    anom_scenarios = [(name, maker) for name, maker, is_anom in SCENARIO_MAKERS if is_anom]
+    anom_scenarios = [(name, maker, is_holdout) for name, maker, is_anom, is_holdout in SCENARIO_MAKERS if is_anom]
 
     # 시나리오별 탐지율
     col_w = 16
@@ -817,7 +819,11 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
     sep = "─" * (20 + col_w * (len(model_names) + 1))
     print("  " + sep)
 
-    for sc_name, maker in tqdm(anom_scenarios, desc="시나리오", unit="개"):
+    prev_holdout = None
+    for sc_name, maker, is_holdout in tqdm(anom_scenarios, desc="시나리오", unit="개"):
+        if is_holdout != prev_holdout and prev_holdout is not None:
+            print("  " + sep)
+            print(f"  ── 홀드아웃 (학습 미포함) ──")
         seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
         scores_and_mses = [infer_weighted_score(sessions, weights, seq) for seq in seqs]
         ens_rate = sum(1 for score, _ in scores_and_mses if score > thr) / N_ANOM * 100
@@ -835,10 +841,12 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
             rate = sum(1 for s in indiv_scores if s > indiv_thr_i) / N_ANOM * 100
             indiv_rates.append(rate)
 
-        row = f"  {sc_name:<20}"
+        prefix = "[H] " if is_holdout else "    "
+        row = f"  {prefix}{sc_name:<16}"
         row += "".join(f"{r:>{col_w}.1f}%" for r in indiv_rates)
         row += f"{ens_rate:>{col_w}.1f}%"
         print(row)
+        prev_holdout = is_holdout
 
     print("  " + sep)
 
@@ -910,13 +918,17 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
 
     # 시나리오별 탐지율
     col_w = 16
-    anom_scenarios = [(name, maker) for name, maker, is_anom in SCENARIO_MAKERS if is_anom]
+    anom_scenarios = [(name, maker, is_holdout) for name, maker, is_anom, is_holdout in SCENARIO_MAKERS if is_anom]
 
     print(f"\n  {'시나리오':<20}" + "".join(f"{'  '+n:>{col_w}}" for n in model_names) + f"{'앙상블':>{col_w}}")
     sep = "─" * (20 + col_w * (len(model_names) + 1))
     print("  " + sep)
 
-    for sc_name, maker in tqdm(anom_scenarios, desc="시나리오", unit="개"):
+    prev_holdout = None
+    for sc_name, maker, is_holdout in tqdm(anom_scenarios, desc="시나리오", unit="개"):
+        if is_holdout != prev_holdout and prev_holdout is not None:
+            print("  " + sep)
+            print(f"  ── 홀드아웃 (학습 미포함) ──")
         seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
         results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in seqs]
         indiv_rates = []
@@ -924,10 +936,12 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
             rate = sum(1 for mses, _ in results if mses[i] > thr) / N_ANOM * 100
             indiv_rates.append(rate)
         ens_rate = sum(1 for _, det in results if det) / N_ANOM * 100
-        row = f"  {sc_name:<20}"
+        prefix = "[H] " if is_holdout else "    "
+        row = f"  {prefix}{sc_name:<16}"
         row += "".join(f"{r:>{col_w}.1f}%" for r in indiv_rates)
         row += f"{ens_rate:>{col_w}.1f}%"
         print(row)
+        prev_holdout = is_holdout
 
     print("  " + sep)
 
@@ -982,7 +996,7 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
     N_ANOM = 500
 
     all_errors = []
-    for name, maker, is_anom in tqdm(SCENARIO_MAKERS, desc="분석1 시나리오", unit="개"):
+    for name, maker, is_anom, is_holdout in tqdm(SCENARIO_MAKERS, desc="분석1 시나리오", unit="개"):
         if not is_anom and real_seqs is not None:
             seqs = real_seqs if N is None else real_seqs[:N]
             errs = np.array([infer_mse(session, seq)
@@ -1011,17 +1025,35 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
         print(rjust(label,12) + "".join(rjust(fn(e), col_w) for _, e in all_errors))
     print(sep)
 
-    anom = [(n,e) for (n,e),(_,_,ia) in zip(all_errors,SCENARIO_MAKERS) if ia]
-    print("\n  [임계값별 탐지율/오탐율]")
-    print("  " + "임계값".rjust(12) + "오탐율".rjust(9) +
-          "".join(rjust(n,16) for n,_ in anom))
-    print("  " + "─"*(12+9+16*len(anom)))
-    for pct in [99,98,97,95,90]:
-        thr = np.percentile(ne, pct)
-        fp  = np.sum(ne>thr)/N_ne*100
-        row = rjust(f"{thr:.6f}",12) + rjust(f"{fp:.1f}%",9)
-        row += "".join(rjust(f"{np.sum(e>thr)/len(e)*100:.1f}%",16) for _,e in anom)
-        print("  "+row)
+    # 학습/홀드아웃 분리
+    anom_train   = [(n,e) for (n,e),(_,_,ia,ih) in zip(all_errors,SCENARIO_MAKERS) if ia and not ih]
+    anom_holdout = [(n,e) for (n,e),(_,_,ia,ih) in zip(all_errors,SCENARIO_MAKERS) if ia and ih]
+
+    def _print_threshold_table(anom_list, label):
+        if not anom_list:
+            return
+        print(f"\n  [임계값별 탐지율/오탐율 — {label}]")
+        print("  " + "임계값".rjust(12) + "오탐율".rjust(9) +
+              "".join(rjust(n,16) for n,_ in anom_list))
+        print("  " + "─"*(12+9+16*len(anom_list)))
+        for pct in [99,98,97,95,90]:
+            thr = np.percentile(ne, pct)
+            fp  = np.sum(ne>thr)/N_ne*100
+            row = rjust(f"{thr:.6f}",12) + rjust(f"{fp:.1f}%",9)
+            row += "".join(rjust(f"{np.sum(e>thr)/len(e)*100:.1f}%",16) for _,e in anom_list)
+            print("  "+row)
+
+    _print_threshold_table(anom_train,   "학습 시나리오")
+    _print_threshold_table(anom_holdout, "홀드아웃 [미학습]")
+
+    if anom_train and anom_holdout:
+        train_det   = np.mean([np.sum(e>threshold)/len(e) for _,e in anom_train])   * 100
+        holdout_det = np.mean([np.sum(e>threshold)/len(e) for _,e in anom_holdout]) * 100
+        print(f"\n  ┌─ 요약 ──────────────────────────────────────────")
+        print(f"  │  학습 시나리오 평균 탐지율:   {train_det:5.1f}%")
+        print(f"  │  홀드아웃 평균 탐지율:        {holdout_det:5.1f}%  ← 일반화 성능")
+        print(f"  └──────────────────────────────────────────────────")
+
     print("\n→ threshold.txt 를 위 값 중 적절한 것으로 교체하세요.")
     return all_errors
 
@@ -1097,7 +1129,7 @@ def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
     N_ANOM = 500
 
     scenario_feat_mse = {}
-    for name, maker, is_anom in tqdm(SCENARIO_MAKERS, desc="분석3 시나리오", unit="개"):
+    for name, maker, is_anom, is_holdout in tqdm(SCENARIO_MAKERS, desc="분석3 시나리오", unit="개"):
         feat_mse = np.zeros(len(FEATURES))
         if not is_anom and real_seqs is not None:
             seqs = real_seqs if N is None else real_seqs[:N]
@@ -1115,7 +1147,7 @@ def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
         scenario_feat_mse[name] = feat_mse
 
     col_w = 13
-    names = [n for n,_,_ in SCENARIO_MAKERS]
+    names = [n for n,_,_,_ in SCENARIO_MAKERS]
     header = "피처".ljust(22) + "".join(rjust(n, col_w) for n in names)
     sep    = "─" * len(header)
     print("\n" + sep + "\n" + header + "\n" + sep)
@@ -1168,7 +1200,7 @@ def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
         print(f"  합성 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회 (CSV 없음)")
 
     N_ANOM = 500
-    anom_scenarios = [(name, maker) for name, maker, is_anom in SCENARIO_MAKERS if is_anom]
+    anom_scenarios = [(name, maker) for name, maker, is_anom, is_holdout in SCENARIO_MAKERS if is_anom]
     print(f"  이상 시나리오 {len(anom_scenarios)}개 × {N_ANOM:,}개 × 반복 {repeat}회\n")
 
     arr_normal = np.array(seqs_scaled, dtype=np.float32)
