@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - "ml/**.py"
+      - "ais_ids_pi/src/**.cpp"
+      - "ais_ids_pi/include/**.h"
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Job 1: Python 문법 + 모델 smoke test
+  # ────────────────────────────────────────────────────────────────
+  python-check:
+    name: Python 검사
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치
+        run: pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: 문법 검사 (py_compile)
+        run: |
+          for f in ml/preprocess.py ml/train_benchmark.py ml/train_supervised.py ml/eval_anomaly.py; do
+            python -m py_compile "$f" && echo "  ✅ $f" || { echo "  ❌ $f"; exit 1; }
+          done
+
+      - name: 모델 구조 smoke test
+        run: |
+          cd ml
+          python - <<'EOF'
+          import torch, types, sys
+
+          source = open("train_supervised.py").read()
+          source = source.replace('if __name__ == "__main__":\n    main()', '')
+          mod = types.ModuleType("ts")
+          exec(compile(source, "train_supervised.py", "exec"), mod.__dict__)
+
+          dummy = torch.zeros(2, 10, 12)
+          for name in ["PatchTST", "iTransformer", "TSMixer", "ModernTCN", "Mamba"]:
+              m   = getattr(mod, name)()
+              out = m(dummy)
+              assert out.shape == (2, 1), f"{name} shape 오류: {out.shape}"
+              print(f"  ✅ {name}: (2,10,12) → {tuple(out.shape)}")
+          EOF
+
+  # ────────────────────────────────────────────────────────────────
+  # Job 2: C++ 핵심 파일 실제 컴파일 (ais_ml.cpp, ais_ids.cpp)
+  #   - ocpn_plugin.h 불필요 파일만 대상
+  #   - onnxruntime 헤더는 레포 내 포함 (ais_ids_pi/onnxruntime/include)
+  # ────────────────────────────────────────────────────────────────
+  cpp-compile:
+    name: C++ 컴파일 (ML 핵심 파일)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 의존성 설치
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ nlohmann-json3-dev
+
+      - name: ais_ml.cpp 컴파일
+        run: |
+          g++ -std=c++17 -fsyntax-only \
+            -I ais_ids_pi/include \
+            -I ais_ids_pi/onnxruntime/include \
+            ais_ids_pi/src/ais_ml.cpp \
+            && echo "✅ ais_ml.cpp 컴파일 통과"
+
+      - name: ais_ids.cpp 컴파일
+        run: |
+          g++ -std=c++17 -fsyntax-only \
+            -I ais_ids_pi/include \
+            -I ais_ids_pi/onnxruntime/include \
+            ais_ids_pi/src/ais_ids.cpp \
+            && echo "✅ ais_ids.cpp 컴파일 통과"
+
+  # ────────────────────────────────────────────────────────────────
+  # Job 3: C++ 정적 분석 (cppcheck) — ocpn_plugin.h 의존 파일 포함
+  # ────────────────────────────────────────────────────────────────
+  cpp-check:
+    name: C++ 정적 분석 (cppcheck)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cppcheck 설치
+        run: sudo apt-get install -y cppcheck
+
+      - name: cppcheck 실행
+        run: |
+          cppcheck \
+            --enable=warning,style,performance \
+            --suppress=missingIncludeSystem \
+            --suppress=missingInclude \
+            --suppress=unknownMacro \
+            --error-exitcode=1 \
+            --std=c++17 \
+            -I ais_ids_pi/include \
+            ais_ids_pi/src/ais_ml.cpp \
+            ais_ids_pi/src/ais_ids.cpp \
+            ais_ids_pi/src/ais_ids_pi.cpp \
+            2>&1 | tee cppcheck_result.txt
+          echo "✅ cppcheck 통과"
+
+      - name: 결과 업로드 (실패 시)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cppcheck-result
+          path: cppcheck_result.txt

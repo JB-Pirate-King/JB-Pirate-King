@@ -148,7 +148,8 @@ class MinMaxScaler:
             scaled = []
             for i, val in enumerate(row):
                 denom = self.max_[i] - self.min_[i]
-                scaled.append((val - self.min_[i]) / denom if denom != 0 else 0.0)
+                s = (val - self.min_[i]) / denom if denom != 0 else 0.0
+                scaled.append(max(0.0, min(1.0, s)))
             result.append(scaled)
         return result
 
@@ -230,11 +231,11 @@ def make_loaders(tensor: torch.Tensor, batch_size: int):
     return train_loader, val_loader
 
 
-def calc_threshold(model, loader, device, threshold_path: str = "threshold.txt") -> float:
+def calc_threshold(model, val_loader, device, threshold_path: str = "threshold.txt") -> float:
     model.eval()
     errors = []
     with torch.no_grad():
-        for (batch,) in loader:
+        for (batch,) in val_loader:
             batch  = batch.to(device)
             output = model(batch)
             mse    = ((output - batch) ** 2).mean(dim=(1, 2))
@@ -244,7 +245,7 @@ def calc_threshold(model, loader, device, threshold_path: str = "threshold.txt")
     thr = errors[min(idx, len(errors) - 1)]
     with open(threshold_path, "w") as f:
         f.write(str(thr))
-    print(f"  임계값: {thr:.6f}  (상위 {100 - THRESHOLD_PERCENTILE}%)")
+    print(f"  임계값: {thr:.6f}  (상위 {100 - THRESHOLD_PERCENTILE}%, 검증 데이터 기준)")
     print(f"  임계값 저장: {threshold_path}")
     return thr
 
@@ -510,18 +511,16 @@ def train_tranad(model: TranAD, train_loader, val_loader, device,
     # 논문 식:
     #   L1(θ_enc, θ_D1) = (1/n)*MSE(D1(z,x), x) + (1-1/n)*MSE(D2(z,D1), x)
     #   L2(θ_enc, θ_D2) = (1/n)*MSE(D1(z,x), x) - (1-1/n)*MSE(D2(z,D1), D1)
-    #   → L1은 enc+D1, L2는 enc+D2 별도 업데이트
+    #   → 인코더는 L1에서만 업데이트, D2는 인코더 파라미터 제외
+    enc_params = (list(model.encoder.parameters()) +
+                  list(model.pos_enc.parameters()) +
+                  list(model.input_proj.parameters()))
     opt_d1 = torch.optim.AdamW(
-        list(model.encoder.parameters()) +
-        list(model.pos_enc.parameters()) +
-        list(model.input_proj.parameters()) +
+        enc_params +
         list(model.decoder1.parameters()) +
         list(model.output_proj1.parameters()),
         lr=lr, weight_decay=1e-4)
     opt_d2 = torch.optim.AdamW(
-        list(model.encoder.parameters()) +
-        list(model.pos_enc.parameters()) +
-        list(model.input_proj.parameters()) +
         list(model.decoder2.parameters()) +
         list(model.output_proj2.parameters()),
         lr=lr, weight_decay=1e-4)
@@ -1142,7 +1141,7 @@ def run_model(model_name: str, tensor: torch.Tensor,
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    calc_threshold(model, train_loader, device, threshold_path)
+    calc_threshold(model, val_loader, device, threshold_path)
     export_onnx(model, device, onnx_path)
     return model
 

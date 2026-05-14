@@ -657,8 +657,8 @@ bool ais_ids_pi::RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPo
         if (!t) continue;
         // Check if the target is an anomaly before drawing
         wxString anomaly = aisIds->detect_anomaly_ais(t->MMSI);
-        m_tpControlDialogImpl->SendMessage(anomaly);
         if (anomaly.IsEmpty()) continue;
+        m_tpControlDialogImpl->SendMessage(anomaly);
         wxPoint p;
         GetCanvasPixLL(vp, &p, t->Lat, t->Lon);
 
