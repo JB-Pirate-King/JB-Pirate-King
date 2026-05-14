@@ -80,9 +80,9 @@ _KN_TO_DPS     = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
 # python eval_anomaly.py              ← 기존 model.onnx 사용
 _KNOWN_MODELS = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"]
 _pre = argparse.ArgumentParser(add_help=False)
-_pre.add_argument("--model", type=str, default=None, choices=_KNOWN_MODELS)
+_pre.add_argument("--model", type=str, default=None)  # choices 검증 없이 받음
 _args_pre, _ = _pre.parse_known_args()
-if _args_pre.model:
+if _args_pre.model and _args_pre.model in _KNOWN_MODELS:
     MODEL_FILE     = f"model_{_args_pre.model}.onnx"
     SCALER_FILE    = f"scaler_{_args_pre.model}.json"
     THRESHOLD_FILE = f"threshold_{_args_pre.model}.txt"
