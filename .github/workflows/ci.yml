@@ -1,4 +1,4 @@
-name: ML CI
+name: CI
 
 on:
   push:
@@ -85,3 +85,36 @@ jobs:
 
           print('smoke test 완료')
           "
+
+  cpp-check:
+    name: C++ 정적 분석 (cppcheck)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cppcheck 설치
+        run: sudo apt-get install -y cppcheck
+
+      - name: cppcheck 실행
+        run: |
+          cppcheck \
+            --enable=warning,style,performance \
+            --suppress=missingIncludeSystem \
+            --suppress=missingInclude \
+            --suppress=unknownMacro \
+            --error-exitcode=1 \
+            --std=c++17 \
+            -I ais_ids_pi/include \
+            ais_ids_pi/src/ais_ml.cpp \
+            ais_ids_pi/src/ais_ids.cpp \
+            ais_ids_pi/src/ais_ids_pi.cpp \
+            2>&1 | tee cppcheck_result.txt
+          echo "✅ cppcheck 통과"
+
+      - name: 결과 업로드 (실패 시)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cppcheck-result
+          path: cppcheck_result.txt
