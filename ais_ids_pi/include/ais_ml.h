@@ -7,6 +7,7 @@
 #include <array>
 #include <unordered_map>
 #include <fstream>
+#include <algorithm>
 
 // 피처 순서 (12개):
 //   0  sog               속력 (knots)
@@ -31,7 +32,7 @@ struct MLScaler {
     float scale(int idx, float val) const {
         float denom = max_[idx] - min_[idx];
         if (denom == 0.0f) return 0.0f;
-        return (val - min_[idx]) / denom;
+        return std::clamp((val - min_[idx]) / denom, 0.0f, 1.0f);
     }
 };
 
@@ -86,6 +87,8 @@ public:
         auto it = m_sequences.find(mmsi);
         return (it != m_sequences.end()) ? it->second.size() : 0;
     }
+
+    void ClearSequence(int mmsi) { m_sequences.erase(mmsi); }
 
 private:
     // ── 공통 ──────────────────────────────────────────────────────
