@@ -1,0 +1,87 @@
+name: ML CI
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - "ml/**.py"
+      - "ais_ids_pi/src/**.cpp"
+      - "ais_ids_pi/include/**.h"
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-check:
+    name: Python 문법 / 임포트 검사
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치 (최소)
+        run: |
+          pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: 문법 검사 (py_compile)
+        run: |
+          python -m py_compile ml/preprocess.py
+          python -m py_compile ml/train_benchmark.py
+          python -m py_compile ml/train_supervised.py
+          python -m py_compile ml/eval_anomaly.py
+          echo "✅ 문법 검사 통과"
+
+      - name: 임포트 검사 (train_supervised)
+        run: |
+          cd ml
+          python -c "
+          import ast, sys
+          files = [
+              'train_supervised.py',
+              'train_benchmark.py',
+              'preprocess.py',
+          ]
+          for f in files:
+              try:
+                  ast.parse(open(f).read())
+                  print(f'  ✅ {f}')
+              except SyntaxError as e:
+                  print(f'  ❌ {f}: {e}')
+                  sys.exit(1)
+          "
+
+      - name: 모델 구조 smoke test
+        run: |
+          cd ml
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+
+          # train_supervised 모델 클래스만 임포트해서 forward 검사
+          import torch
+
+          # 파일을 직접 exec해서 argparse 충돌 없이 클래스만 로드
+          import importlib.util, types
+          spec = importlib.util.spec_from_file_location('ts', 'train_supervised.py')
+          mod  = types.ModuleType('ts')
+          mod.__spec__ = spec
+          # argparse.parse_args 호출 전에 멈추도록 main 실행 안 함
+          source = open('train_supervised.py').read()
+          # main() 호출 부분 제거 후 exec
+          source = source.replace('if __name__ == \"__main__\":\n    main()', '')
+          exec(compile(source, 'train_supervised.py', 'exec'), mod.__dict__)
+
+          dummy = torch.zeros(2, 10, 12)
+          for cls_name in ['PatchTST', 'iTransformer', 'TSMixer', 'ModernTCN', 'Mamba']:
+              cls = getattr(mod, cls_name)
+              m   = cls()
+              out = m(dummy)
+              assert out.shape == (2, 1), f'{cls_name} 출력 shape 오류: {out.shape}'
+              print(f'  ✅ {cls_name}: input(2,10,12) → output{tuple(out.shape)}')
+
+          print('smoke test 완료')
+          "
