@@ -11,81 +11,84 @@ on:
     branches: [main]
 
 jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Job 1: Python 문법 + 모델 smoke test
+  # ────────────────────────────────────────────────────────────────
   python-check:
-    name: Python 문법 / 임포트 검사
+    name: Python 검사
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Python 설치
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: 의존성 설치 (최소)
-        run: |
-          pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+      - name: 의존성 설치
+        run: pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: 문법 검사 (py_compile)
         run: |
-          python -m py_compile ml/preprocess.py
-          python -m py_compile ml/train_benchmark.py
-          python -m py_compile ml/train_supervised.py
-          python -m py_compile ml/eval_anomaly.py
-          echo "✅ 문법 검사 통과"
-
-      - name: 임포트 검사 (train_supervised)
-        run: |
-          cd ml
-          python -c "
-          import ast, sys
-          files = [
-              'train_supervised.py',
-              'train_benchmark.py',
-              'preprocess.py',
-          ]
-          for f in files:
-              try:
-                  ast.parse(open(f).read())
-                  print(f'  ✅ {f}')
-              except SyntaxError as e:
-                  print(f'  ❌ {f}: {e}')
-                  sys.exit(1)
-          "
+          for f in ml/preprocess.py ml/train_benchmark.py ml/train_supervised.py ml/eval_anomaly.py; do
+            python -m py_compile "$f" && echo "  ✅ $f" || { echo "  ❌ $f"; exit 1; }
+          done
 
       - name: 모델 구조 smoke test
         run: |
           cd ml
-          python -c "
-          import sys
-          sys.path.insert(0, '.')
+          python - <<'EOF'
+          import torch, types, sys
 
-          # train_supervised 모델 클래스만 임포트해서 forward 검사
-          import torch
-
-          # 파일을 직접 exec해서 argparse 충돌 없이 클래스만 로드
-          import importlib.util, types
-          spec = importlib.util.spec_from_file_location('ts', 'train_supervised.py')
-          mod  = types.ModuleType('ts')
-          mod.__spec__ = spec
-          # argparse.parse_args 호출 전에 멈추도록 main 실행 안 함
-          source = open('train_supervised.py').read()
-          # main() 호출 부분 제거 후 exec
-          source = source.replace('if __name__ == \"__main__\":\n    main()', '')
-          exec(compile(source, 'train_supervised.py', 'exec'), mod.__dict__)
+          source = open("train_supervised.py").read()
+          source = source.replace('if __name__ == "__main__":\n    main()', '')
+          mod = types.ModuleType("ts")
+          exec(compile(source, "train_supervised.py", "exec"), mod.__dict__)
 
           dummy = torch.zeros(2, 10, 12)
-          for cls_name in ['PatchTST', 'iTransformer', 'TSMixer', 'ModernTCN', 'Mamba']:
-              cls = getattr(mod, cls_name)
-              m   = cls()
+          for name in ["PatchTST", "iTransformer", "TSMixer", "ModernTCN", "Mamba"]:
+              m   = getattr(mod, name)()
               out = m(dummy)
-              assert out.shape == (2, 1), f'{cls_name} 출력 shape 오류: {out.shape}'
-              print(f'  ✅ {cls_name}: input(2,10,12) → output{tuple(out.shape)}')
+              assert out.shape == (2, 1), f"{name} shape 오류: {out.shape}"
+              print(f"  ✅ {name}: (2,10,12) → {tuple(out.shape)}")
+          EOF
 
-          print('smoke test 완료')
-          "
+  # ────────────────────────────────────────────────────────────────
+  # Job 2: C++ 핵심 파일 실제 컴파일 (ais_ml.cpp, ais_ids.cpp)
+  #   - ocpn_plugin.h 불필요 파일만 대상
+  #   - onnxruntime 헤더는 레포 내 포함 (ais_ids_pi/onnxruntime/include)
+  # ────────────────────────────────────────────────────────────────
+  cpp-compile:
+    name: C++ 컴파일 (ML 핵심 파일)
+    runs-on: ubuntu-latest
 
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 의존성 설치
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ nlohmann-json3-dev
+
+      - name: ais_ml.cpp 컴파일
+        run: |
+          g++ -std=c++17 -fsyntax-only \
+            -I ais_ids_pi/include \
+            -I ais_ids_pi/onnxruntime/include \
+            ais_ids_pi/src/ais_ml.cpp \
+            && echo "✅ ais_ml.cpp 컴파일 통과"
+
+      - name: ais_ids.cpp 컴파일
+        run: |
+          g++ -std=c++17 -fsyntax-only \
+            -I ais_ids_pi/include \
+            -I ais_ids_pi/onnxruntime/include \
+            ais_ids_pi/src/ais_ids.cpp \
+            && echo "✅ ais_ids.cpp 컴파일 통과"
+
+  # ────────────────────────────────────────────────────────────────
+  # Job 3: C++ 정적 분석 (cppcheck) — ocpn_plugin.h 의존 파일 포함
+  # ────────────────────────────────────────────────────────────────
   cpp-check:
     name: C++ 정적 분석 (cppcheck)
     runs-on: ubuntu-latest
