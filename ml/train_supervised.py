@@ -645,7 +645,7 @@ def export_onnx(model, name: str, device):
         wrapped, dummy, path,
         input_names=["x"],
         output_names=["output"],
-        opset_version=17,
+        opset_version=18,
         dynamic_axes={"x": {0: "batch"}, "output": {0: "batch"}},
     )
     return path
