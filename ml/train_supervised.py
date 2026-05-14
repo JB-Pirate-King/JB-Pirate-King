@@ -29,8 +29,8 @@ AIS 이상 탐지 지도 학습 스크립트 (5개 최신 모델)
 데이터 파이프라인
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  정상 데이터: ais_preprocessed.csv 실제 데이터 + make_normal_seq() 합성
-  이상 데이터: eval_anomaly.SCENARIO_MAKERS 중 is_anom=True 24종 × 500개
+  정상 데이터: ais_preprocessed.csv 실제 데이터만 사용 (CSV 없으면 오류)
+  이상 데이터: eval_anomaly.SCENARIO_MAKERS 중 is_anom=True, is_holdout=False 시나리오 × n_anom개
   스케일러: scaler_dcdetect.json 재사용 (재학습 없음)
   클래스 균형: 다운샘플링으로 1:1 맞춤
 
@@ -42,6 +42,7 @@ AIS 이상 탐지 지도 학습 스크립트 (5개 최신 모델)
   python train_supervised.py --model all
   python train_supervised.py --model mamba --epochs 50 --lr 0.001
   python train_supervised.py --model itrans --n_anom 1000 --n_normal 20000
+  python train_supervised.py --model all --max_mmsi 200   # MMSI 200개로 제한
 
 출력 파일:
   model_sup_{name}.onnx       ONNX 모델 (input="x" → output="output" 확률 스칼라)
@@ -88,8 +89,8 @@ DEFAULTS = {
     "epochs":    40,
     "lr":        3e-4,
     "batch":     128,
-    "n_anom":    500,    # 시나리오당 이상 시퀀스 생성 수
-    "n_normal":  15000,  # 정상 시퀀스 최대 수 (CSV + 합성)
+    "n_anom":    None,   # 시나리오당 이상 시퀀스 수 (None=정상 수 기준 자동)
+    "n_normal":  15000,  # 정상 시퀀스 최대 수
     "val_ratio": 0.15,
     "d_model":   64,
     "n_heads":   4,
@@ -126,7 +127,8 @@ def scale_seq(seq, mins, maxs) -> list:
 # 데이터 파이프라인
 # ══════════════════════════════════════════════════════════════════
 
-def load_normal_from_csv(path: str, mins, maxs, max_seqs: int = 15000) -> list:
+def load_normal_from_csv(path: str, mins, maxs,
+                         max_seqs: int = 15000, max_mmsi: int = None) -> list:
     if not os.path.exists(path):
         return []
     print(f"  [정상] CSV 로드: {path}")
@@ -143,9 +145,14 @@ def load_normal_from_csv(path: str, mins, maxs, max_seqs: int = 15000) -> list:
             except (ValueError, KeyError):
                 continue
 
+    mmsis = list(mmsi_data.keys())
+    if max_mmsi is not None:
+        mmsis = mmsis[:max_mmsi]
+
     dt_idx = FEATURES.index("dt")
     all_seqs = []
-    for records in mmsi_data.values():
+    for mmsi in mmsis:
+        records = mmsi_data[mmsi]
         seg, current = [], [records[0]]
         for rec in records[1:]:
             if rec[dt_idx] >= SEQ_BREAK_DT:
@@ -163,50 +170,56 @@ def load_normal_from_csv(path: str, mins, maxs, max_seqs: int = 15000) -> list:
     random.shuffle(all_seqs)
     sampled = all_seqs[:max_seqs]
     scaled  = [scale_seq(seq, mins, maxs) for seq in sampled]
-    print(f"    → {len(scaled):,}개 (전체 풀: {len(all_seqs):,})")
+    mmsi_info = f"{len(mmsis):,}개 MMSI" + (f" (전체 {len(mmsi_data):,}개 중)" if max_mmsi else "")
+    print(f"    → {len(scaled):,}개 ({mmsi_info}, 전체 풀: {len(all_seqs):,})")
     return scaled
 
 
 def build_dataset(args, mins, maxs):
-    from eval_anomaly import SCENARIO_MAKERS, make_normal_seq
+    from eval_anomaly import SCENARIO_MAKERS
 
-    # ── 이상 시퀀스 생성 (홀드아웃 제외) ────────────────────────
+    # ── 정상 시퀀스: CSV 실데이터만 사용 (먼저 로드) ────────────
+    csv_candidates = [
+        "ais_preprocessed.csv",
+        "ais-2024-01-01_preprocessed.csv",
+        "ais-2025-01-25_preprocessed.csv",
+        "ais-2025-12-31_preprocessed.csv",
+    ]
+    normal_seqs = []
+    for cand in csv_candidates:
+        normal_seqs = load_normal_from_csv(
+            cand, mins, maxs,
+            max_seqs=args.n_normal,
+            max_mmsi=args.max_mmsi,
+        )
+        if normal_seqs:
+            break
+
+    if not normal_seqs:
+        print("  [오류] 정상 CSV 데이터를 찾을 수 없습니다. CSV 파일을 ml/ 폴더에 확인하세요.")
+        sys.exit(1)
+
+    # ── 이상 시퀀스 생성 (홀드아웃 제외, 정상 수에 비례) ─────────
     anom_makers = [(name, maker) for name, maker, is_anom, is_holdout
                    in SCENARIO_MAKERS if is_anom and not is_holdout]
     holdout_cnt = sum(1 for _, _, ia, ih in SCENARIO_MAKERS if ia and ih)
-    print(f"  [이상] {len(anom_makers)}개 시나리오 × {args.n_anom}개 = "
-          f"{len(anom_makers)*args.n_anom:,}개 목표  "
+
+    # --n_anom 미지정 시 정상 수 기준으로 자동 계산
+    n_anom = args.n_anom if args.n_anom is not None else \
+             max(1, math.ceil(len(normal_seqs) / len(anom_makers)))
+
+    print(f"  [이상] {len(anom_makers)}개 시나리오 × {n_anom}개 = "
+          f"{len(anom_makers)*n_anom:,}개 목표  "
           f"(홀드아웃 {holdout_cnt}개 제외)")
     anom_seqs = []
     for name, maker in tqdm(anom_makers, desc="  이상 시나리오", leave=False):
-        for _ in range(args.n_anom):
+        for _ in range(n_anom):
             try:
                 seq = maker()
                 anom_seqs.append(scale_seq(seq, mins, maxs))
             except Exception:
                 pass
     print(f"    → {len(anom_seqs):,}개 생성")
-
-    # ── 정상 시퀀스: CSV 우선, 부족하면 합성으로 보충 ────────────
-    csv_candidates = [
-        "ais_preprocessed.csv",
-        "ais-2024-01-01_preprocessed.csv",
-        "ais-2025-12-31_preprocessed.csv",
-    ]
-    normal_seqs = []
-    for cand in csv_candidates:
-        normal_seqs = load_normal_from_csv(cand, mins, maxs, max_seqs=args.n_normal)
-        if normal_seqs:
-            break
-
-    synth_need = max(0, args.n_normal - len(normal_seqs))
-    if synth_need > 0:
-        print(f"  [정상] 합성 시퀀스 {synth_need:,}개 추가")
-        for _ in tqdm(range(synth_need), desc="  합성 정상", leave=False):
-            try:
-                normal_seqs.append(scale_seq(make_normal_seq(), mins, maxs))
-            except Exception:
-                pass
 
     # ── 클래스 균형 (1:1 다운샘플) ──────────────────────────────
     n = min(len(normal_seqs), len(anom_seqs))
@@ -768,9 +781,11 @@ def main():
     parser.add_argument("--lr",           type=float, default=DEFAULTS["lr"])
     parser.add_argument("--batch",        type=int,   default=DEFAULTS["batch"])
     parser.add_argument("--n_anom",       type=int,   default=DEFAULTS["n_anom"],
-                        help="시나리오당 이상 시퀀스 생성 수")
+                        help="시나리오당 이상 시퀀스 수 (기본: 정상 수 기준 자동 계산)")
     parser.add_argument("--n_normal",     type=int,   default=DEFAULTS["n_normal"],
                         help="정상 시퀀스 최대 수")
+    parser.add_argument("--max_mmsi",     type=int,   default=None,
+                        help="학습에 사용할 최대 MMSI 수 (기본: 전체)")
     parser.add_argument("--val_ratio",    type=float, default=DEFAULTS["val_ratio"])
     parser.add_argument("--d_model",      type=int,   default=DEFAULTS["d_model"])
     parser.add_argument("--n_heads",      type=int,   default=DEFAULTS["n_heads"])
