@@ -1472,12 +1472,9 @@ def main():
                                         target_fp=args.target_fp, real_seqs=real_seqs)
         elif IS_ENSEMBLE:
             analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, real_seqs=real_seqs)
-        elif run_all:
-            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
-            analysis_correlation()
-            analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-            analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
         else:
+            # 탐지율(분석1)은 항상 실행
+            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
             if args.corr:  analysis_correlation()
             if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
             if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
