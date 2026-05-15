@@ -240,11 +240,9 @@ def build_dataset(args):
         print("  [오류] 정상 CSV 데이터를 찾을 수 없습니다. CSV 파일을 ml/data/ 폴더에 확인하세요.")
         sys.exit(1)
 
-    # ── 스케일러: 정상 데이터에서 직접 계산 후 저장 (seq_len별 분리) ─
-    scaler_path = os.path.join(OUTPUT_DIR, f"scaler_sup_seq{args.seq_len}.json")
+    # ── 스케일러: 정상 데이터에서 직접 계산 (저장은 run_model에서 모델 폴더에)
     mins, maxs = compute_scaler(raw_normal)
-    save_scaler(mins, maxs, scaler_path)
-    print(f"  [스케일러] 정상 데이터 기반으로 계산 → {scaler_path}")
+    print(f"  [스케일러] 정상 데이터 기반으로 계산 완료 (모델 폴더에 저장 예정)")
 
     normal_seqs = [scale_seq(seq, mins, maxs) for seq in raw_normal]
 
@@ -289,7 +287,7 @@ def build_dataset(args):
 
     X_t = torch.tensor(X, dtype=torch.float32)   # (N, T, F)
     y_t = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # (N, 1)
-    return X_t, y_t
+    return X_t, y_t, mins, maxs
 
 
 def make_loaders(X_t, y_t, batch_size: int, val_ratio: float):
@@ -928,7 +926,8 @@ def export_onnx(model, name: str, seq_len: int, device):
     return path
 
 
-def run_model(name: str, model: nn.Module, train_loader, val_loader, args, device):
+def run_model(name: str, model: nn.Module, train_loader, val_loader, args, device,
+              mins=None, maxs=None):
     print(f"\n{'='*60}")
     print(f"  모델: {name.upper()}")
     print(f"{'='*60}")
@@ -999,6 +998,12 @@ def run_model(name: str, model: nn.Module, train_loader, val_loader, args, devic
         f.write(f"# F1: {f1:.4f}\n")
         f.write(f"# val_acc: {val_acc:.4f}\n")
     print(f"  임계값 저장: {thr_path}")
+
+    # 스케일러 저장 (모델 폴더에 함께)
+    if mins is not None and maxs is not None:
+        scaler_path = os.path.join(model_out_dir, f"scaler_sup_{name}_seq{args.seq_len}.json")
+        save_scaler(mins, maxs, scaler_path)
+        print(f"  스케일러 저장: {scaler_path}")
 
     return {"name": name, "f1": f1, "precision": precision,
             "recall": recall, "threshold": best_thr}
@@ -1086,8 +1091,9 @@ def main():
         csv_path, scaler_dict, anom_x, anom_y = build_dataset_streaming(args)
         train_loader, val_loader = make_loaders_streaming(
             csv_path, scaler_dict, anom_x, anom_y, args)
+        mins, maxs = scaler_dict["min"], scaler_dict["max"]
     else:
-        X_t, y_t = build_dataset(args)
+        X_t, y_t, mins, maxs = build_dataset(args)
         train_loader, val_loader = make_loaders(X_t, y_t, args.batch, args.val_ratio)
         print(f"  train: {len(train_loader.dataset):,}  val: {len(val_loader.dataset):,}")
 
@@ -1099,7 +1105,7 @@ def main():
         model = build_model(name, args)
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"\n  파라미터 수: {n_params:,}")
-        res = run_model(name, model, train_loader, val_loader, args, device)
+        res = run_model(name, model, train_loader, val_loader, args, device, mins, maxs)
         results.append(res)
 
     # 최종 요약
