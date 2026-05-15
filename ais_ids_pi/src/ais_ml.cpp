@@ -9,9 +9,10 @@ using json = nlohmann::json;
 
 // ── 생성자 / 소멸자 ───────────────────────────────────────────────
 
-AIS_ML::AIS_ML()
+AIS_ML::AIS_ML(int seq_len)
     : m_env(ORT_LOGGING_LEVEL_WARNING, "ais_ml")
     , m_session(nullptr)
+    , m_seq_len(seq_len > 0 ? seq_len : ML_SEQ_LEN)
     , m_threshold(0.0f)
     , m_loaded(false)
     , m_ensemble_mode(false)
@@ -180,7 +181,7 @@ void AIS_ML::PushFeature(int mmsi,
     };
     auto &seq = m_sequences[mmsi];
     seq.push_back(feat);
-    if ((int)seq.size() > ML_SEQ_LEN)
+    if ((int)seq.size() > m_seq_len)
         seq.pop_front();
 }
 
@@ -191,14 +192,15 @@ float AIS_ML::RunSession(Ort::Session *session,
                           const std::deque<std::array<float, ML_FEATURE_COUNT>> &seq) const
 {
     // 모델별 스케일러로 입력 벡터 구성
+    const int seq_len = m_seq_len;
     std::vector<float> input_data;
-    input_data.reserve(ML_SEQ_LEN * ML_FEATURE_COUNT);
+    input_data.reserve(seq_len * ML_FEATURE_COUNT);
     for (auto &feat : seq) {
         for (int i = 0; i < ML_FEATURE_COUNT; i++)
             input_data.push_back(scaler.scale(i, feat[i]));
     }
 
-    std::vector<int64_t> input_shape = {1, ML_SEQ_LEN, ML_FEATURE_COUNT};
+    std::vector<int64_t> input_shape = {1, seq_len, ML_FEATURE_COUNT};
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtArenaAllocator, OrtMemTypeDefault);
 
@@ -220,7 +222,7 @@ float AIS_ML::RunSession(Ort::Session *session,
         output_names, 1
     );
 
-    const size_t expected_ae = static_cast<size_t>(ML_SEQ_LEN * ML_FEATURE_COUNT);
+    const size_t expected_ae = static_cast<size_t>(seq_len * ML_FEATURE_COUNT);
     const size_t out_count   = output_tensors[0].GetTensorTypeAndShapeInfo().GetElementCount();
     const float *output_data = output_tensors[0].GetTensorData<float>();
 
@@ -247,7 +249,7 @@ bool AIS_ML::DetectAnomaly(int mmsi, float &out_error)
     if (!m_loaded) return false;
 
     auto it = m_sequences.find(mmsi);
-    if (it == m_sequences.end() || (int)it->second.size() < ML_SEQ_LEN)
+    if (it == m_sequences.end() || (int)it->second.size() < m_seq_len)
         return false;
 
     if (m_ensemble_mode) {

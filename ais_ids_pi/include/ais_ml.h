@@ -24,6 +24,7 @@
 //  11  lon_speed         경도 방향 변화율 (도/초)
 #define ML_FEATURE_COUNT 12
 #define ML_SEQ_LEN       10
+#define ML_SEQ_LEN_SHORT  5
 
 struct MLScaler {
     float min_[ML_FEATURE_COUNT];
@@ -45,7 +46,8 @@ struct EnsembleModel {
 
 class AIS_ML {
 public:
-    AIS_ML();
+    // seq_len: 슬라이딩 윈도우 길이 (ML_SEQ_LEN_SHORT=5 또는 ML_SEQ_LEN=10)
+    explicit AIS_ML(int seq_len = ML_SEQ_LEN);
     ~AIS_ML();
 
     // ── 단일 모델 로드 (기존 인터페이스 유지) ────────────────────
@@ -82,6 +84,7 @@ public:
     float  GetThreshold() const { return m_threshold; }
     bool   IsEnsemble()    const { return m_ensemble_mode; }
     size_t GetEnsembleSize() const { return m_ensemble.size(); }
+    int    GetSeqLen()    const { return m_seq_len; }
 
     size_t GetSequenceSize(int mmsi) const {
         auto it = m_sequences.find(mmsi);
@@ -94,6 +97,9 @@ private:
     // ── 공통 ──────────────────────────────────────────────────────
     Ort::Env            m_env;
     Ort::SessionOptions m_session_options;
+
+    // 슬라이딩 윈도우 길이 (생성자에서 고정)
+    int                 m_seq_len;
 
     // 단일 모델 전용 스케일러 (앙상블 모드에서는 EnsembleModel::scaler 사용)
     MLScaler            m_scaler;
