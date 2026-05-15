@@ -222,24 +222,25 @@ def add_derived_features(rows: list) -> list:
 
         # speed_consistency: 실제 이동거리 / SOG 기반 예상 거리
         # 정상 ≈ 1.0 / 위치 조작이나 SOG 허위 보고 시 크게 벗어남
-        # sog=0 이면 정지 중이므로 dist_km 도 0이어야 정상 → 비율 1.0 유지
+        # sog=0 또는 dt=0이면 비율 정의 불가 → 1.0 유지
         try:
-            sog      = float(row["sog"])
-            dt       = float(row["dt"])
-            dist     = float(row["dist_km"])
-            expected = sog * dt / 3600.0 * 1.852
-            row["speed_consistency"] = round(dist / (expected + 1e-6), 4) \
-                                       if sog >= 0.1 else 1.0
+            sog  = float(row["sog"])
+            dt   = float(row["dt"])
+            dist = float(row["dist_km"])
+            if dt > 0.0 and sog >= 0.1:
+                expected = sog * dt / 3600.0 * 1.852
+                row["speed_consistency"] = round(dist / (expected + 1e-6), 4)
+            else:
+                row["speed_consistency"] = 1.0
         except Exception:
             row["speed_consistency"] = 1.0
 
-
         # lat_speed: 위도 변화율 (도/초)
-        # 위도/경도 방향을 분리해서 이동 방향 이상 탐지
+        # dt=0이면 정의 불가 → 0.0 처리
         try:
             dlat = float(row["latitude"]) - float(prev["latitude"])
             dt   = float(row["dt"])
-            row["lat_speed"] = round(dlat / (dt + 1e-6), 6)
+            row["lat_speed"] = round(dlat / dt, 6) if dt > 0.0 else 0.0
         except Exception:
             row["lat_speed"] = 0.0
 
@@ -247,7 +248,7 @@ def add_derived_features(rows: list) -> list:
         try:
             dlon = float(row["longitude"]) - float(prev["longitude"])
             dt   = float(row["dt"])
-            row["lon_speed"] = round(dlon / (dt + 1e-6), 6)
+            row["lon_speed"] = round(dlon / dt, 6) if dt > 0.0 else 0.0
         except Exception:
             row["lon_speed"] = 0.0
 

@@ -1,12 +1,10 @@
 {
   "models": [
-    "model_dcdetect.onnx",
-    "model_tranad.onnx"
+    "model_sup_moderntcn.onnx"
   ],
   "scalers": [
-    "scaler_dcdetect.json",
-    "scaler_tranad.json"
+    "scaler_dcdetect.json"
   ],
-  "threshold": "threshold_weighted_ensemble.txt",
-  "weights": [0.7, 0.3]
+  "threshold": "threshold_sup_moderntcn.txt",
+  "weights": [1.0]
 }

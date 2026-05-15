@@ -1,11 +1,35 @@
 ais_ids_pi/build
 ais_ids_pi/po
 
-ml/threshold.txt
-ml/scaler.json
-ml/model.onnx
+# ml: 데이터 파일 (data/ 디렉터리)
+ml/data/
+
+# ml: 학습 아웃풋 (output/ 디렉터리)
+ml/output/
+
+# 이전 방식 폴백 (ml/ 루트에 남아있는 경우)
 ml/*.csv
+ml/*.onnx
+ml/threshold*.txt
+ml/scaler*.json
+ml/eval_result_*.txt
 
 aivdm_gen/*.csv
 
+# 런타임 생성 파일
+ais_ids_alerts.log
+*.log
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Claude Code 설정
 .claude/
