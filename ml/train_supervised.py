@@ -44,9 +44,13 @@ AIS 이상 탐지 지도 학습 스크립트 (5개 최신 모델)
   python train_supervised.py --model itrans --n_anom 1000 --n_normal 20000
   python train_supervised.py --model all --max_mmsi 200   # MMSI 200개로 제한
 
+입력 데이터:
+  data/*.csv                  정상 AIS 데이터 (CSV)
+
 출력 파일:
-  model_sup_{name}.onnx       ONNX 모델 (input="x" → output="output" 확률 스칼라)
-  threshold_sup_{name}.txt    최적 판정 임계값 (Youden's J 기준)
+  output/scaler_sup.json               지도학습 전용 스케일러 (CSV에서 자동 계산)
+  output/sup_{name}/model_sup_{name}.onnx      ONNX 모델
+  output/sup_{name}/threshold_sup_{name}.txt   최적 판정 임계값 (Youden's J 기준)
 """
 
 import argparse

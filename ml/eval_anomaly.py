@@ -20,10 +20,13 @@ OR 앙상블 평가 (개별 임계값 기준):
     python eval_anomaly.py --weighted dcdetect tranad --weights 0.7 0.3 --target_fp 5.0
     python eval_anomaly.py --weighted dcdetect tranad conv1d --weights 0.6 0.2 0.2
 
+입력 데이터:
+    data/ais-2025-01-25_preprocessed.csv
+
 결과 파일:
-    eval_result_{model}.txt
-    eval_result_{model1}_{model2}_ensemble.txt
-    eval_result_{model1}_{model2}_weighted.txt
+    output/{model}/eval_result_{model}.txt
+    output/ensemble/eval_result_{model1}_{model2}_ensemble.txt
+    output/ensemble/eval_result_{model1}_{model2}_weighted.txt
 """
 
 import argparse
