@@ -7,3 +7,5 @@ ml/model.onnx
 ml/*.csv
 
 aivdm_gen/*.csv
+
+.claude/
