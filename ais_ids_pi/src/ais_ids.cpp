@@ -96,6 +96,17 @@ void ais_ids::to_snapshot(AISTarget &target)
 
         float dt = (float)(cur.rxTime - prev.rxTime);
 
+        // gap 처리: dt > 600초(10분)이면 시퀀스 연속성 깨짐 → deque 리셋 후 스킵
+        if (dt > 600.0f) {
+            ais_ml->ClearSequence(target.mmsi);
+            return;
+        }
+
+        // dt 이상값 처리: 너무 작으면(1초 미만) 동일 메시지 중복 수신으로 간주 → 스킵
+        if (dt < 1.0f) {
+            return;
+        }
+
         double dLat = (cur.lat - prev.lat) * M_PI / 180.0;
         double dLon = (cur.lon - prev.lon) * M_PI / 180.0;
         double a    = std::sin(dLat/2) * std::sin(dLat/2)
