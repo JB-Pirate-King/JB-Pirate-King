@@ -75,9 +75,10 @@ DATA_DIR       = "data"
 MODEL_FILE     = f"{OUTPUT_DIR}/model.onnx"
 SCALER_FILE    = f"{OUTPUT_DIR}/scaler.json"
 THRESHOLD_FILE = f"{OUTPUT_DIR}/threshold.txt"
-DATA_FILE      = f"{DATA_DIR}/ais-2025-01-25_preprocessed.csv"
+DATA_FILE      = f"{DATA_DIR}/ais-2024-01-01_preprocessed.csv"
 SEQ_BREAK_DT   = 600   # 이 시간(초) 이상 간격이면 새 세그먼트로 분리
 _KN_TO_DPS     = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
+_G_N_ANOM      = 500   # 시나리오당 이상 시퀀스 수 (--n_anom으로 덮어씌워짐)
 
 # ── --model 인자로 파일명 자동 설정 ──────────────────────────────
 # python eval_anomaly.py --model usad
@@ -838,7 +839,7 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
     print(f"  목표 오탐율: {target_fp}%")
     print("="*60)
 
-    N_ANOM = 500  # 시나리오당 생성할 이상 시퀀스 수
+    N_ANOM = _G_N_ANOM  # 시나리오당 생성할 이상 시퀀스 수 (--n_anom)
 
     # 정상 시퀀스 스코어 수집
     if real_seqs is not None:
@@ -1377,8 +1378,16 @@ def main():
     parser.add_argument("--perm",   action="store_true")
     parser.add_argument("--output", type=str, default=None,
                         help="텍스트 결과 저장 파일명 (기본: eval_result_{model}.txt)")
+    parser.add_argument("--n_normal", type=int, default=3000,
+                        help="오탐율 계산에 사용할 정상 시퀀스 수 (기본: 3000, 0=전체)")
+    parser.add_argument("--n_anom", type=int, default=500,
+                        help="시나리오당 생성할 이상 시퀀스 수 (기본: 500)")
     args = parser.parse_args()
     run_all = not any([args.corr, args.recon, args.perm])
+
+    # 전역으로 노출 (함수 내부 N_ANOM 하드코딩 대체용)
+    global _G_N_ANOM
+    _G_N_ANOM = args.n_anom
 
     # output 기본값: 모델명 포함
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1447,7 +1456,8 @@ def main():
             print("  ⚠ matplotlib 없음 - 그래프 저장 건너뜀 (pip install matplotlib)")
 
         print("\n실제 정상 시퀀스 로드 중...")
-        real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=3000)
+        _n_normal = None if args.n_normal == 0 else args.n_normal
+        real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=_n_normal)
         if real_seqs is None:
             print(f"  ⚠ {DATA_FILE} 없음 - 합성 정상 시퀀스 사용")
 
