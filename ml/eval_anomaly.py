@@ -1375,9 +1375,10 @@ def main():
     parser.add_argument("--ensemble", type=str, nargs="+", default=None,
                         metavar="MODEL", choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"],
                         help="앙상블 모델 목록 (예: --ensemble conv1d tranad)")
-    parser.add_argument("--corr",   action="store_true")
-    parser.add_argument("--recon",  action="store_true")
-    parser.add_argument("--perm",   action="store_true")
+    parser.add_argument("--corr",   action="store_true", help="[분석 2] 피처 상관행렬")
+    parser.add_argument("--recon",  action="store_true", help="[분석 3] 재구성 오차 분해")
+    parser.add_argument("--perm",   action="store_true", help="[분석 4] Permutation Importance")
+    parser.add_argument("--all",    action="store_true", help="분석 1~4 전부 실행")
     parser.add_argument("--output", type=str, default=None,
                         help="텍스트 결과 저장 파일명 (기본: eval_result_{model}.txt)")
     parser.add_argument("--n_normal", type=int, default=3000,
@@ -1385,7 +1386,10 @@ def main():
     parser.add_argument("--n_anom", type=int, default=500,
                         help="시나리오당 생성할 이상 시퀀스 수 (기본: 500)")
     args = parser.parse_args()
-    run_all = not any([args.corr, args.recon, args.perm])
+    # --all 이면 전부, 아무것도 없으면 탐지율만(분석1), 개별 플래그 우선
+    if args.all:
+        args.corr = args.recon = args.perm = True
+    run_all = args.all
 
     # 전역으로 노출 (함수 내부 N_ANOM 하드코딩 대체용)
     global _G_N_ANOM
