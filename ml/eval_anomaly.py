@@ -29,6 +29,7 @@ OR 앙상블 평가 (개별 임계값 기준):
 import argparse
 import json
 import math
+import os
 import random
 import numpy as np
 import onnxruntime as ort
@@ -66,10 +67,12 @@ FEATURES = [
     "lat_speed", "lon_speed",
 ]
 SEQ_LEN        = 10
-MODEL_FILE     = "model.onnx"
-SCALER_FILE    = "scaler.json"
-THRESHOLD_FILE = "threshold.txt"
-DATA_FILE      = "ais-2025-01-25_preprocessed.csv"
+OUTPUT_DIR     = "output"
+DATA_DIR       = "data"
+MODEL_FILE     = f"{OUTPUT_DIR}/model.onnx"
+SCALER_FILE    = f"{OUTPUT_DIR}/scaler.json"
+THRESHOLD_FILE = f"{OUTPUT_DIR}/threshold.txt"
+DATA_FILE      = f"{DATA_DIR}/ais-2025-01-25_preprocessed.csv"
 SEQ_BREAK_DT   = 600   # 이 시간(초) 이상 간격이면 새 세그먼트로 분리
 _KN_TO_DPS     = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
 
@@ -89,13 +92,14 @@ _pre = argparse.ArgumentParser(add_help=False)
 _pre.add_argument("--model", type=str, default=None)  # choices 검증 없이 받음
 _args_pre, _ = _pre.parse_known_args()
 if _args_pre.model and _args_pre.model in _KNOWN_MODELS:
-    MODEL_FILE     = f"model_{_args_pre.model}.onnx"
-    # 지도 학습 모델은 공유 스케일러(scaler_dcdetect.json) 사용
+    _mdir = os.path.join(OUTPUT_DIR, _args_pre.model)
+    MODEL_FILE     = os.path.join(_mdir, f"model_{_args_pre.model}.onnx")
+    THRESHOLD_FILE = os.path.join(_mdir, f"threshold_{_args_pre.model}.txt")
+    # 지도 학습 모델은 전용 스케일러(scaler_sup.json) 사용
     if _args_pre.model in _SUP_MODELS:
-        SCALER_FILE = "scaler_dcdetect.json"
+        SCALER_FILE = os.path.join(OUTPUT_DIR, "scaler_sup.json")
     else:
-        SCALER_FILE = f"scaler_{_args_pre.model}.json"
-    THRESHOLD_FILE = f"threshold_{_args_pre.model}.txt"
+        SCALER_FILE = os.path.join(OUTPUT_DIR, f"scaler_{_args_pre.model}.json")
 
 IS_SUPERVISED = MODEL_FILE.startswith("model_sup_")
 
@@ -903,7 +907,7 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
     print("\n→ 가중 앙상블: score = " +
           " + ".join(f"{w:.2f}×MSE({n})" for w,n in zip(weights, model_names)))
     print(f"→ 임계값 저장: threshold_weighted_ensemble.txt")
-    with open("threshold_weighted_ensemble.txt", "w") as f:
+    with open(f"{OUTPUT_DIR}/threshold_weighted_ensemble.txt", "w") as f:
         f.write(f"{thr}\n# weights: {dict(zip(model_names, weights))}")
 
 # ══════════════════════════════════════════════════════════════════
@@ -1358,13 +1362,20 @@ def main():
     run_all = not any([args.corr, args.recon, args.perm])
 
     # output 기본값: 모델명 포함
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR,   exist_ok=True)
+
     if args.output is None:
         if args.weighted:
-            args.output = f"eval_result_{'_'.join(args.weighted)}_weighted.txt"
+            args.output = os.path.join(OUTPUT_DIR, "ensemble",
+                                       f"eval_result_{'_'.join(args.weighted)}_weighted.txt")
         elif args.ensemble:
-            args.output = f"eval_result_{'_'.join(args.ensemble)}_ensemble.txt"
+            args.output = os.path.join(OUTPUT_DIR, "ensemble",
+                                       f"eval_result_{'_'.join(args.ensemble)}_ensemble.txt")
         else:
-            args.output = f"eval_result_{args.model or 'lstm'}.txt"
+            _m = args.model or "lstm"
+            args.output = os.path.join(OUTPUT_DIR, _m, f"eval_result_{_m}.txt")
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     # ── 앙상블 모드 ──────────────────────────────────────────────
     # python eval_anomaly.py --ensemble conv1d tranad
@@ -1376,8 +1387,8 @@ def main():
         model_names = args.weighted
         w_sessions, w_scalers = [], []
         for name in model_names:
-            w_sessions.append(ort.InferenceSession(f"model_{name}.onnx", providers=["CPUExecutionProvider"]))
-            w_scalers.append(load_scaler(f"scaler_{name}.json"))
+            w_sessions.append(ort.InferenceSession(os.path.join(OUTPUT_DIR, name, f"model_{name}.onnx"), providers=["CPUExecutionProvider"]))
+            w_scalers.append(load_scaler(os.path.join(OUTPUT_DIR, f"scaler_{name}.json")))
         mins, maxs = w_scalers[0]
         n_models = len(model_names)
         weights = args.weights if args.weights and len(args.weights)==n_models                   else [1.0/n_models]*n_models
@@ -1388,10 +1399,10 @@ def main():
         model_names = args.ensemble
         sessions, thresholds, scalers = [], [], []
         for name in model_names:
-            sessions.append(ort.InferenceSession(f"model_{name}.onnx", providers=["CPUExecutionProvider"]))
-            with open(f"threshold_{name}.txt") as f:
+            sessions.append(ort.InferenceSession(os.path.join(OUTPUT_DIR, name, f"model_{name}.onnx"), providers=["CPUExecutionProvider"]))
+            with open(os.path.join(OUTPUT_DIR, name, f"threshold_{name}.txt")) as f:
                 thresholds.append(float(f.read()))
-            scalers.append(load_scaler(f"scaler_{name}.json"))
+            scalers.append(load_scaler(os.path.join(OUTPUT_DIR, f"scaler_{name}.json")))
         mins, maxs = scalers[0]
     else:
         mins, maxs = load_scaler(SCALER_FILE)
