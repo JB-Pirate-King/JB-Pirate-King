@@ -1089,7 +1089,7 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
         print("  " + "임계값".rjust(12) + "오탐율".rjust(9) +
               "".join(rjust(n,16) for n,_ in anom_list))
         print("  " + "─"*(12+9+16*len(anom_list)))
-        for pct in [99,98,97,95,90]:
+        for pct in [99.9, 99.5, 99,98,97,95,90]:
             thr = np.percentile(ne, pct)
             fp  = np.sum(ne>thr)/N_ne*100
             row = rjust(f"{thr:.6f}",12) + rjust(f"{fp:.1f}%",9)
