@@ -305,6 +305,13 @@ if (NOT OCPN_FLATPAK_CONFIG)
       DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/opencpn
   )
 
+  # ML 모델 data 파일 설치 (data/ 폴더가 있을 때만)
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/data)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data/
+        DESTINATION ${CMAKE_INSTALL_PREFIX}/share/opencpn/plugins/ais_ids_pi/data
+    )
+  endif()
+
 endif (NOT OCPN_FLATPAK_CONFIG)
 
 add_definitions(-DTIXML_USE_STL)
