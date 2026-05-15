@@ -208,8 +208,11 @@ float AIS_ML::RunSession(Ort::Session *session,
         input_shape.data(), input_shape.size()
     );
 
-    const char *input_names[]  = {"x"};
-    const char *output_names[] = {"output"};
+    Ort::AllocatorWithDefaultOptions alloc;
+    auto in_name_ptr  = session->GetInputNameAllocated(0, alloc);
+    auto out_name_ptr = session->GetOutputNameAllocated(0, alloc);
+    const char *input_names[]  = {in_name_ptr.get()};
+    const char *output_names[] = {out_name_ptr.get()};
 
     auto output_tensors = session->Run(
         Ort::RunOptions{nullptr},
@@ -217,14 +220,24 @@ float AIS_ML::RunSession(Ort::Session *session,
         output_names, 1
     );
 
+    const size_t expected_ae = static_cast<size_t>(ML_SEQ_LEN * ML_FEATURE_COUNT);
+    const size_t out_count   = output_tensors[0].GetTensorTypeAndShapeInfo().GetElementCount();
     const float *output_data = output_tensors[0].GetTensorData<float>();
-    float mse = 0.0f;
-    int n = ML_SEQ_LEN * ML_FEATURE_COUNT;
-    for (int i = 0; i < n; i++) {
-        float diff = output_data[i] - input_data[i];
-        mse += diff * diff;
+
+    if (out_count == 1) {
+        // 지도 학습 분류기: sigmoid 확률 그대로 반환
+        return output_data[0];
+    } else if (out_count == expected_ae) {
+        // 비지도 오토인코더: MSE 재구성 오차
+        float mse = 0.0f;
+        for (size_t i = 0; i < expected_ae; i++) {
+            float diff = output_data[i] - input_data[i];
+            mse += diff * diff;
+        }
+        return mse / static_cast<float>(expected_ae);
+    } else {
+        return 0.0f;
     }
-    return mse / static_cast<float>(n);
 }
 
 // ── 이상 탐지 (단일 / 앙상블 자동 분기) ─────────────────────────
