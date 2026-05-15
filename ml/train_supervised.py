@@ -908,6 +908,9 @@ def find_best_threshold(probs, labels):
 
 
 def export_onnx(model, name: str, seq_len: int, device):
+    import onnx
+    import tempfile
+
     model.eval()
     wrapped = SigmoidWrapper(model).to(device)
     wrapped.eval()
@@ -915,14 +918,22 @@ def export_onnx(model, name: str, seq_len: int, device):
     seq_len = dummy.shape[1]
     model_out_dir = os.path.join(OUTPUT_DIR, f"sup_{name}_seq{seq_len}")
     os.makedirs(model_out_dir, exist_ok=True)
-    path  = os.path.join(model_out_dir, f"model_sup_{name}_seq{seq_len}.onnx")
-    torch.onnx.export(
-        wrapped, dummy, path,
-        input_names=["x"],
-        output_names=["output"],
-        opset_version=18,
-        dynamic_axes={"x": {0: "batch"}, "output": {0: "batch"}},
-    )
+    path = os.path.join(model_out_dir, f"model_sup_{name}_seq{seq_len}.onnx")
+
+    # 임시 경로에 export 후 단일 파일로 재저장 (.onnx.data 분리 방지)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = os.path.join(tmp_dir, "model_tmp.onnx")
+        torch.onnx.export(
+            wrapped, dummy, tmp_path,
+            input_names=["x"],
+            output_names=["output"],
+            opset_version=18,
+            dynamic_axes={"x": {0: "batch"}, "output": {0: "batch"}},
+        )
+        # external data를 인라인으로 합쳐 단일 .onnx 파일로 저장
+        onnx_model = onnx.load(tmp_path, load_external_data=True)
+        onnx.save_model(onnx_model, path, save_as_external_data=False)
+
     return path
 
 
