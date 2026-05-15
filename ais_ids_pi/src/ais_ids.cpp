@@ -288,8 +288,6 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
     if (latest.sog > 1.0 && dt_sec > 0) {
         double expected_km = latest.sog * dt_sec / 3600.0 * 1.852;
         if (expected_km > 0.001) {
-            // dist 계산은 history에 있어야 하므로 lat/lon 필요
-            // 근사: lat/lon 차이로 dist 계산
             double dlat = latest.lat - prev.lat;
             double dlon = latest.lon - prev.lon;
             double dist_km = std::sqrt(dlat*dlat + dlon*dlon) * 111.0;
@@ -299,6 +297,17 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
                     "[규칙] 속도-거리 불일치 (MMSI: %d) (비율: %.1f배)",
                     mmsi, ratio);
         }
+    }
+
+    // 8. SOG=0 보고인데 실제 이동 (SOG < 0.3kn, dist > 0.05km, dt < 120s)
+    if (latest.sog < 0.3 && dt_sec > 0 && dt_sec < 120.0) {
+        double dlat = latest.lat - prev.lat;
+        double dlon = latest.lon - prev.lon;
+        double dist_km = std::sqrt(dlat*dlat + dlon*dlon) * 111.0;
+        if (dist_km > 0.05)
+            return wxString::Format(
+                "[규칙] SOG=0 실제이동 (MMSI: %d) (SOG: %.2f kn, 이동: %.3f km)",
+                mmsi, latest.sog, dist_km);
     }
 
     // ── 8a. ML 조기 탐지 (seq5) ────────────────────────────────────
