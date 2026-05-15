@@ -79,8 +79,8 @@ FEATURES = [
     "speed_consistency",
     "lat_speed", "lon_speed",
 ]
-SEQ_LEN        = 10
 N_FEAT         = len(FEATURES)   # 12
+SEQ_LEN        = 10              # 모델 클래스 기본값용 (실제 학습은 --seq_len 인자 사용)
 SEED           = 42
 SEQ_BREAK_DT   = 600
 SCALER_SUP     = "output/scaler_sup.json"   # 지도 학습 전용 스케일러
@@ -95,6 +95,7 @@ DEFAULTS = {
     "epochs":    40,
     "lr":        3e-4,
     "batch":     128,
+    "seq_len":   10,     # 시퀀스 길이 (5 또는 10)
     "n_anom":    None,   # 시나리오당 이상 시퀀스 수 (None=정상 수 기준 자동)
     "n_normal":  15000,  # 정상 시퀀스 최대 수
     "val_ratio": 0.15,
@@ -144,8 +145,8 @@ def scale_seq(seq, mins, maxs) -> list:
 # 데이터 파이프라인
 # ══════════════════════════════════════════════════════════════════
 
-def load_normal_from_csv(path: str, max_seqs: int = 15000,
-                         max_mmsi: int = None) -> list:
+def load_normal_from_csv(path: str, seq_len: int = 10,
+                         max_seqs: int = 15000, max_mmsi: int = None) -> list:
     """CSV에서 raw(스케일링 전) 정상 시퀀스 로드"""
     if not os.path.exists(path):
         return []
@@ -180,10 +181,10 @@ def load_normal_from_csv(path: str, max_seqs: int = 15000,
                 current.append(rec)
         seg.append(current)
         for s in seg:
-            if len(s) < SEQ_LEN:
+            if len(s) < seq_len:
                 continue
-            for i in range(len(s) - SEQ_LEN + 1):
-                all_seqs.append(s[i:i + SEQ_LEN])
+            for i in range(len(s) - seq_len + 1):
+                all_seqs.append(s[i:i + seq_len])
 
     random.shuffle(all_seqs)
     sampled = all_seqs[:max_seqs]
@@ -209,6 +210,7 @@ def build_dataset(args):
     for cand in csv_candidates:
         raw_normal = load_normal_from_csv(
             cand,
+            seq_len=args.seq_len,
             max_seqs=args.n_normal,
             max_mmsi=args.max_mmsi,
         )
@@ -243,6 +245,8 @@ def build_dataset(args):
         for _ in range(n_anom):
             try:
                 seq = maker()
+                # seq_len에 맞게 슬라이싱 (뒤에서 자름)
+                seq = seq[-args.seq_len:]
                 anom_seqs.append(scale_seq(seq, mins, maxs))
             except Exception:
                 pass
@@ -675,14 +679,15 @@ def find_best_threshold(probs, labels):
     return best_thr, best_j
 
 
-def export_onnx(model, name: str, device):
+def export_onnx(model, name: str, seq_len: int, device):
     model.eval()
     wrapped = SigmoidWrapper(model).to(device)
     wrapped.eval()
-    dummy = torch.zeros(1, SEQ_LEN, N_FEAT, device=device)
-    model_out_dir = os.path.join(OUTPUT_DIR, f"sup_{name}")
+    dummy = torch.zeros(1, seq_len, N_FEAT, device=device)
+    seq_len = dummy.shape[1]
+    model_out_dir = os.path.join(OUTPUT_DIR, f"sup_{name}_seq{seq_len}")
     os.makedirs(model_out_dir, exist_ok=True)
-    path  = os.path.join(model_out_dir, f"model_sup_{name}.onnx")
+    path  = os.path.join(model_out_dir, f"model_sup_{name}_seq{seq_len}.onnx")
     torch.onnx.export(
         wrapped, dummy, path,
         input_names=["x"],
@@ -750,13 +755,13 @@ def run_model(name: str, model: nn.Module, train_loader, val_loader, args, devic
     print(f"  Precision={precision:.3f}  Recall={recall:.3f}  F1={f1:.3f}")
 
     # ONNX export
-    onnx_path = export_onnx(model, name, device)
+    onnx_path = export_onnx(model, name, args.seq_len, device)
     print(f"  ONNX 저장: {onnx_path}")
 
     # 임계값 저장
-    model_out_dir = os.path.join(OUTPUT_DIR, f"sup_{name}")
+    model_out_dir = os.path.join(OUTPUT_DIR, f"sup_{name}_seq{args.seq_len}")
     os.makedirs(model_out_dir, exist_ok=True)
-    thr_path = os.path.join(model_out_dir, f"threshold_sup_{name}.txt")
+    thr_path = os.path.join(model_out_dir, f"threshold_sup_{name}_seq{args.seq_len}.txt")
     with open(thr_path, "w") as f:
         f.write(f"{best_thr:.6f}\n")
         f.write(f"# model: {name}\n")
@@ -774,23 +779,24 @@ def run_model(name: str, model: nn.Module, train_loader, val_loader, args, devic
 # ══════════════════════════════════════════════════════════════════
 
 def build_model(name: str, args) -> nn.Module:
-    d = args.d_model
-    h = args.n_heads
-    l = args.n_layers
+    d  = args.d_model
+    h  = args.n_heads
+    l  = args.n_layers
     dr = args.dropout
+    sl = args.seq_len
     if name == "patchtst":
-        return PatchTST(SEQ_LEN, N_FEAT, patch_len=2, stride=2,
+        return PatchTST(sl, N_FEAT, patch_len=2, stride=2,
                         d_model=d, n_heads=h, n_layers=l, dropout=dr)
     elif name == "itrans":
-        return iTransformer(SEQ_LEN, N_FEAT, d_model=d, n_heads=h,
+        return iTransformer(sl, N_FEAT, d_model=d, n_heads=h,
                             n_layers=l, dropout=dr)
     elif name == "tsmixer":
-        return TSMixer(SEQ_LEN, N_FEAT, n_layers=max(l, 4), dropout=dr, d_hidden=d)
+        return TSMixer(sl, N_FEAT, n_layers=max(l, 4), dropout=dr, d_hidden=d)
     elif name == "moderntcn":
-        return ModernTCN(SEQ_LEN, N_FEAT, d_model=d, n_layers=l,
+        return ModernTCN(sl, N_FEAT, d_model=d, n_layers=l,
                          kernel_size=7, dropout=dr)
     elif name == "mamba":
-        return Mamba(SEQ_LEN, N_FEAT, d_model=d, d_state=16,
+        return Mamba(sl, N_FEAT, d_model=d, d_state=16,
                      n_layers=l, dropout=dr)
     else:
         raise ValueError(f"알 수 없는 모델: {name}")
@@ -808,6 +814,9 @@ def main():
     parser.add_argument("--model", type=str, default="all",
                         choices=ALL_MODELS + ["all"],
                         help="학습할 모델 (default: all)")
+    parser.add_argument("--seq_len",      type=int,   default=DEFAULTS["seq_len"],
+                        choices=[5, 10],
+                        help="시퀀스 길이 (5 또는 10, default: 10)")
     parser.add_argument("--epochs",       type=int,   default=DEFAULTS["epochs"])
     parser.add_argument("--lr",           type=float, default=DEFAULTS["lr"])
     parser.add_argument("--batch",        type=int,   default=DEFAULTS["batch"])
