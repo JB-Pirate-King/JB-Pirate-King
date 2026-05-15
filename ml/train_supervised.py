@@ -44,9 +44,13 @@ AIS 이상 탐지 지도 학습 스크립트 (5개 최신 모델)
   python train_supervised.py --model itrans --n_anom 1000 --n_normal 20000
   python train_supervised.py --model all --max_mmsi 200   # MMSI 200개로 제한
 
+입력 데이터:
+  data/*.csv                  정상 AIS 데이터 (CSV)
+
 출력 파일:
-  model_sup_{name}.onnx       ONNX 모델 (input="x" → output="output" 확률 스칼라)
-  threshold_sup_{name}.txt    최적 판정 임계값 (Youden's J 기준)
+  output/scaler_sup.json               지도학습 전용 스케일러 (CSV에서 자동 계산)
+  output/sup_{name}/model_sup_{name}.onnx      ONNX 모델
+  output/sup_{name}/threshold_sup_{name}.txt   최적 판정 임계값 (Youden's J 기준)
 """
 
 import argparse
@@ -79,7 +83,9 @@ SEQ_LEN        = 10
 N_FEAT         = len(FEATURES)   # 12
 SEED           = 42
 SEQ_BREAK_DT   = 600
-SCALER_SOURCE  = "scaler_dcdetect.json"   # 재사용할 기존 스케일러
+SCALER_SUP     = "output/scaler_sup.json"   # 지도 학습 전용 스케일러
+OUTPUT_DIR     = "output"   # 모델·임계값 출력 디렉터리
+DATA_DIR       = "data"     # CSV 입력 데이터 디렉터리
 
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -107,9 +113,20 @@ DEFAULTS = {
 def load_scaler(path: str):
     with open(path) as f:
         j = json.load(f)
-    mins = j["min"]
-    maxs = j["max"]
+    return j["min"], j["max"]
+
+def compute_scaler(raw_seqs: list):
+    """raw 시퀀스 리스트에서 피처별 min/max 계산"""
+    all_rows = [row for seq in raw_seqs for row in seq]
+    arr = np.array(all_rows, dtype=np.float32)
+    mins = arr.min(axis=0).tolist()
+    maxs = arr.max(axis=0).tolist()
     return mins, maxs
+
+def save_scaler(mins, maxs, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"min": mins, "max": maxs}, f, indent=2)
 
 def scale_seq(seq, mins, maxs) -> list:
     out = []
@@ -127,8 +144,9 @@ def scale_seq(seq, mins, maxs) -> list:
 # 데이터 파이프라인
 # ══════════════════════════════════════════════════════════════════
 
-def load_normal_from_csv(path: str, mins, maxs,
-                         max_seqs: int = 15000, max_mmsi: int = None) -> list:
+def load_normal_from_csv(path: str, max_seqs: int = 15000,
+                         max_mmsi: int = None) -> list:
+    """CSV에서 raw(스케일링 전) 정상 시퀀스 로드"""
     if not os.path.exists(path):
         return []
     print(f"  [정상] CSV 로드: {path}")
@@ -169,35 +187,44 @@ def load_normal_from_csv(path: str, mins, maxs,
 
     random.shuffle(all_seqs)
     sampled = all_seqs[:max_seqs]
-    scaled  = [scale_seq(seq, mins, maxs) for seq in sampled]
     mmsi_info = f"{len(mmsis):,}개 MMSI" + (f" (전체 {len(mmsi_data):,}개 중)" if max_mmsi else "")
-    print(f"    → {len(scaled):,}개 ({mmsi_info}, 전체 풀: {len(all_seqs):,})")
-    return scaled
+    print(f"    → {len(sampled):,}개 ({mmsi_info}, 전체 풀: {len(all_seqs):,})")
+    return sampled
 
 
-def build_dataset(args, mins, maxs):
+def build_dataset(args):
     from eval_anomaly import SCENARIO_MAKERS
 
-    # ── 정상 시퀀스: CSV 실데이터만 사용 (먼저 로드) ────────────
+    # ── 정상 시퀀스: CSV 실데이터 로드 (raw) ────────────────────
     csv_candidates = [
+        f"{DATA_DIR}/ais_preprocessed.csv",
+        f"{DATA_DIR}/ais-2024-01-01_preprocessed.csv",
+        f"{DATA_DIR}/ais-2025-01-25_preprocessed.csv",
+        f"{DATA_DIR}/ais-2025-12-31_preprocessed.csv",
+        # 현재 디렉터리 폴백 (이전 방식 호환)
         "ais_preprocessed.csv",
-        "ais-2024-01-01_preprocessed.csv",
         "ais-2025-01-25_preprocessed.csv",
-        "ais-2025-12-31_preprocessed.csv",
     ]
-    normal_seqs = []
+    raw_normal = []
     for cand in csv_candidates:
-        normal_seqs = load_normal_from_csv(
-            cand, mins, maxs,
+        raw_normal = load_normal_from_csv(
+            cand,
             max_seqs=args.n_normal,
             max_mmsi=args.max_mmsi,
         )
-        if normal_seqs:
+        if raw_normal:
             break
 
-    if not normal_seqs:
-        print("  [오류] 정상 CSV 데이터를 찾을 수 없습니다. CSV 파일을 ml/ 폴더에 확인하세요.")
+    if not raw_normal:
+        print("  [오류] 정상 CSV 데이터를 찾을 수 없습니다. CSV 파일을 ml/data/ 폴더에 확인하세요.")
         sys.exit(1)
+
+    # ── 스케일러: 정상 데이터에서 직접 계산 후 저장 ─────────────
+    mins, maxs = compute_scaler(raw_normal)
+    save_scaler(mins, maxs, SCALER_SUP)
+    print(f"  [스케일러] 정상 데이터 기반으로 계산 → {SCALER_SUP}")
+
+    normal_seqs = [scale_seq(seq, mins, maxs) for seq in raw_normal]
 
     # ── 이상 시퀀스 생성 (홀드아웃 제외, 정상 수에 비례) ─────────
     anom_makers = [(name, maker) for name, maker, is_anom, is_holdout
@@ -653,7 +680,9 @@ def export_onnx(model, name: str, device):
     wrapped = SigmoidWrapper(model).to(device)
     wrapped.eval()
     dummy = torch.zeros(1, SEQ_LEN, N_FEAT, device=device)
-    path  = f"model_sup_{name}.onnx"
+    model_out_dir = os.path.join(OUTPUT_DIR, f"sup_{name}")
+    os.makedirs(model_out_dir, exist_ok=True)
+    path  = os.path.join(model_out_dir, f"model_sup_{name}.onnx")
     torch.onnx.export(
         wrapped, dummy, path,
         input_names=["x"],
@@ -725,7 +754,9 @@ def run_model(name: str, model: nn.Module, train_loader, val_loader, args, devic
     print(f"  ONNX 저장: {onnx_path}")
 
     # 임계값 저장
-    thr_path = f"threshold_sup_{name}.txt"
+    model_out_dir = os.path.join(OUTPUT_DIR, f"sup_{name}")
+    os.makedirs(model_out_dir, exist_ok=True)
+    thr_path = os.path.join(model_out_dir, f"threshold_sup_{name}.txt")
     with open(thr_path, "w") as f:
         f.write(f"{best_thr:.6f}\n")
         f.write(f"# model: {name}\n")
@@ -792,11 +823,13 @@ def main():
     parser.add_argument("--n_layers",     type=int,   default=DEFAULTS["n_layers"])
     parser.add_argument("--dropout",      type=float, default=DEFAULTS["dropout"])
     parser.add_argument("--weight_decay", type=float, default=DEFAULTS["weight_decay"])
-    parser.add_argument("--scaler",       type=str,   default=SCALER_SOURCE,
-                        help="재사용할 스케일러 JSON 경로")
     parser.add_argument("--device",       type=str,   default="auto",
                         help="cuda / cpu / auto")
     args = parser.parse_args()
+
+    # 출력/데이터 디렉터리 생성
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR,   exist_ok=True)
 
     # 디바이스 설정
     if args.device == "auto":
@@ -805,23 +838,9 @@ def main():
         device = torch.device(args.device)
     print(f"[디바이스] {device}")
 
-    # 스케일러 로드
-    if not os.path.exists(args.scaler):
-        # 대체 스케일러 탐색
-        for alt in ["scaler_tranad.json", "scaler_conv1d.json", "scaler.json"]:
-            if os.path.exists(alt):
-                args.scaler = alt
-                break
-        else:
-            print(f"[오류] 스케일러 파일을 찾을 수 없습니다: {args.scaler}")
-            print("  먼저 비지도 모델을 학습하거나 --scaler 옵션으로 경로를 지정하세요.")
-            sys.exit(1)
-    print(f"[스케일러] {args.scaler}")
-    mins, maxs = load_scaler(args.scaler)
-
-    # 데이터 준비
+    # 데이터 준비 (스케일러는 CSV에서 자동 계산)
     print("\n[데이터 준비]")
-    X_t, y_t = build_dataset(args, mins, maxs)
+    X_t, y_t = build_dataset(args)
     train_loader, val_loader = make_loaders(X_t, y_t, args.batch, args.val_ratio)
     print(f"  train: {len(train_loader.dataset):,}  val: {len(val_loader.dataset):,}")
 
