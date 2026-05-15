@@ -648,11 +648,13 @@ def make_traj_stitch_seq():
     hdg_a = random.uniform(0, 360)
     hdg_b = (hdg_a + random.uniform(120, 240)) % 360
     sog = random.uniform(8, 15)
-    stitch_steps = random.randint(3, 5)
+    max_stitch = max(2, SEQ_LEN - 3)   # switch_at(≥2) + stitch + 최소 1스텝
+    stitch_steps = random.randint(2, max_stitch)
     lat = 37. + random.uniform(-0.05, 0.05)
     lon = 126. + random.uniform(-0.05, 0.05)
     cog = hdg_a
-    switch_at = random.randint(2, SEQ_LEN - stitch_steps - 1)
+    hi = max(2, SEQ_LEN - stitch_steps - 1)
+    switch_at = random.randint(1, hi)
     steps = []
     for i in range(SEQ_LEN):
         dt = random.uniform(10, 25)
