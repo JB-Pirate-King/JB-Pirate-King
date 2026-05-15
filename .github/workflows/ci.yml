@@ -26,7 +26,7 @@ jobs:
           python-version: "3.11"
 
       - name: 의존성 설치
-        run: pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+        run: pip install numpy torch tqdm --index-url https://download.pytorch.org/whl/cpu
 
       - name: 문법 검사 (py_compile)
         run: |
@@ -54,8 +54,9 @@ jobs:
           EOF
 
   # ────────────────────────────────────────────────────────────────
-  # Job 2: C++ 핵심 파일 실제 컴파일 (ais_ml.cpp, ais_ids.cpp)
-  #   - ocpn_plugin.h 불필요 파일만 대상
+  # Job 2: C++ 핵심 파일 실제 컴파일 (ais_ml.cpp)
+  #   - ais_ml.cpp: ocpn_plugin.h 불필요 → fsyntax-only 가능
+  #   - ais_ids.cpp: ais_ids.h → ocpn_plugin.h 의존 → cppcheck 대상
   #   - onnxruntime 헤더는 레포 내 포함 (ais_ids_pi/onnxruntime/include)
   # ────────────────────────────────────────────────────────────────
   cpp-compile:
@@ -77,14 +78,6 @@ jobs:
             -I ais_ids_pi/onnxruntime/include \
             ais_ids_pi/src/ais_ml.cpp \
             && echo "✅ ais_ml.cpp 컴파일 통과"
-
-      - name: ais_ids.cpp 컴파일
-        run: |
-          g++ -std=c++17 -fsyntax-only \
-            -I ais_ids_pi/include \
-            -I ais_ids_pi/onnxruntime/include \
-            ais_ids_pi/src/ais_ids.cpp \
-            && echo "✅ ais_ids.cpp 컴파일 통과"
 
   # ────────────────────────────────────────────────────────────────
   # Job 3: C++ 정적 분석 (cppcheck) — ocpn_plugin.h 의존 파일 포함
