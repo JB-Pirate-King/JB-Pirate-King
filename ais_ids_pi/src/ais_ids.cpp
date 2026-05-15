@@ -247,8 +247,8 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
             "[규칙] 정박/계류 중 이동 (MMSI: %d) (NavStatus: %d) (SOG: %.1f kn)",
             mmsi, latest.navStatus, latest.sog);
 
-    // 3. COG/HDG 심각 불일치 (둘 다 유효한 경우만)
-    if (latest.cog < 360.0 && latest.hdg < 511) {
+    // 3. COG/HDG 심각 불일치 (둘 다 유효 + SOG >= 2.0kn, 저속시 COG 무의미)
+    if (latest.cog < 360.0 && latest.hdg < 511 && latest.sog >= 2.0) {
         double diff = std::abs(latest.cog - (double)latest.hdg);
         if (diff > 180.0) diff = 360.0 - diff;
         if (diff > 90.0)
@@ -257,8 +257,49 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
                 mmsi, latest.cog, latest.hdg, diff);
     }
 
+    // 4. 물리적 속도 초과 (선종 무관, 50kn 이상은 물리적으로 불가)
+    if (latest.sog < 102.2 && latest.sog > 50.0)
+        return wxString::Format(
+            "[규칙] 물리적 속도 초과 (MMSI: %d) (SOG: %.1f kn)",
+            mmsi, latest.sog);
+
     // ── 이전 기록 없으면 규칙만 적용 ─────────────────────────
     if (history.size() < 2) return wxEmptyString;
+
+    const auto &prev = history[history.size() - 2];
+    double dt_sec = latest.timestamp - prev.timestamp;
+
+    // 5. 순간 SOG 급변 (한 보고 주기 내 15kn 이상 변화)
+    if (dt_sec > 0 && dt_sec < 120.0) {
+        double sog_change = std::abs(latest.sog - prev.sog);
+        if (sog_change > 15.0)
+            return wxString::Format(
+                "[규칙] SOG 급변 (MMSI: %d) (Δ%.1f kn / %.0fs)",
+                mmsi, sog_change, dt_sec);
+    }
+
+    // 6. 신호 간격 이상 (10분 이상 소실 후 재등장)
+    if (dt_sec > 600.0)
+        return wxString::Format(
+            "[규칙] 신호 간격 이상 (MMSI: %d) (%.0f초 공백)",
+            mmsi, dt_sec);
+
+    // 7. 속도-거리 불일치 (보고 SOG 대비 실제 이동거리 10배 이상)
+    if (latest.sog > 1.0 && dt_sec > 0) {
+        double expected_km = latest.sog * dt_sec / 3600.0 * 1.852;
+        if (expected_km > 0.001) {
+            // dist 계산은 history에 있어야 하므로 lat/lon 필요
+            // 근사: lat/lon 차이로 dist 계산
+            double dlat = latest.lat - prev.lat;
+            double dlon = latest.lon - prev.lon;
+            double dist_km = std::sqrt(dlat*dlat + dlon*dlon) * 111.0;
+            double ratio = dist_km / expected_km;
+            if (ratio > 10.0)
+                return wxString::Format(
+                    "[규칙] 속도-거리 불일치 (MMSI: %d) (비율: %.1f배)",
+                    mmsi, ratio);
+        }
+    }
 
     // ── 8a. ML 조기 탐지 (seq5) ────────────────────────────────────
     // seq10이 쌓이기 전 seq5 모델로 먼저 판단
