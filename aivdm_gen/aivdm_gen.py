@@ -11,13 +11,13 @@
 ║  │    ↓                                                     │   ║
 ║  │  SimEngine  ←→  RealTimeState  ←→  RealTimeControlWin   │   ║
 ║  │    ↓                                                     │   ║
-║  │  SenderWorker  →  UDP Socket  →  OpenCPN                 │   ║
+║  │  SenderWorker  →  TCP/UDP Transport  →  OpenCPN/IDS      │   ║
 ║  └──────────────────────────────────────────────────────────┘   ║
 ║  모듈 역할                                                       ║
 ║   AttackPlugin  : 메타데이터 + make/update 인터페이스            ║
 ║   AttackRegistry: 데코레이터 기반 자동 등록                      ║
 ║   SimEngine     : tick 루프, RT 오버라이드 적용                  ║
-║   SenderWorker  : UDP 전송 스레드                                ║
+║   SenderWorker  : TCP/UDP 전송 스레드                            ║
 ║   App           : tkinter GUI (좌=설정, 우=로그)                 ║
 ║   RealTimeControlWindow : 별도 Toplevel 실시간 조작              ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -180,6 +180,137 @@ def _sleep(ev:threading.Event,sec:float)->bool:
         if r<=0: return True
         time.sleep(min(0.05,r))
     return False
+
+def _normalize_nmea(msg: str) -> bytes:
+    return (msg.strip("\r\n") + "\r\n").encode("ascii")
+
+class Transport:
+    def __init__(self, protocol: str, host: str, port: int, stop: threading.Event):
+        raw = (protocol or "tcp_server").strip().lower().replace(" ", "_").replace("-", "_")
+        aliases = {
+            "tcp": "tcp_server",
+            "tcp_server": "tcp_server",
+            "tcp_listen": "tcp_server",
+            "server": "tcp_server",
+            "tcp_client": "tcp_client",
+            "client": "tcp_client",
+            "udp": "udp",
+        }
+        self.protocol = aliases.get(raw, "")
+        if self.protocol not in {"tcp_server", "tcp_client", "udp"}:
+            raise ValueError(f"unsupported transport protocol: {protocol}")
+        self.host = host
+        self.port = int(port)
+        self.addr = (self.host, self.port)
+        self.stop = stop
+        self.sock: socket.socket | None = None
+        self.listener: socket.socket | None = None
+        self.reconnect_delay = 1.0
+
+    def __enter__(self) -> "Transport":
+        if self.protocol == "udp":
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _qlog(f"[UDP ??] {self.host}:{self.port}", "start")
+        elif self.protocol == "tcp_server":
+            self._open_tcp_server()
+        else:
+            self._connect_tcp()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._close_client()
+        if self.listener is not None:
+            try:
+                self.listener.close()
+            finally:
+                self.listener = None
+
+    def _close_client(self) -> None:
+        if self.sock is None:
+            return
+        try:
+            self.sock.close()
+        finally:
+            self.sock = None
+
+    def _open_tcp_server(self) -> None:
+        if self.listener is None:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((self.host, self.port))
+            listener.listen(1)
+            listener.settimeout(0.5)
+            self.listener = listener
+            _qlog(f"[TCP server wait] {self.host}:{self.port}", "start")
+        self._accept_tcp_client()
+
+    def _accept_tcp_client(self) -> None:
+        assert self.listener is not None
+        self._close_client()
+        while not self.stop.is_set():
+            try:
+                sock, peer = self.listener.accept()
+                sock.settimeout(None)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock = sock
+                _qlog(f"[TCP server connected] {peer[0]}:{peer[1]}", "start")
+                return
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if self.stop.is_set():
+                    raise RuntimeError("send stopped") from exc
+                _qlog(f"[TCP server error] {exc}", "error")
+                if not _sleep(self.stop, self.reconnect_delay):
+                    raise RuntimeError("send stopped") from exc
+        raise RuntimeError("send stopped")
+
+    def _connect_tcp(self) -> None:
+        self._close_client()
+        while not self.stop.is_set():
+            try:
+                sock = socket.create_connection(self.addr, timeout=5)
+                sock.settimeout(None)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock = sock
+                _qlog(f"[TCP client connected] {self.host}:{self.port}", "start")
+                return
+            except OSError as exc:
+                _qlog(f"[TCP client wait] {self.host}:{self.port} connect failed: {exc}", "error")
+                if not _sleep(self.stop, self.reconnect_delay):
+                    raise RuntimeError("send stopped") from exc
+        raise RuntimeError("send stopped")
+
+    def send(self, msg: str) -> None:
+        data = _normalize_nmea(msg)
+        if self.protocol == "udp":
+            if self.sock is None:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.sendto(data, self.addr)
+            return
+
+        if self.sock is None:
+            if self.protocol == "tcp_server":
+                self._open_tcp_server()
+            else:
+                self._connect_tcp()
+        try:
+            assert self.sock is not None
+            self.sock.sendall(data)
+        except OSError as exc:
+            _qlog(f"[TCP reconnect] send failed: {exc}", "error")
+            self._close_client()
+            if not _sleep(self.stop, self.reconnect_delay):
+                raise
+            if self.protocol == "tcp_server":
+                self._accept_tcp_client()
+            else:
+                self._connect_tcp()
+            assert self.sock is not None
+            self.sock.sendall(data)
 
 # ══════════════════════════════════════════════════
 #  §4  AttackPlugin 기반 + Registry
@@ -404,158 +535,10 @@ class PositionJump(AttackPlugin):
             _step(v,dt)
 
 
-# ─── B1  고스트쉽 원형 정지 ──────────────────────
-@_reg
-class GhostCircleStatic(AttackPlugin):
-    meta = AttackMeta(
-        key="ghost_circle", label="B1  고스트쉽 원형 정지",
-        category="B",
-        purpose="갑작스러운 위치 출현 + navStatus=1",
-        evasion="출현/소멸 반복으로 IDS 이력 초기화 유도",
-        expected_fn="출현 시 위치 점프, 소멸 후 재출현은 신호 소실로 탐지")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",4,100,20),
-                _pi("원 반경 (도)","radius",0.01,1.0,0.15,0.01),
-                _pi("출현 주기 (초)","appear",5,300,30,5),
-                _pi("유지 시간 (초)","vanish",5,300,20,5)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",20)); cl=cfg["clat"]; cn=cfg["clon"]
-        r=float(cfg.get("radius",0.15))
-        ap=float(cfg.get("appear",30)); va=float(cfg.get("vanish",20))
-        fleet=[]
-        for i in range(n):
-            ang=2*math.pi*i/n
-            v=Vessel(991000000+i,f"GHO-{i+1:02d}",nav=1)
-            v.sx("clat",cl+math.cos(ang)*r); v.sx("clon",cn+math.sin(ang)*r*1.2)
-            v.lat=0; v.lon=0; v.sog=0; v.cog=0; v.hdg=int(math.degrees(ang))
-            v.sx("ap",ap); v.sx("va",va); v.sx("last",-(ap)); v.sx("vis",False)
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            since=elapsed-v.x("last")
-            if not v.x("vis"):
-                if since>=v.x("ap"):
-                    v.lat=v.x("clat")+random.uniform(-0.002,0.002)
-                    v.lon=v.x("clon")+random.uniform(-0.002,0.002)
-                    v.sx("last",elapsed); v.sx("vis",True)
-            else:
-                if since>=v.x("va"):
-                    v.lat=0; v.lon=0; v.sx("vis",False); v.sx("last",elapsed)
 
 
-# ─── B2  원형 순찰 (자연스러운 CTRV 기반) ────────
-@_reg
-class CirclePatrol(AttackPlugin):
-    meta = AttackMeta(
-        key="circle_patrol", label="B2  원형 순찰",
-        category="B",
-        purpose="원형 항적 패턴 + 선택적 속도 이상 주입",
-        evasion="일정 각속도 유지 → CTRV 모델 잔차 낮음",
-        expected_fn="속도 이상 주입 구간에서 SOG 초과 탐지")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",2,100,15),
-                _pi("순찰 반경 (도)","radius",0.05,1.0,0.2,0.01),
-                _pi("기본 SOG (kn)","sog",1,40,12,0.5),
-                _pi("이상 SOG (kn, 0=없음)","spike_sog",0,60,0,1),
-                _pi("이상 주기 (초)","spike_itv",5,120,20,5)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",15)); cl=cfg["clat"]; cn=cfg["clon"]
-        r=float(cfg.get("radius",0.2)); sog=float(cfg.get("sog",12))
-        fleet=[]
-        for i in range(n):
-            ang=2*math.pi*i/n
-            v=Vessel(991050000+i,f"CPT-{i+1:02d}")
-            v.lat=cl+math.cos(ang)*r; v.lon=cn+math.sin(ang)*r*1.2
-            v.sog=sog+random.uniform(-0.5,0.5)
-            v.cog=(math.degrees(ang)+90)%360; v.hdg=int(v.cog)
-            v.sx("ang",ang); v.sx("r",r); v.sx("cl",cl); v.sx("cn",cn)
-            v.sx("base_sog",v.sog); v.sx("spike",float(cfg.get("spike_sog",0)))
-            v.sx("sitv",float(cfg.get("spike_itv",20)))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        base_sog=float(cfg.get("sog",12)); spike=float(cfg.get("spike_sog",0))
-        sitv=float(cfg.get("spike_itv",20))
-        for v in fleet:
-            circ=2*math.pi*v.x("r")
-            omega=v.sog*_KN_TO_DPS/(circ+1e-9)
-            v.sx("ang",(v.x("ang")+omega*dt)%(2*math.pi))
-            v.lat=v.x("cl")+math.cos(v.x("ang"))*v.x("r")
-            v.lon=v.x("cn")+math.sin(v.x("ang"))*v.x("r")*1.2
-            v.cog=(math.degrees(v.x("ang"))+90)%360; v.hdg=int(v.cog)
-            if spike>0 and (elapsed%sitv)/sitv<0.12:
-                v.sog=spike
-            else:
-                v.sog=base_sog+random.uniform(-0.3,0.3)
 
 
-# ─── B3  직선 왕복 (가속/감속 포함) ─────────────
-@_reg
-class LinearBounce(AttackPlugin):
-    meta = AttackMeta(
-        key="linear_bounce", label="B3  직선 왕복",
-        category="B",
-        purpose="직선 왕복 + 이상 속도 주입",
-        evasion="반환점 근처 자연스러운 감속/가속 포함",
-        expected_fn="이상 속도 구간 탐지")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,100,15),
-                _pi("왕복 길이 (도)","length",0.1,2.0,0.4,0.05),
-                _pi("방향 (도)","hdg",0,359,0,5),
-                _pi("기본 SOG (kn)","sog",1,30,10,0.5),
-                _pi("이상 SOG (kn, 0=없음)","spike_sog",0,60,0,1),
-                _pi("이상 주기 (초)","spike_itv",5,120,20,5)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",15)); cl=cfg["clat"]; cn=cfg["clon"]
-        L=float(cfg.get("length",0.4)); hdg=float(cfg.get("hdg",0))
-        sog=float(cfg.get("sog",10)); rad=math.radians(hdg)
-        fleet=[]
-        for i in range(n):
-            t=i/max(n-1,1)
-            perp=math.radians(hdg+90); sp=(i-n//2)*0.003
-            v=Vessel(991100000+i,f"LBN-{i+1:02d}")
-            v.lat=cl+math.cos(rad)*L*(t-0.5)+math.cos(perp)*sp
-            v.lon=cn+math.sin(rad)*L*(t-0.5)*1.2+math.sin(perp)*sp*1.2
-            v.sog=sog+random.uniform(-0.5,0.5); v.cog=hdg; v.hdg=int(hdg)
-            v.sx("s_lat",cl-math.cos(rad)*L/2)
-            v.sx("s_lon",cn-math.sin(rad)*L/2*1.2)
-            v.sx("e_lat",cl+math.cos(rad)*L/2)
-            v.sx("e_lon",cn+math.sin(rad)*L/2*1.2)
-            v.sx("fwd",t<0.5); v.sx("base_sog",v.sog)
-            v.sx("spike",float(cfg.get("spike_sog",0)))
-            v.sx("sitv",float(cfg.get("spike_itv",20)))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        spike=float(cfg.get("spike_sog",0)); sitv=float(cfg.get("spike_itv",20))
-        for v in fleet:
-            # 반환점 근처 감속 (자연스러운 패턴)
-            fwd=v.x("fwd")
-            tx=v.x("e_lat") if fwd else v.x("s_lat")
-            ty=v.x("e_lon") if fwd else v.x("s_lon")
-            dist=math.sqrt((tx-v.lat)**2+(ty-v.lon)**2)+1e-9
-            decel=min(1.0,dist/0.02)  # 반환점 0.02도 전부터 감속
-            if spike>0 and (elapsed%sitv)/sitv<0.12:
-                v.sog=spike
-            else:
-                v.sog=v.x("base_sog")*decel+0.3
-            step=v.sog*_KN_TO_DPS*dt
-            if dist<step*2: v.sx("fwd",not fwd)
-            else:
-                dl=tx-v.lat; dn=ty-v.lon
-                v.lat+=dl/dist*step; v.lon+=dn/dist*step
-            v.cog=math.degrees(math.atan2(ty-v.lat,tx-v.lon)+1e-9)%360
-            v.hdg=int(v.cog)
 
 
 # ─── B4  실제 항로 모방 + 이상 속도 ─────────────
@@ -564,53 +547,6 @@ _ROUTE_WPS=[
     (0.10,0.17),(0.15,0.09),(0.18,0.00),(0.14,-0.10),
     (0.07,-0.17),(0.00,-0.20),(-0.10,-0.14),(-0.17,-0.07),(-0.20,0.00)
 ]
-
-@_reg
-class RealisticRoute(AttackPlugin):
-    meta = AttackMeta(
-        key="realistic_route", label="B4  실제루트 이상속도",
-        category="B",
-        purpose="정상 항로 이동 중 특정 WP에서 SOG 이상",
-        evasion="13개 웨이포인트 실항로 → route conformance 통과",
-        expected_fn="이상 SOG 구간에서 shipType maxSOG 초과 탐지")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("정상 SOG (kn)","sog_n",1,30,12,0.5),
-                _pi("이상 SOG (kn)","sog_s",1,60,35,1),
-                _pi("이상 WP 인덱스 (0~12)","spike_wp",0,12,4,1)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        wps=[(cl+d[0],cn+d[1]*1.2) for d in _ROUTE_WPS]
-        fleet=[]
-        for i in range(n):
-            si=int(i/n*len(wps))%len(wps)
-            v=Vessel(991200000+i,f"RRT-{i+1:02d}")
-            v.lat,v.lon=wps[si]
-            v.lat+=random.uniform(-0.004,0.004); v.lon+=random.uniform(-0.004,0.004)
-            v.sog=float(cfg.get("sog_n",12)); v.cog=0; v.hdg=0
-            v.sx("wps",wps); v.sx("wi",si); v.sx("prog",0.0)
-            v.sx("sog_n",float(cfg.get("sog_n",12)))
-            v.sx("sog_s",float(cfg.get("sog_s",35)))
-            v.sx("swp",int(cfg.get("spike_wp",4)))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            wps=v.x("wps"); wi=v.x("wi"); nxt=(wi+1)%len(wps)
-            cy,cx=wps[wi]; ny,nx=wps[nxt]
-            d=math.sqrt((ny-cy)**2+(nx-cx)**2)+1e-9
-            v.sog=v.x("sog_s") if wi==v.x("swp") else v.x("sog_n")
-            v.sx("prog",v.x("prog")+v.sog*_KN_TO_DPS*dt/d)
-            if v.x("prog")>=1.0:
-                v.sx("prog",0.0); v.sx("wi",(wi+1)%len(wps))
-                wi=(wi+1)%len(wps); nxt=(wi+1)%len(wps)
-                cy,cx=wps[wi]; ny,nx=wps[nxt]; d=math.sqrt((ny-cy)**2+(nx-cx)**2)+1e-9
-            p=v.x("prog")
-            v.lat=cy+(ny-cy)*p; v.lon=cx+(nx-cx)*p
-            v.cog=math.degrees(math.atan2(nx-cx,ny-cy)+1e-9)%360; v.hdg=int(v.cog)
 
 
 # ─── B5  JBU 글자 선단 ───────────────────────────
@@ -756,137 +692,12 @@ class Wave(AttackPlugin):
 #  C  규칙 IDS False-Negative 테스트
 # ═══════════════════════════════════════════════════
 
-# ─── C1  dt 구간 점프 ─────────────────────────────
-@_reg
-class BlindDtJump(AttackPlugin):
-    meta = AttackMeta(
-        key="blind_dt_jump", label="C1  [FN] dt 구간 점프",
-        category="C",
-        purpose="IDS Check5/6 회피: dt>60s이면 검사 skip",
-        evasion="송신 주기를 65~120s로 설정 → dt 항상 >60",
-        expected_fn="Check5·6 모두 skip, Check7(dt>300)도 아님 → 탐지 없음")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("점프 거리 (도)","jdist",0.05,0.5,0.15,0.01)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        fleet=[]
-        for i in range(n):
-            v=Vessel(991700000+i,f"FN1-{i+1:03d}")
-            _place(v,cl,cn,0.05); v.sog=random.uniform(5,12)
-            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            v.sx("jd",float(cfg.get("jdist",0.15)))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            d=v.x("jd"); ang=random.uniform(0,360)
-            v.lat+=math.cos(math.radians(ang))*d
-            v.lon+=math.sin(math.radians(ang))*d*1.2
-            v.sog=random.choice([2.0,18.0,3.0,20.0])
-            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
 
 
-# ─── C2  속도 단계 상승 ───────────────────────────
-@_reg
-class BlindSpeedRamp(AttackPlugin):
-    meta = AttackMeta(
-        key="blind_speed_ramp", label="C2  [FN] 속도 단계 상승",
-        category="C",
-        purpose="IDS Check5 회피: Δsog < 10.0/메시지 유지",
-        evasion="매 메시지 9.5kn씩 증가 → 임계값(10.0) 미달",
-        expected_fn="2→11→20→29kn 달성해도 각 Δ<10 → 탐지 없음")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("시작 SOG (kn)","start",0,5,2,0.5),
-                _pi("증가량 (kn, <10)","step",1,9.9,9.5,0.1),
-                _pi("상한 SOG (kn, <30)","maxs",5,29.9,29,1)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        fleet=[]
-        for i in range(n):
-            v=Vessel(991800000+i,f"FN2-{i+1:03d}")
-            _place(v,cl,cn,0.05); v.sog=float(cfg.get("start",2))
-            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            v.sx("step",float(cfg.get("step",9.5)))
-            v.sx("maxs",float(cfg.get("maxs",29)))
-            v.sx("start",float(cfg.get("start",2)))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            v.sog=min(v.sog+v.x("step"),v.x("maxs"))
-            if v.sog>=v.x("maxs"): v.sog=v.x("start")
-            v.hdg=int(v.cog); _step(v,dt)
 
 
-# ─── C3  COG/HDG 경계값 ──────────────────────────
-@_reg
-class BlindCogBorder(AttackPlugin):
-    meta = AttackMeta(
-        key="blind_cog_border", label="C3  [FN] COG/HDG 경계값",
-        category="C",
-        purpose="IDS Check4 임계값(100°) 하회",
-        evasion="91~99° 불일치 유지 → diff<100 → 탐지 없음",
-        expected_fn="실제로는 비정상이나 임계가 느슨해 탐지 안됨")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("COG-HDG 불일치 (도)","mm",80,99.9,95,1)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        mm=float(cfg.get("mm",95))
-        fleet=[]
-        for i in range(n):
-            v=Vessel(991900000+i,f"FN3-{i+1:03d}")
-            _place(v,cl,cn,0.05); v.sog=random.uniform(3,10)
-            v.cog=random.uniform(0,360); v.hdg=int((v.cog+mm)%360)
-            v.sx("mm",mm)
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            if random.random()<0.1: v.cog=(v.cog+random.uniform(-10,10))%360
-            v.hdg=int((v.cog+v.x("mm"))%360); _step(v,dt)
 
 
-# ─── C4  navStatus 회피 ───────────────────────────
-@_reg
-class BlindNavStatus(AttackPlugin):
-    meta = AttackMeta(
-        key="blind_nav_status", label="C4  [FN] navStatus 회피",
-        category="C",
-        purpose="IDS Check3 미검사 navStatus 악용",
-        evasion="navStatus 2/3/7/8/11/12 에서 SOG≥0.5 이동",
-        expected_fn="IDS는 1/5/6만 검사 → 나머지 상태는 탐지 없음")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,12),
-                _pi("SOG (kn, ≥0.5)","sog",0.5,20,3,0.5)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",12)); cl=cfg["clat"]; cn=cfg["clon"]
-        stlist=[2,3,7,8,11,12]
-        fleet=[]
-        for i in range(n):
-            v=Vessel(992000000+i,f"FN4-{i+1:03d}",nav=stlist[i%len(stlist)])
-            _place(v,cl,cn,0.05); v.sog=float(cfg.get("sog",3))
-            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            if random.random()<0.05: v.cog=(v.cog+random.uniform(-15,15))%360
-            v.hdg=int(v.cog); _step(v,dt)
 
 
 # ═══════════════════════════════════════════════════
@@ -1041,118 +852,10 @@ class MLMimicry(AttackPlugin):
 #  E  ML 우회 v2 (구조적)
 # ═══════════════════════════════════════════════════
 
-# ─── E1  Smooth Trajectory (CTRV 기반) ───────────
-@_reg
-class AdvSmooth(AttackPlugin):
-    meta = AttackMeta(
-        key="adv_smooth", label="E1  [ADV] Smooth Trajectory",
-        category="E",
-        purpose="Kalman 잔차·jerk 피처 무력화",
-        evasion="CTRV(등각속도·등속) 운동 유지 → 운동 모델 예측 오차 ≈ 0",
-        expected_fn="residual-based scorer 통과. behavioral context만으로 탐지 가능")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("SOG (kn)","sog",1,40,15,0.5),
-                _pi("선회율 (deg/s)","omega",0.1,10,2,0.1)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        fleet=[]
-        for i in range(n):
-            v=Vessel(993100000+i,f"SMT-{i+1:03d}")
-            _place(v,cl,cn,0.08); v.sog=float(cfg.get("sog",15))+random.uniform(-1,1)
-            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            v.sx("om",float(cfg.get("omega",2))*random.choice([-1,1]))
-            v.sx("bs",v.sog)
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            v.cog=(v.cog+v.x("om")*dt)%360; v.sog=v.x("bs"); v.hdg=int(v.cog)
-            _step(v,dt)
 
 
-# ─── E2  Fleet Desync ─────────────────────────────
-@_reg
-class AdvDesync(AttackPlugin):
-    meta = AttackMeta(
-        key="adv_desync", label="E2  [ADV] Fleet Desync",
-        category="E",
-        purpose="fleet-level 상관 피처 파괴",
-        evasion="MMSI·shipType·SOG분포 개별화, 이상 발생 시각 분산",
-        expected_fn="MMSI clustering·fleet variance 피처 무력화. 개별 탐지만 가능")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,12),
-                _pi("이상 SOG (kn)","spike",10,60,38,1)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",12)); cl=cfg["clat"]; cn=cfg["clon"]
-        used=set(); fleet=[]
-        for i in range(n):
-            mid=random.choice(_MID_POOL)
-            while True:
-                mmsi=mid*1000000+random.randint(100000,999999)
-                if mmsi not in used: used.add(mmsi); break
-            pr=random.choice(_PROFILES)
-            v=Vessel(mmsi,f"{pr.name_pfx}{mmsi%10000:04d}")
-            _place(v,cl,cn,0.1); v.sog=random.uniform(pr.sog_lo,pr.sog_hi)
-            v.cog=random.uniform(0,360); v.hdg=int(v.cog+random.uniform(-5,5))%360
-            v.nav=random.choice(pr.nav_opts)
-            v.sx("ao",random.uniform(0,45)); v.sx("ai",random.uniform(30,90))
-            v.sx("bs",v.sog); v.sx("sp",float(cfg.get("spike",38))*random.uniform(0.85,1.15))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            adj=elapsed+v.x("ao"); cyc=adj%v.x("ai")
-            v.sog=v.x("sp") if cyc<v.x("ai")*0.12 else v.x("bs")+random.uniform(-0.3,0.3)
-            if random.random()<0.08: v.cog=(v.cog+random.uniform(-8,8))%360
-            v.hdg=int(v.cog+random.uniform(-4,4))%360
-            _step(v,dt)
 
 
-# ─── E3  Window Edge ──────────────────────────────
-@_reg
-class AdvWindowEdge(AttackPlugin):
-    meta = AttackMeta(
-        key="adv_window_edge", label="E3  [ADV] Window Edge",
-        category="E",
-        purpose="sliding window anomaly score 희석",
-        evasion="window_size-1 틱마다 이상 1회 → 양쪽 window에 각 1개만 포함",
-        expected_fn="window당 anomaly score = 1/window_size → 임계 미달 가능성 높음")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("ML window 크기 가정","wsize",5,50,20,1),
-                _pi("이상 SOG (kn)","anom",10,60,42,1),
-                _pi("정상 SOG (kn)","norm",1,30,12,0.5)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        fleet=[]
-        for i in range(n):
-            v=Vessel(993300000+i,f"WED-{i+1:03d}")
-            _place(v,cl,cn,0.06); v.sog=float(cfg.get("norm",12))
-            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            v.sx("ws",int(cfg.get("wsize",20))); v.sx("tick",0)
-            v.sx("an",float(cfg.get("anom",42))); v.sx("nm",float(cfg.get("norm",12)))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            v.sx("tick",v.x("tick")+1)
-            cyc=v.x("tick")%v.x("ws")
-            if cyc==v.x("ws")-1:
-                v.sog=v.x("an"); v.cog=(v.cog+175+random.uniform(-3,3))%360
-            else:
-                v.sog=v.x("nm")+random.uniform(-0.4,0.4)
-                if cyc==0: v.cog=(v.cog+175+random.uniform(-3,3))%360
-            v.hdg=int(v.cog); _step(v,dt)
 
 
 # ─── E4  Contextual Blend (어선 위장) ────────────
@@ -1261,112 +964,11 @@ class AdvShadow(AttackPlugin):
 # ─── F1  Feature Smoothing ────────────────────────
 # 목적: ML feature의 Δ값을 학습된 정상 분포 내로 클램핑하면서 이동
 # 동작: 매 틱 Δsog·Δcog·Δpos 전부를 "정상 분포 내 최대값"으로 제한
-# 회피: 어떤 단일 피처 변화도 임계를 넘지 않음 → 누적 이동만 이상
-@_reg
-class FSmoothing(AttackPlugin):
-    meta = AttackMeta(
-        key="feat_smooth", label="F1  [F] Feature Smoothing",
-        category="F",
-        purpose="Δsog·Δcog·Δpos 전부 정상 분포 상위값으로 클램핑",
-        evasion="어떤 단일 Δ피처도 임계 미달. 누적 변위만 이상",
-        expected_fn="단기 window IDS 전 통과. 궤적 이탈 감지기만 탐지 가능")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("목표 위도 오프셋","tlat",  -0.5,0.5,0.2,0.01),
-                _pi("목표 경도 오프셋","tlon", -0.5,0.5,0.2,0.01),
-                _pi("max Δsog/틱 (kn)","dsog_max",0.1,9.9,3.0,0.1),
-                _pi("max Δcog/틱 (도)","dcog_max",0.1,30,5.0,0.5),
-                _pi("max Δpos/틱 (도)","dpos_max",0.001,0.04,0.01,0.001)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        tl=cl+float(cfg.get("tlat",0.2)); tn=cn+float(cfg.get("tlon",0.2))
-        fleet=[]
-        for i in range(n):
-            v=Vessel(993500000+i,f"FSM-{i+1:03d}")
-            _place(v,cl,cn,0.06)
-            v.sog=random.uniform(5,12); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            v.sx("tl",tl+random.uniform(-0.02,0.02))
-            v.sx("tn",tn+random.uniform(-0.02,0.02))
-            v.sx("dsmax",float(cfg.get("dsog_max",3)))
-            v.sx("dcmax",float(cfg.get("dcog_max",5)))
-            v.sx("dpmax",float(cfg.get("dpos_max",0.01)))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            # 원하는 방향 계산
-            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
-            dist=math.sqrt(dl**2+dn**2)+1e-9
-            want_cog=math.degrees(math.atan2(dn,dl)+1e-9)%360
-            want_sog=min(15.0,dist/(_KN_TO_DPS*max(dt,0.1)))
-
-            # Δ클램핑: 각 피처 변화를 정상 범위 내로 제한
-            dcog=want_cog-v.cog
-            if dcog>180: dcog-=360
-            elif dcog<-180: dcog+=360
-            dcog=max(-v.x("dcmax"),min(v.x("dcmax"),dcog))
-            v.cog=(v.cog+dcog)%360
-
-            dsog=want_sog-v.sog
-            dsog=max(-v.x("dsmax"),min(v.x("dsmax"),dsog))
-            v.sog=max(0,v.sog+dsog)
-
-            v.hdg=int(v.cog)
-            step=v.sog*_KN_TO_DPS*dt
-            step=min(step,v.x("dpmax"))   # 위치 변화도 클램핑
-            v.lat+=math.cos(math.radians(v.cog))*step
-            v.lon+=math.sin(math.radians(v.cog))*step*1.2
 
 
 # ─── F2  Intermittent Spoofing ────────────────────
 # 목적: 간헐적 위조 — 정상 구간과 이상 구간을 교번
 # 동작: T_normal초 동안 완전 정상 거동, T_attack초 동안 이상 삽입
-# 회피: 이상 구간이 전체의 T_attack/(T_n+T_a) 비율만 차지
-@_reg
-class IntermittentSpoof(AttackPlugin):
-    meta = AttackMeta(
-        key="intermittent", label="F2  [F] Intermittent Spoofing",
-        category="F",
-        purpose="정상/이상 교번으로 anomaly score 시간 평균 희석",
-        evasion="전체 시간의 일부만 이상 → 평균 score = α × peak_score",
-        expected_fn="T_normal이 클수록 평균 score 낮음. 순간 탐지기만 잡음")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("정상 구간 (초)","tn",5,120,30,5),
-                _pi("이상 구간 (초)","ta",1,60,5,1),
-                _pi("이상 SOG (kn)","anom",10,60,45,1),
-                _pi("이상 navStatus","anav",0,15,6,1)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        fleet=[]
-        for i in range(n):
-            v=Vessel(993600000+i,f"ISP-{i+1:03d}")
-            _place(v,cl,cn,0.06); v.sog=random.uniform(5,12)
-            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            v.sx("tn",float(cfg.get("tn",30))); v.sx("ta",float(cfg.get("ta",5)))
-            v.sx("anom",float(cfg.get("anom",45))); v.sx("anav",int(cfg.get("anav",6)))
-            v.sx("bs",v.sog); v.sx("phase_off",random.uniform(0,float(cfg.get("tn",30))))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            tn=v.x("tn"); ta=v.x("ta"); cycle=tn+ta
-            t=(elapsed+v.x("phase_off"))%cycle
-            if t<ta:
-                # 이상 구간
-                v.sog=v.x("anom"); v.nav=v.x("anav")
-                v.cog=(v.cog+random.uniform(-60,60))%360
-            else:
-                # 정상 구간
-                v.sog=v.x("bs")+random.uniform(-0.5,0.5); v.nav=0
-                v.cog=(v.cog+random.uniform(-3,3))%360
-            v.hdg=int(v.cog); _step(v,dt)
 
 
 # ─── F3  Trajectory Stitching ─────────────────────
@@ -1451,54 +1053,6 @@ class TrajStitch(AttackPlugin):
 # 동작: 빠른 burst (짧은 Δt) + 긴 침묵 (긴 Δt) 교번
 #       ML이 Δpos/Δt로 속도를 재구성하면 burst 구간은
 #       실제 속도의 수배로 계산됨
-# 회피: 각 메시지의 SOG 필드는 정상값 → 보고 vs 추정 불일치
-@_reg
-class TimeSkew(AttackPlugin):
-    meta = AttackMeta(
-        key="time_skew", label="F4  [F] Time Skew",
-        category="F",
-        purpose="Δt 조작으로 ML 재구성 속도와 보고 SOG 불일치 생성",
-        evasion="보고 SOG는 정상 → 규칙 IDS 통과. ML은 Δpos/Δt로 이상 감지 어려움",
-        expected_fn="SOG-필드 기반 탐지기 통과. Δpos/Δt 재구성 탐지기만 잡을 수 있음")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("burst 메시지 수","burst_n",2,10,4,1),
-                _pi("burst 이동 거리 (도)","burst_dist",0.01,0.3,0.08,0.01),
-                _pi("보고 SOG (kn, 정상값)","rep_sog",1,30,10,0.5)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        fleet=[]
-        for i in range(n):
-            v=Vessel(993800000+i,f"TSK-{i+1:03d}")
-            _place(v,cl,cn,0.06)
-            v.sog=float(cfg.get("rep_sog",10)); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            v.sx("bn",int(cfg.get("burst_n",4)))
-            v.sx("bd",float(cfg.get("burst_dist",0.08)))
-            v.sx("rs",float(cfg.get("rep_sog",10)))
-            v.sx("tick",0); v.sx("mode","idle")
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            v.sx("tick",v.x("tick")+1)
-            t=v.x("tick"); bn=v.x("bn")
-            # burst: bn개 메시지를 연속으로 큰 이동
-            if t%(bn*3)<bn:
-                v.sx("mode","burst")
-                # 한 틱에 burst_dist/bn 이동 (빠른 실제 이동)
-                step=v.x("bd")/bn
-                v.lat+=math.cos(math.radians(v.cog))*step
-                v.lon+=math.sin(math.radians(v.cog))*step*1.2
-            else:
-                v.sx("mode","idle")
-                # idle: 거의 움직이지 않음 (하지만 SOG는 정상 보고)
-                _step(v,dt*0.05)
-            # 보고 SOG는 항상 정상값
-            v.sog=v.x("rs")+random.uniform(-0.3,0.3)
-            v.hdg=int(v.cog)
 
 
 # ─── F5  Multi-Ship Coordination ─────────────────
@@ -1506,54 +1060,6 @@ class TimeSkew(AttackPlugin):
 #       개별 거동은 정상으로 보이게 함
 # 동작: 각 선박이 목표 방향으로 조금씩 편향된 정상 항로를 따름
 #       개별 분석: 완전 정상
-#       fleet-level: 수렴 벡터 필드가 형성됨
-@_reg
-class MultiCoord(AttackPlugin):
-    meta = AttackMeta(
-        key="multi_coord", label="F5  [F] Multi-Ship Coordination",
-        category="F",
-        purpose="fleet-level 협조 탐지 vs 개별 정상성 트레이드오프",
-        evasion="각 선박 개별 피처는 완전 정상. 協調는 fleet-level에만 나타남",
-        expected_fn="개별 IDS 전 통과. fleet-level 수렴 벡터 분석만 탐지 가능")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",3,50,12),
-                _pi("목표 위도 오프셋","tlat",  -0.5,0.5,0.15,0.05),
-                _pi("목표 경도 오프셋","tlon", -0.5,0.5,0.15,0.05),
-                _pi("SOG (kn)","sog",5,20,10,0.5),
-                _pi("목표 편향 가중치","bias",0.0,1.0,0.3,0.05)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",12)); cl=cfg["clat"]; cn=cfg["clon"]
-        tl=cl+float(cfg.get("tlat",0.15)); tn=cn+float(cfg.get("tlon",0.15))
-        fleet=[]
-        for i in range(n):
-            pr=random.choice(_PROFILES)
-            mmsi=random.choice([440,441,477,413])*1000000+random.randint(100000,999999)
-            v=Vessel(mmsi,f"{pr.name_pfx}{i+1:03d}")
-            _place(v,cl,cn,0.15)
-            v.sog=float(cfg.get("sog",10))+random.uniform(-1,1)
-            # 각 선박의 기본 항로: 실제 항로 방향 중 가장 가까운 것
-            tc=math.degrees(math.atan2(tn-v.lon,tl-v.lat)+1e-9)%360
-            base=min(_COASTAL_HDGS,key=lambda h:min(abs(h-tc),360-abs(h-tc)))
-            v.cog=base+random.uniform(-10,10); v.hdg=int(v.cog)
-            v.sx("tl",tl); v.sx("tn",tn)
-            v.sx("bias",float(cfg.get("bias",0.3)))
-            v.sx("base_cog",v.cog); v.sx("bs",v.sog)
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        bias=float(cfg.get("bias",0.3))
-        for v in fleet:
-            # 목표 방향
-            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
-            tc=math.degrees(math.atan2(dn,dl)+1e-9)%360
-            # 기본 항로 + bias × 목표 방향 blend (자연스럽게 편향)
-            v.cog=((1-bias)*v.x("base_cog")+bias*tc+random.uniform(-5,5))%360
-            v.sog=v.x("bs")+random.uniform(-0.4,0.4)
-            v.hdg=int(v.cog+random.uniform(-4,4))%360
-            _step(v,dt)
 
 
 # ─── F6  AIS Gap Attack ───────────────────────────
@@ -1621,59 +1127,6 @@ class AISGap(AttackPlugin):
 # 목적: LSTM hidden state를 정상 분포 내로 유지하는 궤적 생성
 # 동작: ΔSOG·ΔCOG·Δpos 전부 정상 학습 데이터의 1σ 이내로 유지하면서
 #       목표 위치 방향으로 아주 천천히 이동 (Gradual Drift의 고급버전)
-#       ΔSOG~N(0,0.5), ΔCOG~N(0,3°), Δpos~U(0,0.002°) 가정
-@_reg
-class LSTMBeat(AttackPlugin):
-    meta = AttackMeta(
-        key="lstm_beat", label="F7  [F] LSTM Beat",
-        category="F",
-        purpose="LSTM hidden state를 정상 분포 내로 유지",
-        evasion="모든 Δ피처를 정상 학습 1σ 이내로 클램핑. 누적 위치만 이상",
-        expected_fn="LSTM reconstruction error ≈ 0. 누적 drift 감지기만 탐지")
-
-    def param_defs(self):
-        return [_pi("선박 수","count",1,50,10),
-                _pi("목표 위도 오프셋","tlat",-0.5,0.5,0.3,0.01),
-                _pi("목표 경도 오프셋","tlon",-0.5,0.5,0.3,0.01),
-                _pi("σ_sog (정상 ΔSOG 표준편차)","s_sog",0.1,3.0,0.5,0.1),
-                _pi("σ_cog (정상 ΔCOG 표준편차)","s_cog",0.5,10.0,3.0,0.5)]
-
-    def make(self,cfg):
-        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
-        tl=cl+float(cfg.get("tlat",0.3)); tn=cn+float(cfg.get("tlon",0.3))
-        fleet=[]
-        for i in range(n):
-            v=Vessel(994000000+i,f"LBT-{i+1:03d}")
-            _place(v,cl,cn,0.06)
-            v.sog=random.uniform(6,12); v.cog=random.uniform(0,360); v.hdg=int(v.cog)
-            v.sx("tl",tl+random.uniform(-0.02,0.02))
-            v.sx("tn",tn+random.uniform(-0.02,0.02))
-            v.sx("ss",float(cfg.get("s_sog",0.5)))
-            v.sx("sc",float(cfg.get("s_cog",3.0)))
-            fleet.append(v)
-        return fleet
-
-    def update(self,fleet,elapsed,dt,cfg):
-        for v in fleet:
-            # 원하는 방향 계산 (목표 쪽으로 아주 작은 편향)
-            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
-            dist=math.sqrt(dl**2+dn**2)+1e-9
-            want_cog=math.degrees(math.atan2(dn,dl)+1e-9)%360
-            # ΔCOG: 정상 1σ 내에서 목표 방향으로 조금씩 편향
-            dcog=want_cog-v.cog
-            if dcog>180: dcog-=360
-            elif dcog<-180: dcog+=360
-            # 한 번에 최대 1σ_cog만 이동
-            dcog=max(-v.x("sc"),min(v.x("sc"),dcog*0.15))
-            v.cog=(v.cog+dcog)%360
-            # ΔSOG: 정상 N(0,σ_sog)
-            dsog=random.gauss(0,v.x("ss"))*0.3
-            v.sog=max(2.0,min(20.0,v.sog+dsog))
-            v.hdg=int(v.cog)
-            # Δpos: 최대 0.002도/틱 (GPS 정밀도 수준)
-            step=min(v.sog*_KN_TO_DPS*dt,0.002)
-            v.lat+=math.cos(math.radians(v.cog))*step
-            v.lon+=math.sin(math.radians(v.cog))*step*1.2
 
 
 
@@ -1681,7 +1134,7 @@ class LSTMBeat(AttackPlugin):
 #  §6  SimEngine
 # ═══════════════════════════════════════════════════
 class SimEngine:
-    """송신 루프 — 패턴·RT 오버라이드·UDP 전송을 캡슐화"""
+    """송신 루프 — 패턴·RT 오버라이드·TCP/UDP 전송을 캡슐화"""
 
     def __init__(self, cfg:dict, log_q:queue.Queue, stop:threading.Event):
         self.cfg=cfg; self.log_q=log_q; self.stop=stop
@@ -1709,15 +1162,15 @@ class SimEngine:
     # ── 메인 루프 ──────────────────────────────────
     def run(self)->None:
         cfg=self.cfg
-        host=cfg["host"]; port=int(cfg["port"])
+        host=cfg["host"]; port=int(cfg["port"]); protocol=cfg.get("protocol","tcp")
         interval=float(cfg["interval"])
         key=cfg["attack_key"]
         plugin=AttackRegistry.get(key)
         fleet=plugin.make(cfg)
         name_sent:set[int]=set()
         iteration=0; start=time.time()
-        _qlog(f"[SimEngine] {plugin.meta.label} | {len(fleet)}척 | {host}:{port}","start")
-        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+        _qlog(f"[SimEngine] {plugin.meta.label} | {len(fleet)}척 | {protocol.upper()} {host}:{port}","start")
+        with Transport(protocol,host,port,self.stop) as transport:
             while not self.stop.is_set():
                 iteration+=1; t0=time.time(); elapsed=t0-start
                 plugin.update(fleet,elapsed,interval,cfg)
@@ -1726,10 +1179,10 @@ class SimEngine:
                 for v in fleet:
                     if self.stop.is_set(): return
                     if v.mmsi not in name_sent:
-                        sock.sendto(v.name_msg().encode("ascii"),(host,port))
+                        transport.send(v.name_msg())
                         name_sent.add(v.mmsi)
                         if not _sleep(self.stop,0.01): return
-                    sock.sendto(v.pos_msg().encode("ascii"),(host,port))
+                    transport.send(v.pos_msg())
                     sent+=1
                     if not _sleep(self.stop,0.004): return
                 dt=time.time()-t0
@@ -1740,17 +1193,17 @@ class SimEngine:
 
 
 def _file_loop(cfg:dict,log_q:queue.Queue,stop:threading.Event)->None:
-    host=cfg["host"]; port=int(cfg["port"])
+    host=cfg["host"]; port=int(cfg["port"]); protocol=cfg.get("protocol","tcp")
     msgs=load_nmea(cfg["file_path"])
     interval=float(cfg["file_interval"]); repeat=bool(cfg["file_repeat"])
-    _qlog(f"[파일] {Path(cfg['file_path']).name} | {len(msgs)}개","start")
+    _qlog(f"[파일] {Path(cfg['file_path']).name} | {len(msgs)}개 | {protocol.upper()} {host}:{port}","start")
     cycle=0
-    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+    with Transport(protocol,host,port,stop) as transport:
         while not stop.is_set():
             cycle+=1
             for i,msg in enumerate(msgs,1):
                 if stop.is_set(): return
-                sock.sendto(msg.encode("ascii"),(host,port))
+                transport.send(msg)
                 _qlog(f"[파일 {i:04d}] {msg.strip()}","info")
                 if not _sleep(stop,interval): return
             if not repeat:
@@ -1984,7 +1437,8 @@ class App(tk.Tk):
     def _build_network(self,p):
         self._section(p,"네트워크")
         self._host  =self._row(p,"대상 IP",          self._entry,default="127.0.0.1")
-        self._port  =self._row(p,"UDP 포트",          self._entry,default="1111")
+        self._proto =self._row(p,"전송 방식",        self._combo,values=["TCP 서버","TCP 클라이언트","UDP"],default="TCP 서버")
+        self._port  =self._row(p,"포트",             self._entry,default="10110")
         self._itv   =self._row(p,"송신 주기 (초)",   self._spin,lo=0.2,hi=120,default=2.0,step=0.1)
 
     def _build_center(self,p):
@@ -2121,7 +1575,20 @@ class App(tk.Tk):
     def _common_cfg(self)->dict:
         h=self._host._var.get().strip()
         if not h: raise ValueError("IP를 입력하세요")
-        return {"host":h,"port":int(self._port._var.get())}
+        proto_label=str(self._proto._var.get()).strip().lower()
+        proto_map={
+            "tcp": "tcp_server",
+            "tcp 서버": "tcp_server",
+            "tcp server": "tcp_server",
+            "tcp 클라이언트": "tcp_client",
+            "tcp client": "tcp_client",
+            "udp": "udp",
+        }
+        proto=proto_map.get(proto_label)
+        if proto is None: raise ValueError("전송 방식은 TCP 서버, TCP 클라이언트, UDP 중 하나여야 합니다")
+        port=int(self._port._var.get())
+        if not 1 <= port <= 65535: raise ValueError("포트는 1~65535 범위여야 합니다")
+        return {"host":h,"port":port,"protocol":proto}
 
     def _gen_cfg(self)->dict:
         cfg=self._common_cfg()

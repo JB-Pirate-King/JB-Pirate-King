@@ -1,0 +1,44 @@
+services:
+  ais-ids-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: ais_ids_server
+    restart: unless-stopped
+
+    ports:
+      # TCP 10110: OpenCPN NMEA 출력 수신
+      - "10110:10110"
+      # HTTP 5000: REST API (경보 조회, 상태 확인)
+      - "5000:5000"
+
+    volumes:
+      # ML 모델 파일 마운트 (model.onnx / ensemble_config.json 등)
+      - ./models:/models:ro
+      # 경보 로그 출력 디렉토리
+      - ./logs:/logs
+
+    environment:
+      NMEA_HOST:  "0.0.0.0"
+      NMEA_PORT:  "10110"
+      API_HOST:   "0.0.0.0"
+      API_PORT:   "5000"
+      MODEL_DIR:  "/models"
+      LOG_DIR:    "/logs"
+
+    healthcheck:
+      test: >
+        python -c
+        "import urllib.request;
+         r = urllib.request.urlopen('http://localhost:5000/status', timeout=5);
+         exit(0 if r.status == 200 else 1)"
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 10s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
