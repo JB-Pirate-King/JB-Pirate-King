@@ -11,7 +11,7 @@
 | `ml/` | AIS 이상 탐지 ML 파이프라인 (학습 · 평가) |
 | `ais_ids_pi/` | OpenCPN 플러그인 (C++, ONNX 추론) |
 | `s-c/` | 로컬 서버 + GUI (Python, Docker) |
-| `aivdm_gen/` | AIVDM 테스트 신호 생성기 |
+| `aivdm_gen/` | AIVDM 공격 시나리오 시뮬레이터 (15개 시나리오, GUI) |
 
 ---
 
@@ -58,6 +58,27 @@ python ais_ids_gui.py
 ```
 
 자세한 내용은 [`s-c/Readme.md`](s-c/Readme.md)를 참고한다.
+
+---
+
+## 시나리오 시뮬레이터 (`aivdm_gen/`)
+
+OpenCPN 또는 IDS 서버로 AIVDM NMEA 신호를 직접 주입하는 ML-Aware 공격 시뮬레이터.
+
+```bash
+python aivdm_gen/aivdm_gen.py
+```
+
+| 그룹 | 시나리오 | 설명 |
+|---|---|---|
+| A | A1~A4 | 규칙 기반 탐지 검증 (속도·정박·COG/HDG·위치 점프) |
+| B | B5~B7 | 다중 선박 협조 패턴 (글자 선단, 집게, 파상 대형) |
+| D | D1~D4 | ML 탐지 우회 1세대 (Low&Slow, 시간 위장, Gradual Drift, Mimicry) |
+| E | E4~E5 | ML 탐지 우회 2세대 (Contextual Blend, Shadow Vessel) |
+| F | F3, F6 | 구조적 공격 (궤적 봉합, AIS Gap으로 이력 리셋) |
+
+전송 프로토콜은 TCP 서버·클라이언트·UDP를 GUI에서 선택할 수 있다.  
+자세한 내용은 [`aivdm_gen/README.md`](aivdm_gen/README.md)를 참고한다.
 
 ---
 
