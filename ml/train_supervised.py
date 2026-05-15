@@ -67,7 +67,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset, random_split, IterableDataset
 from tqdm import tqdm
 
 # ── 공통 설정 ─────────────────────────────────────────────────────
@@ -83,9 +83,11 @@ N_FEAT         = len(FEATURES)   # 12
 SEQ_LEN        = 10              # 모델 클래스 기본값용 (실제 학습은 --seq_len 인자 사용)
 SEED           = 42
 SEQ_BREAK_DT   = 600
-SCALER_SUP     = "output/scaler_sup.json"   # 지도 학습 전용 스케일러
-OUTPUT_DIR     = "output"   # 모델·임계값 출력 디렉터리
-DATA_DIR       = "data"     # CSV 입력 데이터 디렉터리
+SCALER_SUP          = "output/scaler_sup.json"  # 지도 학습 전용 스케일러
+OUTPUT_DIR          = "output"                  # 모델·임계값 출력 디렉터리
+DATA_DIR            = "data"                    # CSV 입력 데이터 디렉터리
+SCALER_SAMPLE_SIZE  = 10_000                    # 스케일러 계산용 샘플 시퀀스 수
+STREAM_SHUFFLE_BUF  = 50_000                    # 스트리밍 셔플 버퍼 크기
 
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -147,22 +149,39 @@ def scale_seq(seq, mins, maxs) -> list:
 
 def load_normal_from_csv(path: str, seq_len: int = 10,
                          max_seqs: int = 15000, max_mmsi: int = None) -> list:
-    """CSV에서 raw(스케일링 전) 정상 시퀀스 로드"""
+    """CSV에서 raw(스케일링 전) 정상 시퀀스 로드.
+
+    대용량 파일 대응: max_seqs * READ_MULTIPLIER 행 수집 후 조기 종료.
+    전체 파일을 메모리에 올리지 않는다.
+    """
+    READ_MULTIPLIER = 20  # max_seqs 의 N배 행 수집 후 중단
+
     if not os.path.exists(path):
         return []
     print(f"  [정상] CSV 로드: {path}")
     mmsi_data = defaultdict(list)
+    row_limit = max_seqs * READ_MULTIPLIER
+    row_count = 0
+
     with open(path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             mmsi = row.get("mmsi", "")
             if not mmsi:
                 continue
+            # max_mmsi 조기 필터: 이미 한도 초과 MMSI면 스킵
+            if max_mmsi is not None and mmsi not in mmsi_data and len(mmsi_data) >= max_mmsi:
+                continue
             try:
                 record = [float(row[col]) for col in FEATURES]
                 mmsi_data[mmsi].append(record)
+                row_count += 1
             except (ValueError, KeyError):
                 continue
+            # 충분한 행 수집 시 조기 종료
+            if row_count >= row_limit:
+                print(f"    (조기 종료: {row_count:,}행 수집, 나머지 스킵)")
+                break
 
     mmsis = list(mmsi_data.keys())
     if max_mmsi is not None:
@@ -282,6 +301,215 @@ def make_loaders(X_t, y_t, batch_size: int, val_ratio: float):
     )
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
+
+
+# ══════════════════════════════════════════════════════════════════
+# 스트리밍 데이터셋 (대용량 CSV 대응)
+# ══════════════════════════════════════════════════════════════════
+
+class StreamingNormalDataset(IterableDataset):
+    """
+    대용량 CSV를 라인 단위 스트리밍.
+    MMSI별 슬라이딩 윈도우 버퍼를 유지하며 시퀀스를 on-the-fly 생성.
+    메모리에는 활성 MMSI 버퍼(최대 seq_len 개 레코드)만 유지.
+    shuffle_buf_size: 셔플 버퍼 크기 (시퀀스 단위, 랜덤성 확보용)
+    """
+    def __init__(self, csv_path: str, seq_len: int, scaler: dict,
+                 shuffle_buf_size: int = STREAM_SHUFFLE_BUF):
+        self.csv_path        = csv_path
+        self.seq_len         = seq_len
+        self.scaler          = scaler
+        self.shuffle_buf_size = shuffle_buf_size
+
+    def _scale_seq(self, seq: list) -> list:
+        mins, maxs = self.scaler["min"], self.scaler["max"]
+        result = []
+        for rec in seq:
+            row = []
+            for i, v in enumerate(rec):
+                d = maxs[i] - mins[i]
+                row.append(max(0.0, min(1.0, (v - mins[i]) / d)) if d else 0.0)
+            result.append(row)
+        return result
+
+    def __iter__(self):
+        dt_idx   = FEATURES.index("dt")
+        mmsi_bufs = {}   # mmsi → deque(최대 seq_len 개)
+        shuf_buf  = []
+
+        with open(self.csv_path, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                mmsi = row.get("mmsi", "")
+                if not mmsi:
+                    continue
+                try:
+                    rec = [float(row[col]) for col in FEATURES]
+                except (ValueError, KeyError):
+                    continue
+
+                buf = mmsi_bufs.get(mmsi)
+                if buf is None:
+                    mmsi_bufs[mmsi] = [rec]
+                    continue
+
+                # gap 처리: 시퀀스 연속성 끊김
+                if rec[dt_idx] >= SEQ_BREAK_DT:
+                    mmsi_bufs[mmsi] = [rec]
+                    continue
+
+                buf.append(rec)
+                # 버퍼는 seq_len 개만 유지
+                if len(buf) > self.seq_len:
+                    buf.pop(0)
+
+                if len(buf) == self.seq_len:
+                    window = self._scale_seq(buf)
+                    shuf_buf.append(window)
+
+                    # 셔플 버퍼가 차면 랜덤 위치 아이템 방출 (reservoir-style)
+                    if len(shuf_buf) >= self.shuffle_buf_size:
+                        idx = random.randrange(len(shuf_buf))
+                        yield (torch.tensor(shuf_buf[idx], dtype=torch.float32),
+                               torch.zeros(1))
+                        shuf_buf[idx] = shuf_buf[-1]
+                        shuf_buf.pop()
+
+        # 잔여 셔플 후 방출
+        random.shuffle(shuf_buf)
+        for w in shuf_buf:
+            yield torch.tensor(w, dtype=torch.float32), torch.zeros(1)
+
+
+class BalancedStreamingDataset(IterableDataset):
+    """
+    정상(스트리밍) + 이상(pre-loaded) 1:1 인터리빙.
+    이상 데이터가 소진되면 셔플 후 반복.
+    """
+    def __init__(self, normal_stream: StreamingNormalDataset,
+                 anom_x: torch.Tensor, anom_y: torch.Tensor):
+        self.normal_stream = normal_stream
+        self.anom_x = anom_x
+        self.anom_y = anom_y
+
+    def __iter__(self):
+        anom_idx = list(range(len(self.anom_x)))
+        random.shuffle(anom_idx)
+        anom_pos = 0
+
+        for normal_x, _ in self.normal_stream:
+            yield normal_x, torch.zeros(1)
+
+            # 이상 샘플 1개 인터리빙 (순환)
+            if anom_pos >= len(anom_idx):
+                random.shuffle(anom_idx)
+                anom_pos = 0
+            i = anom_idx[anom_pos]
+            anom_pos += 1
+            yield self.anom_x[i], self.anom_y[i]
+
+
+def build_dataset_streaming(args):
+    """
+    스트리밍 모드용 데이터셋 빌더.
+    - 스케일러: CSV 앞부분 샘플(SCALER_SAMPLE_SIZE)로 계산
+    - 이상 데이터: 전부 pre-load (크기 작음)
+    - 정상 데이터: StreamingNormalDataset으로 스트리밍
+    """
+    from eval_anomaly import SCENARIO_MAKERS
+
+    csv_candidates = [
+        f"{DATA_DIR}/ais_preprocessed.csv",
+        f"{DATA_DIR}/ais-2024-01-01_preprocessed.csv",
+        f"{DATA_DIR}/ais-2025-01-25_preprocessed.csv",
+        f"{DATA_DIR}/ais-2025-12-31_preprocessed.csv",
+        "ais_preprocessed.csv",
+        "ais-2025-01-25_preprocessed.csv",
+    ]
+    csv_path = None
+    for cand in csv_candidates:
+        if os.path.exists(cand) and os.path.getsize(cand) > 0:
+            csv_path = cand
+            break
+    if csv_path is None:
+        print("  [오류] 정상 CSV 데이터를 찾을 수 없습니다.")
+        sys.exit(1)
+    print(f"  [스트리밍] CSV: {csv_path}")
+
+    # ── 스케일러: 앞부분 샘플로 계산 ────────────────────────────────
+    print(f"  [스케일러] 샘플 {SCALER_SAMPLE_SIZE:,}개로 계산 중...")
+    scaler_sample = load_normal_from_csv(csv_path, args.seq_len,
+                                         max_seqs=SCALER_SAMPLE_SIZE)
+    mins, maxs = compute_scaler(scaler_sample)
+    save_scaler(mins, maxs, SCALER_SUP)
+    scaler_dict = {"min": mins, "max": maxs}
+    print(f"  [스케일러] 저장 → {SCALER_SUP}")
+
+    # ── 이상 시퀀스 생성 (pre-load) ─────────────────────────────────
+    anom_makers = [(name, maker) for name, maker, is_anom, is_holdout
+                   in SCENARIO_MAKERS if is_anom and not is_holdout]
+    holdout_cnt = sum(1 for _, _, ia, ih in SCENARIO_MAKERS if ia and ih)
+    n_anom = args.n_anom if args.n_anom is not None else 1000
+
+    print(f"  [이상] {len(anom_makers)}개 시나리오 × {n_anom}개  "
+          f"(홀드아웃 {holdout_cnt}개 제외)")
+    anom_seqs = []
+    for name, maker in tqdm(anom_makers, desc="  이상 시나리오", leave=False):
+        for _ in range(n_anom):
+            try:
+                seq = maker()[-args.seq_len:]
+                anom_seqs.append(scale_seq(seq, mins, maxs))
+            except Exception:
+                pass
+    print(f"    → {len(anom_seqs):,}개 생성")
+
+    anom_x = torch.tensor(anom_seqs, dtype=torch.float32)
+    anom_y = torch.ones(len(anom_seqs), 1)
+    return csv_path, scaler_dict, anom_x, anom_y
+
+
+def make_loaders_streaming(csv_path: str, scaler_dict: dict,
+                            anom_x: torch.Tensor, anom_y: torch.Tensor,
+                            args) -> tuple:
+    """
+    스트리밍 train_loader + pre-loaded val_loader 생성.
+    검증 세트는 CSV 앞부분 소량 + 이상 일부로 구성.
+    """
+    n_val_each = max(500, int(len(anom_x) * args.val_ratio))
+
+    # 검증용 정상 소량 pre-load
+    print(f"  [검증셋] 정상 {n_val_each:,}개 pre-load 중...")
+    val_raw = load_normal_from_csv(csv_path, args.seq_len, max_seqs=n_val_each)
+    mins, maxs = scaler_dict["min"], scaler_dict["max"]
+    val_normal = [scale_seq(s, mins, maxs) for s in val_raw]
+
+    # 이상 데이터 검증/훈련 분할
+    n_val_anom   = min(n_val_each, len(anom_x))
+    val_anom_x   = anom_x[:n_val_anom]
+    val_anom_y   = anom_y[:n_val_anom]
+    train_anom_x = anom_x[n_val_anom:]
+    train_anom_y = anom_y[n_val_anom:]
+
+    # 검증 DataLoader (TensorDataset, 전체 메모리)
+    val_nx = torch.tensor(val_normal, dtype=torch.float32)
+    val_ny = torch.zeros(len(val_normal), 1)
+    val_x  = torch.cat([val_nx, val_anom_x])
+    val_y  = torch.cat([val_ny, val_anom_y])
+    val_loader = DataLoader(TensorDataset(val_x, val_y),
+                            batch_size=args.batch, shuffle=False)
+    print(f"  [검증셋] 정상 {len(val_normal):,} + 이상 {n_val_anom:,} = {len(val_x):,}")
+
+    # 훈련 스트리밍 DataLoader
+    normal_stream = StreamingNormalDataset(
+        csv_path, args.seq_len, scaler_dict,
+        shuffle_buf_size=STREAM_SHUFFLE_BUF)
+    train_ds = BalancedStreamingDataset(normal_stream, train_anom_x, train_anom_y)
+    # IterableDataset은 num_workers>0 시 주의 필요 → 0으로 고정
+    train_loader = DataLoader(train_ds, batch_size=args.batch,
+                              num_workers=0, pin_memory=False)
+    print(f"  [훈련셋] 스트리밍 (전체 CSV) + 이상 {len(train_anom_x):,}개")
+
     return train_loader, val_loader
 
 
@@ -834,6 +1062,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=DEFAULTS["weight_decay"])
     parser.add_argument("--device",       type=str,   default="auto",
                         help="cuda / cpu / auto")
+    parser.add_argument("--streaming",    action="store_true",
+                        help="대용량 CSV 스트리밍 모드 (메모리 절약, 전체 데이터 학습)")
     args = parser.parse_args()
 
     # 출력/데이터 디렉터리 생성
@@ -847,11 +1077,17 @@ def main():
         device = torch.device(args.device)
     print(f"[디바이스] {device}")
 
-    # 데이터 준비 (스케일러는 CSV에서 자동 계산)
+    # 데이터 준비
     print("\n[데이터 준비]")
-    X_t, y_t = build_dataset(args)
-    train_loader, val_loader = make_loaders(X_t, y_t, args.batch, args.val_ratio)
-    print(f"  train: {len(train_loader.dataset):,}  val: {len(val_loader.dataset):,}")
+    if args.streaming:
+        print("  모드: 스트리밍 (대용량 CSV 전체 학습)")
+        csv_path, scaler_dict, anom_x, anom_y = build_dataset_streaming(args)
+        train_loader, val_loader = make_loaders_streaming(
+            csv_path, scaler_dict, anom_x, anom_y, args)
+    else:
+        X_t, y_t = build_dataset(args)
+        train_loader, val_loader = make_loaders(X_t, y_t, args.batch, args.val_ratio)
+        print(f"  train: {len(train_loader.dataset):,}  val: {len(val_loader.dataset):,}")
 
     # 학습 대상 모델 목록
     targets = ALL_MODELS if args.model == "all" else [args.model]
