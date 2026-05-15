@@ -1017,37 +1017,64 @@ RULES = [
     ("COG/HDG 불일치(>90°)", _rule_cog_hdg),
 ]
 
+def _apply_rules(seqs):
+    """시퀀스 리스트에 룰 적용 → {rule_name: 탐지수}, 합산 탐지수 반환"""
+    counts = {name: 0 for name, _ in RULES}
+    any_count = 0
+    for seq in seqs:
+        fired = False
+        for name, rule_fn in RULES:
+            if any(rule_fn(step) for step in seq):
+                counts[name] += 1
+                fired = True
+        if fired:
+            any_count += 1
+    return counts, any_count
+
 def analysis_rule_fp(raw_seqs):
-    """룰 기반 탐지를 정상 시퀀스에 적용 → 오탐율 측정"""
+    """룰 기반: 정상 시퀀스 오탐율 + 이상 시나리오 탐지율"""
     if raw_seqs is None:
         return
     print("\n" + "="*60)
-    print("  [룰 기반 오탐율 분석]")
-    print("  (정상 시퀀스에서 룰이 얼마나 잘못 발동되는지)")
+    print("  [룰 기반 탐지율 / 오탐율 분석]")
     print("="*60)
 
+    # ── 오탐율 (정상 시퀀스) ──────────────────────────────────────
     n = len(raw_seqs)
-    # 시퀀스 단위: 한 스텝이라도 룰에 걸리면 오탐으로 카운트
-    seq_fp   = {name: 0 for name, _ in RULES}
-    seq_any  = 0
+    fp_counts, fp_any = _apply_rules(raw_seqs)
 
-    for seq in raw_seqs:
-        fired_any = False
-        for name, rule_fn in RULES:
-            if any(rule_fn(step) for step in seq):
-                seq_fp[name] += 1
-                fired_any = True
-        if fired_any:
-            seq_any += 1
-
-    print(f"\n  정상 시퀀스 수: {n:,}개\n")
-    print(f"  {'룰':<25} {'오탐 수':>8} {'오탐율':>8}")
-    print(f"  {'─'*25} {'─'*8} {'─'*8}")
+    print(f"\n  [오탐율] 정상 시퀀스 {n:,}개")
+    print(f"  {'룰':<26} {'오탐율':>8}")
+    print(f"  {'─'*26} {'─'*8}")
     for name, _ in RULES:
-        cnt = seq_fp[name]
-        print(f"  {name:<25} {cnt:>8,} {cnt/n*100:>7.2f}%")
-    print(f"  {'─'*25} {'─'*8} {'─'*8}")
-    print(f"  {'룰 합산 (OR)':<25} {seq_any:>8,} {seq_any/n*100:>7.2f}%")
+        print(f"  {name:<26} {fp_counts[name]/n*100:>7.2f}%")
+    print(f"  {'─'*26} {'─'*8}")
+    print(f"  {'룰 합산 (OR)':<26} {fp_any/n*100:>7.2f}%")
+
+    # ── 탐지율 (이상 시나리오) ────────────────────────────────────
+    N_ANOM = _G_N_ANOM
+    anom_scenarios = [(name, maker, is_holdout)
+                      for name, maker, is_anom, is_holdout in SCENARIO_MAKERS if is_anom]
+
+    print(f"\n  [탐지율] 시나리오당 {N_ANOM:,}개")
+    col_w = 10
+    header = f"  {'시나리오':<22}"
+    for name, _ in RULES:
+        header += rjust(name, col_w + len(name) - sum(2 if 0xAC00<=ord(c)<=0xD7A3 else 1 for c in name) + col_w)[:col_w+4]
+    header += f"  {'OR합산':>8}  {'구분':>6}"
+    print(f"\n  {'시나리오':<22}" +
+          "".join(f"  {n:>12}" for n, _ in RULES) +
+          f"  {'OR합산':>8}  {'구분':>6}")
+    print("  " + "─" * (22 + 14*len(RULES) + 18))
+
+    for scen_name, maker, is_holdout in anom_scenarios:
+        seqs = [maker() for _ in range(N_ANOM)]
+        counts, any_c = _apply_rules(seqs)
+        tag = "홀드아웃" if is_holdout else "학습"
+        row = f"  {scen_name:<22}"
+        row += "".join(f"  {counts[n]/N_ANOM*100:>11.1f}%" for n, _ in RULES)
+        row += f"  {any_c/N_ANOM*100:>7.1f}%  {tag:>6}"
+        print(row)
     print()
 
 
@@ -1646,6 +1673,9 @@ def main():
     IS_WEIGHTED = bool(args.weighted)
     IS_ENSEMBLE = bool(args.ensemble) and not IS_WEIGHTED
 
+    # --rule 단독 모드: 모델 없이 룰만 실행
+    RULE_ONLY = args.rule and not args.model and not args.weighted and not args.ensemble
+
     if IS_WEIGHTED:
         model_names = args.weighted
         w_sessions, w_scalers = [], []
@@ -1655,7 +1685,6 @@ def main():
         mins, maxs = w_scalers[0]
         n_models = len(model_names)
         weights = args.weights if args.weights and len(args.weights)==n_models                   else [1.0/n_models]*n_models
-        # 정규화
         wsum = sum(weights)
         weights = [w/wsum for w in weights]
     elif IS_ENSEMBLE:
@@ -1667,6 +1696,8 @@ def main():
                 thresholds.append(float(f.read()))
             scalers.append(load_scaler(os.path.join(OUTPUT_DIR, f"scaler_{name}.json")))
         mins, maxs = scalers[0]
+    elif RULE_ONLY:
+        mins, maxs = [0.0]*len(FEATURES), [1.0]*len(FEATURES)  # 스케일러 불필요
     else:
         mins, maxs = load_scaler(SCALER_FILE)
         with open(THRESHOLD_FILE) as f:
@@ -1704,10 +1735,12 @@ def main():
                                         target_fp=args.target_fp, real_seqs=real_seqs)
         elif IS_ENSEMBLE:
             analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, real_seqs=real_seqs)
+        elif RULE_ONLY:
+            analysis_rule_fp(raw_seqs)
         else:
             # 탐지율(분석1)은 항상 실행
             analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
-            if args.rule: analysis_rule_fp(raw_seqs)
+            if args.rule:  analysis_rule_fp(raw_seqs)
             if args.corr:  analysis_correlation()
             if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
             if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
