@@ -30,3 +30,6 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# Claude Code 설정
+.claude/
