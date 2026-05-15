@@ -999,22 +999,53 @@ SCENARIO_MAKERS = [
 # 룰 기반 오탐율 분석
 # ══════════════════════════════════════════════════════════════════
 # FEATURES 인덱스
-_I_SOG     = FEATURES.index("sog")
-_I_STATUS  = FEATURES.index("status")
-_I_CHD     = FEATURES.index("cog_hdg_diff")   # -1이면 HDG 무효
+_I_SOG      = FEATURES.index("sog")
+_I_STATUS   = FEATURES.index("status")
+_I_CHD      = FEATURES.index("cog_hdg_diff")
+_I_DT       = FEATURES.index("dt")
+_I_DIST     = FEATURES.index("dist_km")
+_I_SOG_CH   = FEATURES.index("sog_change")
+_I_SPEED_C  = FEATURES.index("speed_consistency")
 
 def _rule_anchor_move(step):
     """정박/계류 중 이동: navStatus 1/5/6 AND SOG >= 3.0"""
     return int(round(step[_I_STATUS])) in (1, 5, 6) and step[_I_SOG] >= 3.0
 
 def _rule_cog_hdg(step):
-    """COG/HDG 불일치: diff > 90도 + SOG >= 2.0kn (저속시 COG 무의미)"""
+    """COG/HDG 불일치: diff > 90° + SOG >= 2.0kn"""
     chd = step[_I_CHD]
     return chd >= 0 and chd > 90.0 and step[_I_SOG] >= 2.0
 
+def _rule_overspeed(step):
+    """물리적 속도 초과: SOG > 50kn (일반 선박 물리적 한계 초과)"""
+    return step[_I_SOG] > 50.0
+
+def _rule_sog_spike(step):
+    """순간 속도 급변: 한 스텝 내 SOG 변화 > 15kn"""
+    return step[_I_SOG_CH] > 15.0
+
+def _rule_speed_dist_mismatch(step):
+    """속도-거리 불일치: 보고 SOG 대비 실제 이동거리 10배 이상
+    speed_consistency = dist / (SOG*dt 기반 예상거리), SOG > 1kn 조건"""
+    sc = step[_I_SPEED_C]
+    return step[_I_SOG] > 1.0 and sc > 10.0
+
+def _rule_signal_gap(step):
+    """비정상 신호 간격: dt > 600초 (10분 이상 소실 후 재등장)"""
+    return step[_I_DT] > 600.0
+
+def _rule_zero_sog_moving(step):
+    """SOG=0 보고인데 실제 이동: SOG < 0.3 AND dist_km > 0.05 AND dt < 120"""
+    return step[_I_SOG] < 0.3 and step[_I_DIST] > 0.05 and step[_I_DT] < 120.0
+
 RULES = [
-    ("정박/계류 중 이동",   _rule_anchor_move),
-    ("COG/HDG 불일치(>90°)", _rule_cog_hdg),
+    ("정박/계류 중 이동",      _rule_anchor_move),
+    ("COG/HDG 불일치(>90°)",   _rule_cog_hdg),
+    ("물리적 속도 초과(>50kn)", _rule_overspeed),
+    ("순간 SOG 급변(>15kn)",   _rule_sog_spike),
+    ("속도-거리 불일치(×10)",   _rule_speed_dist_mismatch),
+    ("신호 간격 이상(>600s)",   _rule_signal_gap),
+    ("SOG=0 실제이동",          _rule_zero_sog_moving),
 ]
 
 def _apply_rules(seqs):
@@ -1662,6 +1693,8 @@ def main():
         elif args.ensemble:
             args.output = os.path.join(OUTPUT_DIR, "ensemble",
                                        f"eval_result_{'_'.join(args.ensemble)}_ensemble.txt")
+        elif args.rule and not args.model:
+            args.output = os.path.join(OUTPUT_DIR, "eval_result_rule.txt")
         else:
             _m = args.model or "lstm"
             args.output = os.path.join(OUTPUT_DIR, _m, f"eval_result_{_m}.txt")
