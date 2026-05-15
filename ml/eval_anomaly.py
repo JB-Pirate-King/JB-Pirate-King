@@ -205,7 +205,7 @@ def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
     sampled = all_seqs if n_seqs is None else all_seqs[:n_seqs]
     scaled  = [scale_seq(seq, mins, maxs) for seq in sampled]
     print(f"  실제 정상 시퀀스 로드: {len(scaled):,}개 (전체 풀: {len(all_seqs):,})")
-    return scaled
+    return scaled, sampled   # scaled(ML용), raw(룰 평가용)
 
 
 
@@ -785,6 +785,170 @@ def make_lstm_beat_seq():
     return _build_derived(steps)
 
 
+# ── G: 완전 신규 홀드아웃 시나리오 ────────────────────────────────
+
+def make_circular_loop_seq():
+    """G1-CircularLoop: 좁은 해역 반복 배회 (밀수/대기 패턴)"""
+    radius_deg = random.uniform(0.005, 0.02)   # ~0.5~2km 반경
+    center_lat = 37. + random.uniform(-0.1, 0.1)
+    center_lon = 126. + random.uniform(-0.1, 0.1)
+    start_ang  = random.uniform(0, 360)
+    sog        = random.uniform(3, 8)
+    # 원주를 SEQ_LEN 스텝으로 균등 분할
+    arc        = random.uniform(180, 360)       # 반원~한 바퀴
+    steps = []
+    prev_lat, prev_lon = center_lat, center_lon
+    for i in range(SEQ_LEN):
+        ang = math.radians(start_ang + arc * i / max(SEQ_LEN - 1, 1))
+        lat = center_lat + radius_deg * math.cos(ang)
+        lon = center_lon + radius_deg * math.sin(ang)
+        dt  = random.uniform(15, 40)
+        if i == 0:
+            dist = 0.0; cog = start_ang % 360
+        else:
+            dlat = lat - prev_lat; dlon = lon - prev_lon
+            dist = math.hypot(dlat, dlon) * 111.
+            cog  = math.degrees(math.atan2(dlon, dlat)) % 360
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+        prev_lat, prev_lon = lat, lon
+    return _build_derived(steps)
+
+
+def make_speed_burst_seq():
+    """G2-SpeedBurst: 정상 속도 중 급격한 속도 급증 후 즉시 복귀 (회피 기동)"""
+    base_sog  = random.uniform(5, 12)
+    burst_sog = random.uniform(35, 60)           # 물리적으로 불가능한 속도
+    burst_at  = random.randint(1, max(1, SEQ_LEN - 2))
+    cog = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        sog = burst_sog if i == burst_at else base_sog
+        dt  = random.uniform(10, 30)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-5, 5)) % 360
+    return _build_derived(steps)
+
+
+def make_phantom_hdg_seq():
+    """G3-PhantomHDG: 정지/저속인데 HDG가 계속 랜덤하게 바뀜 (유령 선박)"""
+    sog = random.uniform(0, 1.5)
+    lat, lon = 37. + random.uniform(-0.05, 0.05), 126. + random.uniform(-0.05, 0.05)
+    steps = []
+    for _ in range(SEQ_LEN):
+        hdg  = random.randint(0, 359)           # 랜덤 HDG
+        cog  = random.uniform(0, 360)
+        dt   = random.uniform(10, 30)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": hdg,
+                       "status": random.choice([0, 1, 5]),
+                       "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+
+def make_status_flicker_seq():
+    """G4-StatusFlicker: navStatus가 빠르게 무작위 변환 (상태 조작)"""
+    sog = random.uniform(5, 12)
+    cog = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    status_pool = [0, 1, 2, 3, 5, 6, 7, 8]
+    steps = []
+    for _ in range(SEQ_LEN):
+        status = random.choice(status_pool)
+        dt     = random.uniform(10, 30)
+        dist   = sog * dt / 3600 * 1.852
+        lat   += math.cos(math.radians(cog)) * dist / 111.
+        lon   += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": status, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-3, 3)) % 360
+    return _build_derived(steps)
+
+
+def make_zigzag_accel_seq():
+    """G5-ZigzagAccel: 속도와 방향을 교대로 급변 (비정상 기동)"""
+    lat, lon = 37., 126.
+    sog = random.uniform(6, 10)
+    cog = random.uniform(0, 360)
+    steps = []
+    for i in range(SEQ_LEN):
+        # 짝수 스텝: 방향 +60~120도 전환 + 속도 증가
+        # 홀수 스텝: 방향 -60~120도 전환 + 속도 감소
+        if i % 2 == 0:
+            cog = (cog + random.uniform(60, 120)) % 360
+            sog = min(30, sog + random.uniform(5, 10))
+        else:
+            cog = (cog - random.uniform(60, 120)) % 360
+            sog = max(1, sog - random.uniform(5, 10))
+        dt   = random.uniform(10, 25)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+
+def make_land_route_seq():
+    """G6-LandRoute: 해상이 아닌 육지 경유 직선 이동 (위치 조작)"""
+    # 실제 육지 좌표 (한국 내륙)로 이동하는 궤적 시뮬레이션
+    # 위도 변화량이 비정상적으로 커서 dist vs SOG 불일치
+    sog  = random.uniform(8, 14)
+    cog  = random.uniform(0, 360)
+    lat  = 37. + random.uniform(-0.05, 0.05)
+    lon  = 126. + random.uniform(-0.05, 0.05)
+    # 비정상: dist_km이 SOG×dt 대비 10~30배 과장
+    fake_scale = random.uniform(10, 30)
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt      = random.uniform(10, 30)
+        real_d  = sog * dt / 3600 * 1.852
+        fake_d  = real_d * fake_scale       # 실제 이동보다 훨씬 큰 거리 보고
+        lat    += math.cos(math.radians(cog)) * fake_d / 111.
+        lon    += math.sin(math.radians(cog)) * fake_d / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": fake_d,
+                       "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-5, 5)) % 360
+    return _build_derived(steps)
+
+
+def make_mmsi_spoof_seq():
+    """G7-MMSISpoof: 정상처럼 보이나 SOG/dist 일관성이 미세하게 깨짐 (MMSI 복제 흔적)"""
+    # 두 선박의 신호가 합쳐진 것처럼 위치 연속성이 미세 불일치
+    sog  = random.uniform(8, 14)
+    cog  = random.uniform(0, 360)
+    lat  = 37. + random.uniform(-0.05, 0.05)
+    lon  = 126. + random.uniform(-0.05, 0.05)
+    steps = []
+    for i in range(SEQ_LEN):
+        dt   = random.uniform(10, 30)
+        dist = sog * dt / 3600 * 1.852
+        # 짝수 스텝마다 위치를 살짝 다른 선박 위치로 점프 (미세 불연속)
+        if i % 2 == 0 and i > 0:
+            lat += random.uniform(-0.003, 0.003)
+            lon += random.uniform(-0.003, 0.003)
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-2, 2)) % 360
+        sog = max(2, min(25, sog + random.gauss(0, 0.3)))
+    return _build_derived(steps)
+
+
 # ── SCENARIO_MAKERS ───────────────────────────────────────────────
 SCENARIO_MAKERS = [
     # (name, maker, is_anom, is_holdout)
@@ -818,9 +982,73 @@ SCENARIO_MAKERS = [
     ("F5-MultiCoord",make_multi_coord_seq,       True,  True),
     ("F6-AISGap",    make_ais_gap_seq,           True,  True),
     ("F7-LSTMBeat",  make_lstm_beat_seq,         True,  True),
+    # G: 완전 신규 홀드아웃 — 학습에 전혀 없는 공격 유형
+    ("G1-CircularLoop", make_circular_loop_seq,  True,  True),
+    ("G2-SpeedBurst",   make_speed_burst_seq,    True,  True),
+    ("G3-PhantomHDG",   make_phantom_hdg_seq,    True,  True),
+    ("G4-StatusFlicker",make_status_flicker_seq, True,  True),
+    ("G5-ZigzagAccel",  make_zigzag_accel_seq,   True,  True),
+    ("G6-LandRoute",    make_land_route_seq,      True,  True),
+    ("G7-MMSISpoof",    make_mmsi_spoof_seq,      True,  True),
 ]
 
 
+
+
+# ══════════════════════════════════════════════════════════════════
+# 룰 기반 오탐율 분석
+# ══════════════════════════════════════════════════════════════════
+# FEATURES 인덱스
+_I_SOG     = FEATURES.index("sog")
+_I_STATUS  = FEATURES.index("status")
+_I_CHD     = FEATURES.index("cog_hdg_diff")   # -1이면 HDG 무효
+
+def _rule_anchor_move(step):
+    """정박/계류 중 이동: navStatus 1/5/6 AND SOG >= 3.0"""
+    return int(round(step[_I_STATUS])) in (1, 5, 6) and step[_I_SOG] >= 3.0
+
+def _rule_cog_hdg(step):
+    """COG/HDG 불일치: diff > 90도 + SOG >= 2.0kn (저속시 COG 무의미)"""
+    chd = step[_I_CHD]
+    return chd >= 0 and chd > 90.0 and step[_I_SOG] >= 2.0
+
+RULES = [
+    ("정박/계류 중 이동",   _rule_anchor_move),
+    ("COG/HDG 불일치(>90°)", _rule_cog_hdg),
+]
+
+def analysis_rule_fp(raw_seqs):
+    """룰 기반 탐지를 정상 시퀀스에 적용 → 오탐율 측정"""
+    if raw_seqs is None:
+        return
+    print("\n" + "="*60)
+    print("  [룰 기반 오탐율 분석]")
+    print("  (정상 시퀀스에서 룰이 얼마나 잘못 발동되는지)")
+    print("="*60)
+
+    n = len(raw_seqs)
+    # 시퀀스 단위: 한 스텝이라도 룰에 걸리면 오탐으로 카운트
+    seq_fp   = {name: 0 for name, _ in RULES}
+    seq_any  = 0
+
+    for seq in raw_seqs:
+        fired_any = False
+        for name, rule_fn in RULES:
+            if any(rule_fn(step) for step in seq):
+                seq_fp[name] += 1
+                fired_any = True
+        if fired_any:
+            seq_any += 1
+
+    print(f"\n  정상 시퀀스 수: {n:,}개\n")
+    print(f"  {'룰':<25} {'오탐 수':>8} {'오탐율':>8}")
+    print(f"  {'─'*25} {'─'*8} {'─'*8}")
+    for name, _ in RULES:
+        cnt = seq_fp[name]
+        print(f"  {name:<25} {cnt:>8,} {cnt/n*100:>7.2f}%")
+    print(f"  {'─'*25} {'─'*8} {'─'*8}")
+    print(f"  {'룰 합산 (OR)':<25} {seq_any:>8,} {seq_any/n*100:>7.2f}%")
+    print()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1379,6 +1607,7 @@ def main():
     parser.add_argument("--recon",  action="store_true", help="[분석 3] 재구성 오차 분해")
     parser.add_argument("--perm",   action="store_true", help="[분석 4] Permutation Importance")
     parser.add_argument("--all",    action="store_true", help="분석 1~4 전부 실행")
+    parser.add_argument("--rule",   action="store_true", help="룰 기반 오탐율 분석")
     parser.add_argument("--output", type=str, default=None,
                         help="텍스트 결과 저장 파일명 (기본: eval_result_{model}.txt)")
     parser.add_argument("--n_normal", type=int, default=3000,
@@ -1463,9 +1692,12 @@ def main():
 
         print("\n실제 정상 시퀀스 로드 중...")
         _n_normal = None if args.n_normal == 0 else args.n_normal
-        real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=_n_normal)
-        if real_seqs is None:
+        result = load_real_normal_seqs(mins, maxs, n_seqs=_n_normal)
+        if result is None:
             print(f"  ⚠ {DATA_FILE} 없음 - 합성 정상 시퀀스 사용")
+            real_seqs, raw_seqs = None, None
+        else:
+            real_seqs, raw_seqs = result
 
         if IS_WEIGHTED:
             analysis_detection_weighted(w_sessions, model_names, weights, mins, maxs,
@@ -1475,6 +1707,7 @@ def main():
         else:
             # 탐지율(분석1)은 항상 실행
             analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
+            if args.rule: analysis_rule_fp(raw_seqs)
             if args.corr:  analysis_correlation()
             if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
             if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)

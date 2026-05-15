@@ -583,18 +583,6 @@ void ais_ids_pi::UpdateAppendToFile(bool bAppendToFile)
 }
 
 
-void ais_ids_pi::SetPositionFixEx(PlugIn_Position_Fix_Ex &pfix)
-{
-    // GPS 수신 확인용 로그 (첫 수신 시 1회만 출력)
-    static bool s_logged = false;
-    if (!s_logged && m_tpControlDialogImpl) {
-        m_tpControlDialogImpl->SendMessage(wxString::Format(
-            "[GPS] Fix received: LAT=%.6f LON=%.6f SOG=%.1f COG=%.1f nSats=%d",
-            pfix.Lat, pfix.Lon, pfix.Sog, pfix.Cog, pfix.nSats));
-        s_logged = true;
-    }
-}
-
 void ais_ids_pi::SetAISSentence(wxString &sentence)
 {
 
