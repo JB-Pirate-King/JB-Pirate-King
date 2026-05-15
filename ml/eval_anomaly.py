@@ -21,7 +21,7 @@ OR 앙상블 평가 (개별 임계값 기준):
     python eval_anomaly.py --weighted dcdetect tranad conv1d --weights 0.6 0.2 0.2
 
 입력 데이터:
-    data/ais-2025-01-25_preprocessed.csv
+    data/ais-2024-01-01_preprocessed.csv
 
 결과 파일:
     output/{model}/eval_result_{model}.txt
@@ -88,6 +88,12 @@ _KNOWN_MODELS = [
     "usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm",
     # 지도 학습 모델 (model_sup_*.onnx)
     "sup_patchtst","sup_itrans","sup_tsmixer","sup_moderntcn","sup_mamba",
+    # seq_len 포함 버전
+    "sup_moderntcn_seq5","sup_moderntcn_seq10",
+    "sup_patchtst_seq5","sup_patchtst_seq10",
+    "sup_itrans_seq5","sup_itrans_seq10",
+    "sup_tsmixer_seq5","sup_tsmixer_seq10",
+    "sup_mamba_seq5","sup_mamba_seq10",
 ]
 _SUP_MODELS = [m for m in _KNOWN_MODELS if m.startswith("sup_")]
 
@@ -98,13 +104,23 @@ if _args_pre.model and _args_pre.model in _KNOWN_MODELS:
     _mdir = os.path.join(OUTPUT_DIR, _args_pre.model)
     MODEL_FILE     = os.path.join(_mdir, f"model_{_args_pre.model}.onnx")
     THRESHOLD_FILE = os.path.join(_mdir, f"threshold_{_args_pre.model}.txt")
-    # 지도 학습 모델은 전용 스케일러(scaler_sup.json) 사용
+    # 지도 학습 모델: 모델 폴더 내 스케일러 우선, 없으면 output/ 루트 폴백
     if _args_pre.model in _SUP_MODELS:
-        SCALER_FILE = os.path.join(OUTPUT_DIR, "scaler_sup.json")
+        _scaler_in_dir = os.path.join(_mdir, f"scaler_{_args_pre.model}.json")
+        if os.path.exists(_scaler_in_dir):
+            SCALER_FILE = _scaler_in_dir
+        else:
+            SCALER_FILE = os.path.join(OUTPUT_DIR, "scaler_sup.json")
     else:
         SCALER_FILE = os.path.join(OUTPUT_DIR, f"scaler_{_args_pre.model}.json")
 
-IS_SUPERVISED = MODEL_FILE.startswith("model_sup_")
+IS_SUPERVISED = (_args_pre.model in _SUP_MODELS) if _args_pre.model else False
+
+# seq_len 자동 설정 (모델 이름에 _seq5/_seq10 포함 시)
+if _args_pre.model and "_seq5" in _args_pre.model:
+    SEQ_LEN = 5
+elif _args_pre.model and "_seq10" in _args_pre.model:
+    SEQ_LEN = 10
 
 
 # ── 스케일러 ──────────────────────────────────────────────────────
