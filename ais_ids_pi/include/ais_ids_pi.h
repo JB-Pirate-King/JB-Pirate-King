@@ -217,6 +217,7 @@ public:
     void UpdateCloseAfterSave(bool bCloseAfterSave);
     void UpdateAppendToFile(bool bAppendToFile);
     void SetAISSentence(wxString &sentence);
+    void SetPositionFixEx(PlugIn_Position_Fix_Ex &pfix);
     bool RenderOverlayMultiCanvas(wxDC &dc, PlugIn_ViewPort *vp, 
                                           int canvasIndex, int priority);
     bool RenderGLOverlayMultiCanvas(wxGLContext *pcontext, PlugIn_ViewPort *vp,
