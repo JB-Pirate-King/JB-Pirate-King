@@ -240,10 +240,11 @@ def build_dataset(args):
         print("  [오류] 정상 CSV 데이터를 찾을 수 없습니다. CSV 파일을 ml/data/ 폴더에 확인하세요.")
         sys.exit(1)
 
-    # ── 스케일러: 정상 데이터에서 직접 계산 후 저장 ─────────────
+    # ── 스케일러: 정상 데이터에서 직접 계산 후 저장 (seq_len별 분리) ─
+    scaler_path = os.path.join(OUTPUT_DIR, f"scaler_sup_seq{args.seq_len}.json")
     mins, maxs = compute_scaler(raw_normal)
-    save_scaler(mins, maxs, SCALER_SUP)
-    print(f"  [스케일러] 정상 데이터 기반으로 계산 → {SCALER_SUP}")
+    save_scaler(mins, maxs, scaler_path)
+    print(f"  [스케일러] 정상 데이터 기반으로 계산 → {scaler_path}")
 
     normal_seqs = [scale_seq(seq, mins, maxs) for seq in raw_normal]
 
@@ -441,10 +442,11 @@ def build_dataset_streaming(args):
     print(f"  [스케일러] 샘플 {SCALER_SAMPLE_SIZE:,}개로 계산 중...")
     scaler_sample = load_normal_from_csv(csv_path, args.seq_len,
                                          max_seqs=SCALER_SAMPLE_SIZE)
+    scaler_path = os.path.join(OUTPUT_DIR, f"scaler_sup_seq{args.seq_len}.json")
     mins, maxs = compute_scaler(scaler_sample)
-    save_scaler(mins, maxs, SCALER_SUP)
+    save_scaler(mins, maxs, scaler_path)
     scaler_dict = {"min": mins, "max": maxs}
-    print(f"  [스케일러] 저장 → {SCALER_SUP}")
+    print(f"  [스케일러] 저장 → {scaler_path}")
 
     # ── 이상 시퀀스 생성 (pre-load) ─────────────────────────────────
     anom_makers = [(name, maker) for name, maker, is_anom, is_holdout
