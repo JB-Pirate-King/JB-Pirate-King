@@ -17,12 +17,38 @@ ml/
 
 ---
 
-## 데이터 경로
+## 디렉터리 구조
 
-| 경로 | 설명 |
-|---|---|
-| `D:\ais_data\raw\` | 원본 AIS CSV 다운로드 위치 (기본 raw_data) |
-| `data/ais_preprocessed.csv` | 전처리 완료 파일 (기본 data_file) |
+```
+D:\                                         ← --base_dir 기본값
+├── ais_data\
+│   ├── raw\2025\                           # 원본 .csv.zst (172개)
+│   └── preprocessed\2025\
+│       ├── daily\                          # 일별 전처리 결과
+│       └── ais_preprocessed_2025.csv       # 연도 합산본 (pipeline 기본값)
+├── ais_models\                             # 학습 모델 파일
+│   ├── model_{name}.onnx
+│   ├── scaler_{name}.json
+│   └── threshold_{name}.txt
+└── ais_output\
+    └── pipeline\
+        ├── comparison_TIMESTAMP.txt
+        ├── comparison_TIMESTAMP.csv        # 통합 CSV
+        └── {model}_TIMESTAMP.csv           # 모델별 개별 CSV
+```
+
+### 전처리 실행 순서
+
+```bash
+# 1단계: 일별 전처리 (raw → daily/)
+python preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
+
+# 2단계: 합산 (daily/ → 연도 합산본)
+python preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
+    --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+```
+
+> 새 날짜 데이터가 추가되면 해당 날짜만 1단계 재실행 후 2단계로 합산.
 
 ---
 
@@ -62,8 +88,9 @@ python pipeline.py --eval --models dcdetect tranad --fp_targets 1 5 10 --n_anom 
 | `--preprocess` | — | 원본 CSV → 전처리 실행 |
 | `--train` | — | 지정 모델 학습 |
 | `--eval` | — | 탐지율 비교 평가 |
-| `--raw_data` | `D:\ais_data\raw` | 원본 AIS CSV 폴더 |
-| `--data_file` | `data/ais_preprocessed.csv` | 전처리 결과 파일 |
+| `--base_dir` | `D:\` | 출력 기본 경로 (모델·결과 저장 루트) |
+| `--raw_data` | `D:\ais_data\raw\2025` | 원본 AIS CSV 폴더 |
+| `--data_file` | `D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv` | 전처리 결과 파일 |
 | `--models` | — | 비교 모델 목록 |
 | `--all_models` | — | 전체 14개 모델 |
 | `--unsup` | — | 비지도 9개 모델 |
@@ -74,8 +101,9 @@ python pipeline.py --eval --models dcdetect tranad --fp_targets 1 5 10 --n_anom 
 | `--skip_trained` | — | 이미 학습된 모델 건너뜀 |
 
 출력:
-- `output/pipeline/comparison_TIMESTAMP.txt` — 텍스트 비교 테이블
-- `output/pipeline/comparison_TIMESTAMP.csv` — CSV 결과 파일
+- `<base_dir>/ais_output/pipeline/comparison_TIMESTAMP.txt` — 텍스트 비교 테이블
+- `<base_dir>/ais_output/pipeline/comparison_TIMESTAMP.csv` — 통합 CSV 결과
+- `<base_dir>/ais_output/pipeline/{model}_TIMESTAMP.csv` — 모델별 개별 CSV
 
 ---
 
@@ -84,14 +112,17 @@ python pipeline.py --eval --models dcdetect tranad --fp_targets 1 5 10 --n_anom 
 ```bash
 pip install torch onnx onnxruntime tqdm numpy
 pip install scikit-learn   # iforest / ocsvm 사용 시
+pip install zstandard      # .csv.zst 원본 파일 처리 시
 
-# 전처리 (단독 실행)
-python preprocess.py D:\ais_data\raw --output data/ais_preprocessed.csv
+# 전처리 (일별 저장 후 합산)
+python preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
+python preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
 
-# 비지도 학습
+# 비지도 학습 (단독 — 기본값: cwd에 저장)
 python train_benchmark.py --model dcdetect
+python train_benchmark.py --model dcdetect --output_dir D:\ais_models
 
-# 지도 학습
+# 지도 학습 (단독)
 python train_supervised.py --model moderntcn
 python train_supervised.py --model all --max_mmsi 300
 
