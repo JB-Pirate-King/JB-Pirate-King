@@ -17,29 +17,37 @@ ml/
 
 ---
 
-## 데이터 경로
+## 디렉터리 구조
+
+`--base_dir`로 출력 루트를 지정한다 (기본값: `D:\`).
 
 ```
-D:\ais_data\
-├── raw\
-│   └── 2025\                               # 원본 .csv.zst (172개)
-└── preprocessed\
-    └── 2025\
-        ├── daily\                          # 일별 전처리 결과
-        │   ├── ais-2025-07-13_preprocessed.csv
-        │   └── ...
-        └── ais_preprocessed_2025.csv       # 연도 합산본 (pipeline 기본값)
+<base_dir>/
+├── ais_data/
+│   ├── raw/2025/                           # 원본 .csv.zst
+│   └── preprocessed/2025/
+│       ├── daily/                          # 일별 전처리 결과
+│       └── ais_preprocessed_2025.csv       # 연도 합산본 (pipeline 기본값)
+├── ais_models/                             # 학습 모델 파일
+│   ├── model_{name}.onnx
+│   ├── scaler_{name}.json
+│   └── threshold_{name}.txt
+└── ais_output/
+    └── pipeline/
+        ├── comparison_TIMESTAMP.txt
+        ├── comparison_TIMESTAMP.csv        # 통합 CSV (전체 모델)
+        └── {model}_TIMESTAMP.csv           # 모델별 개별 CSV
 ```
 
 ### 전처리 실행 순서
 
 ```bash
 # 1단계: 일별 전처리 (raw → daily/)
-python preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
+python preprocess.py <raw_dir> --output_dir <preprocessed_dir>/daily
 
 # 2단계: 합산 (daily/ → 연도 합산본)
-python preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
-    --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+python preprocess.py "<preprocessed_dir>/daily/*_preprocessed.csv" ^
+    --output <preprocessed_dir>/ais_preprocessed_2025.csv
 ```
 
 > 새 날짜 데이터가 추가되면 해당 날짜만 1단계 재실행 후 2단계로 합산.
@@ -82,8 +90,9 @@ python pipeline.py --eval --models dcdetect tranad --fp_targets 1 5 10 --n_anom 
 | `--preprocess` | — | 원본 CSV → 전처리 실행 |
 | `--train` | — | 지정 모델 학습 |
 | `--eval` | — | 탐지율 비교 평가 |
-| `--raw_data` | `D:\ais_data\raw\2025` | 원본 AIS CSV 폴더 |
-| `--data_file` | `D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv` | 전처리 결과 파일 |
+| `--base_dir` | `D:\` | 출력 기본 경로 — 모델·결과가 이 아래에 저장됨 |
+| `--raw_data` | `<base_dir>/ais_data/raw/2025` | 원본 AIS CSV 폴더 |
+| `--data_file` | `<base_dir>/ais_data/preprocessed/2025/ais_preprocessed_2025.csv` | 전처리 결과 파일 |
 | `--models` | — | 비교 모델 목록 |
 | `--all_models` | — | 전체 14개 모델 |
 | `--unsup` | — | 비지도 9개 모델 |
@@ -94,8 +103,9 @@ python pipeline.py --eval --models dcdetect tranad --fp_targets 1 5 10 --n_anom 
 | `--skip_trained` | — | 이미 학습된 모델 건너뜀 |
 
 출력:
-- `output/pipeline/comparison_TIMESTAMP.txt` — 텍스트 비교 테이블
-- `output/pipeline/comparison_TIMESTAMP.csv` — CSV 결과 파일
+- `<base_dir>/ais_output/pipeline/comparison_TIMESTAMP.txt` — 텍스트 비교 테이블
+- `<base_dir>/ais_output/pipeline/comparison_TIMESTAMP.csv` — 통합 CSV 결과
+- `<base_dir>/ais_output/pipeline/{model}_TIMESTAMP.csv` — 모델별 개별 CSV
 
 ---
 
@@ -107,13 +117,14 @@ pip install scikit-learn   # iforest / ocsvm 사용 시
 pip install zstandard      # .csv.zst 원본 파일 처리 시
 
 # 전처리 (일별 저장 후 합산)
-python preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
-python preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+python preprocess.py <raw_dir> --output_dir <preprocessed_dir>/daily
+python preprocess.py "<preprocessed_dir>/daily/*_preprocessed.csv" --output <preprocessed_dir>/ais_preprocessed_2025.csv
 
-# 비지도 학습
+# 비지도 학습 (단독 — 기본값: cwd에 저장)
 python train_benchmark.py --model dcdetect
+python train_benchmark.py --model dcdetect --output_dir <base_dir>/ais_models
 
-# 지도 학습
+# 지도 학습 (단독)
 python train_supervised.py --model moderntcn
 python train_supervised.py --model all --max_mmsi 300
 
@@ -250,3 +261,31 @@ ais_ids_pi/data/
     scaler.json       (scaler_dcdetect.json → scaler.json으로 복사)
     threshold.txt     (threshold_sup_moderntcn.txt → threshold.txt로 복사)
 ```
+
+---
+
+## 릴리즈 & 버전 관리
+
+`v{major}.{minor}.{patch}` 규칙:
+
+| 올리는 경우 | 예시 |
+|---|---|
+| **major** — 입력 피처 변경, SEQ_LEN 변경, 모델 인터페이스 파괴적 변경 | v1→v2 |
+| **minor** — 새 모델 추가, 새 평가 시나리오 추가 | v1.0→v1.1 |
+| **patch** — 임계값 재조정, 버그픽스, 동일 구조 재학습 | v1.0.0→v1.0.1 |
+
+릴리즈 첨부 파일:
+- `model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
+- `comparison_TIMESTAMP.txt/.csv` — 비교 결과
+- `{model}_TIMESTAMP.csv` — 모델별 개별 CSV
+
+```bash
+# 태그 생성 후 릴리즈
+git tag v1.0.0 && git push origin main --tags
+gh release create v1.0.0 <파일들...> --title "v1.0.0" --notes "..."
+
+# 다른 PC에서 다운로드
+gh release download v1.0.0 --dir <base_dir>/ais_models
+```
+
+자세한 릴리즈 절차 및 버전 히스토리는 `CLAUDE.md` 참고.
