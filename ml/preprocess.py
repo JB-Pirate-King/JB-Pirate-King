@@ -50,6 +50,16 @@ USE_COLS = [
     "status", "vessel_type",
 ]
 
+# 출력 피처 컬럼 (모듈 레벨 공개 — run_pipeline.py 에서 참조)
+OUT_COLS = USE_COLS + [
+    "dt", "dist_km",
+    "cog_hdg_diff",
+    "sog_change",
+    "cog_hdg_change",
+    "speed_consistency",
+    "lat_speed", "lon_speed",
+]
+
 STATUS_MAX_SOG = {
     0: 30.0, 1: 1.0,  2: 5.0,  3: 10.0,
     4: 10.0, 5: 1.0,  6: 5.0,  7: 15.0, 8: 15.0,
@@ -58,18 +68,57 @@ DEFAULT_MAX_SOG = 30.0
 
 
 # ── 입력 파일 목록 결정 ───────────────────────────────────────────
-def resolve_input_files() -> list:
-    # 1) CLI 인수
-    if len(sys.argv) > 1:
-        args = sys.argv[1:]
+def _filter_by_years(files: list, years: int) -> list:
+    """파일명에서 날짜 파싱 후 최근 N년치만 필터링. ais-YYYY-MM-DD.csv 형식 가정."""
+    import re
+    from datetime import datetime, timedelta
+    cutoff = datetime.now() - timedelta(days=years * 365)
+    filtered = []
+    unparsed = []
+    for f in files:
+        m = re.search(r'(\d{4})-(\d{2})-(\d{2})', os.path.basename(f))
+        if m:
+            try:
+                file_date = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                if file_date >= cutoff:
+                    filtered.append(f)
+            except ValueError:
+                unparsed.append(f)
+        else:
+            unparsed.append(f)  # 날짜 파싱 불가 → 포함
+    if unparsed:
+        print(f"  [경고] 날짜 파싱 불가 파일 {len(unparsed)}개 → 전부 포함")
+        filtered += unparsed
+    return sorted(filtered)
+
+
+def resolve_input_files(years: int = None) -> list:
+    # 1) CLI 인수 (--output_dir / --years / --tag 는 제외하고 파일/폴더만)
+    positional = []
+    skip_next  = False
+    for a in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("--output_dir", "--years", "--tag"):
+            skip_next = True
+            continue
+        if a.startswith("--"):
+            continue
+        positional.append(a)
+
+    if positional:
         files = []
-        for a in args:
+        for a in positional:
             if os.path.isdir(a):
                 files += sorted(glob.glob(os.path.join(a, "*.csv")))
+                files += sorted(glob.glob(os.path.join(a, "*.csv.zst")))
             else:
-                files += sorted(glob.glob(a))   # glob 패턴도 허용
-        files = [f for f in files if os.path.isfile(f)]
+                files += sorted(glob.glob(a))
+        files = sorted(set(f for f in files if os.path.isfile(f)))
         if files:
+            if years:
+                files = _filter_by_years(files, years)
             return files
 
     # 2) 스크립트 내 설정
@@ -77,7 +126,8 @@ def resolve_input_files() -> list:
         files = [f for f in INPUT_FILES if os.path.isfile(f)]
     elif INPUT_DIR:
         files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.csv")))
-        files = [f for f in files if os.path.isfile(f)]
+        files += sorted(glob.glob(os.path.join(INPUT_DIR, "*.csv.zst")))
+        files = sorted(set(f for f in files if os.path.isfile(f)))
     else:
         files = sorted(glob.glob(INPUT_GLOB))
         files = [f for f in files if os.path.isfile(f)]
@@ -90,14 +140,26 @@ def resolve_input_files() -> list:
             "  python preprocess.py jan.csv feb.csv\n"
             "또는 스크립트 상단 INPUT_GLOB / INPUT_DIR / INPUT_FILES 설정"
         )
+    if years:
+        files = _filter_by_years(files, years)
     return files
 
 
-# ── CSV 한 줄씩 읽기 ──────────────────────────────────────────────
+# ── CSV 한 줄씩 읽기 (.zst 자동 지원) ───────────────────────────
 def iter_lines_csv(path: str):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            yield line.rstrip("\n")
+    if path.endswith(".zst"):
+        import io
+        import zstandard as zstd
+        with open(path, "rb") as fh:
+            dctx = zstd.ZstdDecompressor()
+            with dctx.stream_reader(fh) as reader:
+                text = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+                for line in text:
+                    yield line.rstrip("\n")
+    else:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                yield line.rstrip("\n")
 
 
 # ── 여러 파일을 헤더 통합해서 스트리밍 ───────────────────────────
@@ -362,30 +424,41 @@ def merge_outputs(part_files: list, merged_path: str):
 
 # ── 메인 ──────────────────────────────────────────────────────────
 def main():
-    input_files = resolve_input_files()
+    import argparse
+    parser = argparse.ArgumentParser(description="AIS 전처리", add_help=False)
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="전처리 결과 저장 디렉터리 (기본: 현재 폴더)")
+    parser.add_argument("--years",      type=int, default=None,
+                        help="최근 N년치만 처리 (기본: 전체)")
+    parser.add_argument("--tag",        type=str, default=None,
+                        help="메타 태그 (폴더명에 사용)")
+    parser.add_argument("-h", "--help", action="help")
+    pargs, _ = parser.parse_known_args()
 
-    print(f"[입력 파일 {len(input_files)}개]")
+    input_files = resolve_input_files(years=pargs.years)
+
+    print(f"[입력 파일 {len(input_files)}개]" +
+          (f"  (최근 {pargs.years}년치)" if pargs.years else ""))
     for f in input_files:
         print(f"  {f}")
 
-    out_cols = USE_COLS + [
-        "dt", "dist_km",
-        "cog_hdg_diff",
-        "sog_change",
-        "cog_hdg_change",
-        "speed_consistency",
-        "lat_speed", "lon_speed",
-    ]
+    out_cols = OUT_COLS   # 모듈 레벨 상수 사용
 
-    part_outputs  = []   # 개별 출력 경로 목록
+    # 출력 디렉터리 결정
+    out_dir = pargs.output_dir or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    part_outputs  = []
     all_skip_logs = []
     total_rows = total_ok = total_skip = 0
 
     # ── 파일별 개별 처리 ────────────────────────────────────────────
     for fpath in input_files:
-        stem        = os.path.splitext(os.path.basename(fpath))[0]
-        out_path    = f"{stem}_preprocessed.csv"
-        skip_path   = f"{stem}_skip_log.csv"
+        _base = os.path.basename(fpath)
+        stem  = _base[:-4] if _base.endswith(".zst") else os.path.splitext(_base)[0]
+        stem  = stem[:-4] if stem.endswith(".csv") else stem  # .csv.zst → stem
+        out_path  = os.path.join(out_dir, f"{stem}_preprocessed.csv")
+        skip_path = os.path.join(out_dir, f"{stem}_skip_log.csv")
 
         print(f"\n[{stem}] 처리 중...")
         result = process_file(fpath, out_path, out_cols)
@@ -409,20 +482,21 @@ def main():
               f"제거 {result['mmsi_skip']:,} MMSI)")
 
     # ── 전체 합산 출력 (파일 2개 이상일 때만) ──────────────────────
+    merged_output = os.path.join(out_dir, OUTPUT_FILE)
     if len(input_files) > 1:
-        print(f"\n[합산] {OUTPUT_FILE} 생성 중...")
-        merge_outputs(part_outputs, OUTPUT_FILE)
+        print(f"\n[합산] {merged_output} 생성 중...")
+        merge_outputs(part_outputs, merged_output)
 
         # 합산 skip 로그
-        merged_skip = "ais_skip_log.csv"
+        merged_skip = os.path.join(out_dir, "ais_skip_log.csv")
         with open(merged_skip, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f); w.writerow(["mmsi", "reason"])
             w.writerows(all_skip_logs)
 
         seen_all = set()
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+        with open(merged_output, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f): seen_all.add(row.get("mmsi", ""))
-        print(f"  → {OUTPUT_FILE}  ({len(seen_all):,} MMSI, {total_rows:,} 행)")
+        print(f"  → {merged_output}  ({len(seen_all):,} MMSI, {total_rows:,} 행)")
 
     # ── 최종 요약 ───────────────────────────────────────────────────
     print(f"\n{'='*50}")
@@ -436,6 +510,27 @@ def main():
     print(f"  총 출력 행:  {total_rows:,}")
     print(f"  제거 MMSI:   {total_skip:,}")
     print(f"완료!")
+
+    # ── preprocess_meta.json 저장 ────────────────────────────────
+    import json
+    from datetime import datetime as _dt
+    meta_path = os.path.join(
+        os.path.dirname(part_outputs[0]) or ".", "preprocess_meta.json"
+    )
+    meta = {
+        "features": out_cols,
+        "years": pargs.years,
+        "tag": pargs.tag,
+        "source_files": [os.path.abspath(f) for f in input_files],
+        "output_file": os.path.abspath(
+            merged_output if len(input_files) > 1 else part_outputs[0]
+        ),
+        "total_rows": total_rows,
+        "created": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"  메타 저장:   {meta_path}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+0.490000
+# model: moderntcn
+# Youden_J: 0.9866
+# F1: 0.9935
+# val_acc: 0.9930
