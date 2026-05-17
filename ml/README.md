@@ -261,3 +261,31 @@ ais_ids_pi/data/
     scaler.json       (scaler_dcdetect.json → scaler.json으로 복사)
     threshold.txt     (threshold_sup_moderntcn.txt → threshold.txt로 복사)
 ```
+
+---
+
+## 릴리즈 & 버전 관리
+
+`v{major}.{minor}.{patch}` 규칙:
+
+| 올리는 경우 | 예시 |
+|---|---|
+| **major** — 입력 피처 변경, SEQ_LEN 변경, 모델 인터페이스 파괴적 변경 | v1→v2 |
+| **minor** — 새 모델 추가, 새 평가 시나리오 추가 | v1.0→v1.1 |
+| **patch** — 임계값 재조정, 버그픽스, 동일 구조 재학습 | v1.0.0→v1.0.1 |
+
+릴리즈 첨부 파일:
+- `model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
+- `comparison_TIMESTAMP.txt/.csv` — 비교 결과
+- `{model}_TIMESTAMP.csv` — 모델별 개별 CSV
+
+```bash
+# 태그 생성 후 릴리즈
+git tag v1.0.0 && git push origin main --tags
+gh release create v1.0.0 <파일들...> --title "v1.0.0" --notes "..."
+
+# 다른 PC에서 다운로드
+gh release download v1.0.0 --dir <base_dir>/ais_models
+```
+
+자세한 릴리즈 절차 및 버전 히스토리는 `CLAUDE.md` 참고.
