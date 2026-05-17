@@ -1,93 +1,93 @@
-# CLAUDE.md — JB-Pirate-King 프로젝트 컨텍스트
+# CLAUDE.md — JB-Pirate-King Project Context
 
-## 푸시 전 체크리스트
+## Pre-Push Checklist
 
-코드를 push하거나 push를 요청받을 때, 반드시 먼저 아래를 확인한다:
+Before pushing code or when asked to push, always check the following first:
 
-1. **README.md / ml/README.md** — 변경된 기능, 경로, 옵션이 문서에 반영되어 있는지 확인. 오래된 내용이 있으면 먼저 업데이트.
-2. **소스코드 주석** — 수정된 함수/클래스의 주석이 현재 동작과 일치하는지 확인. 잘못된 주석은 삭제하거나 수정.
-
----
-
-## 프로젝트 개요
-
-선박 AIS 신호 기반 이상 탐지 시스템. OpenCPN 플러그인(C++), ML 파이프라인(Python), 로컬 서버(Python/Docker)로 구성.
+1. **README.md / ml/README.md** — Verify that any changed features, paths, or options are reflected in the docs. Update outdated content before pushing.
+2. **Source code comments** — Verify that comments in modified functions/classes match current behavior. Remove or fix any stale comments.
 
 ---
 
-## 디렉토리 구조
+## Project Overview
+
+AIS anomaly detection system for ships. Consists of an OpenCPN plugin (C++), ML pipeline (Python), and local server (Python/Docker).
+
+---
+
+## Directory Structure
 
 ```
 JB-Pirate-King/
-├── ml/                   # ML 파이프라인 (학습 · 평가)
-│   ├── pipeline.py       # 멀티모델 학습/탐지율 비교 파이프라인 ★
-│   ├── preprocess.py     # AIS CSV 전처리 (.csv.zst 지원)
-│   ├── train_benchmark.py# 비지도 모델 학습 (9종)
-│   ├── eval_anomaly.py   # 탐지율/오탐율 평가
-│   ├── compare_models.py # 모델 비교 도구
-│   ├── run_pipeline.py   # 파이프라인 실행 스크립트
-│   ├── download_ais.py   # AIS 데이터 다운로드
-│   ├── eval_rule_gen.py  # 룰 기반 평가 생성
-│   └── deploy/           # 배포용 모델/스케일러/임계값
-├── ais_ids_pi/           # OpenCPN 플러그인 (C++)
-│   └── src/ais_ids.cpp   # 플러그인 메인 소스
-├── s-c/                  # 로컬 서버 + GUI
-├── aivdm_gen/            # AIVDM 테스트 신호 생성기
-└── scripts/
+├── ml/                    # ML pipeline (training & evaluation)
+│   ├── pipeline.py        # Multi-model training/detection rate comparison ★
+│   ├── preprocess.py      # AIS CSV preprocessing (.csv.zst supported)
+│   ├── train_benchmark.py # Unsupervised model training (9 models)
+│   ├── eval_anomaly.py    # Detection rate / false positive evaluation
+│   ├── compare_models.py  # Model comparison tool
+│   ├── run_pipeline.py    # Pipeline runner script
+│   ├── download_ais.py    # AIS data downloader
+│   ├── eval_rule_gen.py   # Rule-based evaluation generator
+│   └── deploy/            # Deployment model/scaler/threshold files
+├── ais_ids_pi/            # OpenCPN plugin (C++)
+│   └── src/ais_ids.cpp    # Plugin main source
+├── s-c/                   # Local server + GUI
+└── aivdm_gen/             # AIVDM test signal generator
 ```
 
 ---
 
-## 데이터 경로 (로컬 D 드라이브)
+## Data Paths (Local D Drive)
 
 ```
 D:\ais_data\
 ├── raw\
-│   └── 2025\                          # 원본 .csv.zst 파일 (172개)
+│   └── 2025\                          # Raw .csv.zst files (172 files)
 └── preprocessed\
     └── 2025\
-        ├── daily\                     # 일별 전처리 결과 (추후 생성)
+        ├── daily\                     # Per-day preprocessed files (to be created)
         │   ├── ais-2025-07-13_preprocessed.csv
         │   └── ...
-        └── ais_preprocessed_2025.csv  # 연도 합산본 (870 MB, pipeline 기본값)
+        └── ais_preprocessed_2025.csv  # Yearly merged file (870 MB, pipeline default)
 ```
 
-### 전처리 실행 순서
+### Preprocessing Steps
 
 ```bash
-# 1단계: 일별 전처리
+# Step 1: Per-day preprocessing
 python ml/preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
 
-# 2단계: 연도 합산
+# Step 2: Yearly merge
 python ml/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
     --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
 ```
 
-> 현재 2025-09-14 하루치만 전처리됨. 나머지 171개는 추후 실행 예정.
+> Currently only 2025-09-14 (1 day) has been preprocessed. Remaining 171 files to be run later.
 
 ---
 
-## ML 모델
+## ML Models
 
-### 비지도 (train_benchmark.py)
-| 모델 | 설명 |
+### Unsupervised (train_benchmark.py)
+
+| Model | Description |
 |---|---|
-| `usad` | 이중 디코더 adversarial |
-| `tranad` | Transformer self-conditioning |
+| `usad` | Dual-decoder adversarial autoencoder |
+| `tranad` | Transformer self-conditioning reconstruction |
 | `conv1d` | 1D Conv Autoencoder |
-| `lstm` | LSTM Seq2Seq |
-| `tcn` | Dilated Causal Conv |
-| `anomtrans` | Anomaly Transformer |
-| `dcdetect` | 채널/패치 이중 어텐션 |
+| `lstm` | LSTM Seq2Seq Autoencoder |
+| `tcn` | Dilated Causal Conv Autoencoder |
+| `anomtrans` | Anomaly Transformer (association discrepancy) |
+| `dcdetect` | Dual channel/patch attention contrastive learning |
 | `iforest` | Isolation Forest |
 | `ocsvm` | One-Class SVM |
 
-### 지도 (train_supervised.py — develop에서 제거됨)
+### Supervised (train_supervised.py — removed from develop)
 patchtst, itrans, tsmixer, moderntcn, mamba
 
 ---
 
-## 입력 피처 (12개)
+## Input Features (12)
 
 `sog, cog, heading, status, dt, dist_km, cog_hdg_diff, sog_change, cog_hdg_change, speed_consistency, lat_speed, lon_speed`
 
@@ -95,60 +95,59 @@ SEQ_LEN = 10
 
 ---
 
-## 파이프라인 주요 명령
+## Key Pipeline Commands
 
 ```bash
-# 전처리 (연도별)
-python ml/preprocess.py D:\ais_data\raw\2025 --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+# Per-day preprocess then merge (see steps above)
 
-# 멀티모델 학습 + 평가
+# Multi-model training + evaluation
 python ml/pipeline.py --train --eval --models conv1d tranad dcdetect --epochs 10 --n_anom 200 --fp_targets 1
 
-# 이미 학습된 모델 건너뛰기
+# Skip already-trained models
 python ml/pipeline.py --train --eval --models conv1d tranad dcdetect --skip_trained
 
-# 평가만
+# Evaluation only
 python ml/pipeline.py --eval --models conv1d dcdetect
 ```
 
-pipeline.py 기본 경로:
+pipeline.py defaults:
 - `--raw_data`: `D:\ais_data\raw\2025`
 - `--data_file`: `D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv`
 
 ---
 
-## 평가 시나리오 (32개)
+## Evaluation Scenarios (32 total)
 
-| 그룹 | 설명 |
+| Group | Description |
 |---|---|
-| 기본 (4종) | COG/HDG 불일치, 정박이동, 속도이상, 위치점프 |
-| FN (4종) | 기존 룰 탐지기 회피 |
-| D (4종) | ML 모델 1차 회피 |
-| E (5종) | ML 모델 2차 회피 |
-| F (7종, 홀드아웃) | 고급 공격 — 학습 미포함 |
-| G (7종, 홀드아웃) | 신규 홀드아웃 |
+| Basic (4) | COG/HDG mismatch, anchored movement, speed anomaly, position jump |
+| FN (4) | Designed to evade rule-based detectors |
+| D (4) | ML model evasion attempt 1st gen |
+| E (5) | ML model evasion attempt 2nd gen |
+| F (7, holdout) | Advanced attacks — excluded from training |
+| G (7, holdout) | Novel holdout scenarios |
 
 ---
 
-## 모델 파일 경로 규칙
+## Model File Path Rules
 
-- 비지도 모델: `ml/model_{name}.onnx`, `ml/scaler_{name}.json`, `ml/threshold_{name}.txt`
-- 배포용: `ml/deploy/model.onnx`, `ml/deploy/scaler.json`, `ml/deploy/threshold.txt`
-- 플러그인: `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
-
----
-
-## 브랜치 전략
-
-- `main`: 안정 릴리즈
-- `develop`: 개발 통합 브랜치 ← 주로 여기에 작업
-- `claude/*`: Claude Code 작업 브랜치 (작업 후 develop으로 머지)
+- Unsupervised: `ml/model_{name}.onnx`, `ml/scaler_{name}.json`, `ml/threshold_{name}.txt`
+- Deploy: `ml/deploy/model.onnx`, `ml/deploy/scaler.json`, `ml/deploy/threshold.txt`
+- Plugin: `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
 
 ---
 
-## 환경
+## Branch Strategy
+
+- `main`: stable releases
+- `develop`: main integration branch — work here
+- `claude/*`: Claude Code working branches (merge into develop when done)
+
+---
+
+## Environment
 
 - Python 3.14 (Windows)
-- 콘솔 인코딩: cp949 → pipeline.py에 `sys.stdout.reconfigure(encoding='utf-8')` 적용
-- GPU: Intel Arc B390 (iGPU, 공유 메모리) — CUDA 없음, torch-directml 미설치
-- 학습은 CPU로 실행 중
+- Console encoding: cp949 — `sys.stdout.reconfigure(encoding='utf-8')` applied in pipeline.py
+- GPU: Intel Arc B390 (iGPU, shared memory) — no CUDA, torch-directml not installed
+- Training runs on CPU
