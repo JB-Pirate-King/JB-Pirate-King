@@ -34,11 +34,27 @@ JB-Pirate-King/
 ```
 D:\ais_data\
 ├── raw\
-│   └── 2025\             # 원본 AIS .csv.zst 파일 (172개)
+│   └── 2025\                          # 원본 .csv.zst 파일 (172개)
 └── preprocessed\
     └── 2025\
-        └── ais_preprocessed_2025.csv  # 전처리 완료 파일 (870 MB)
+        ├── daily\                     # 일별 전처리 결과 (추후 생성)
+        │   ├── ais-2025-07-13_preprocessed.csv
+        │   └── ...
+        └── ais_preprocessed_2025.csv  # 연도 합산본 (870 MB, pipeline 기본값)
 ```
+
+### 전처리 실행 순서
+
+```bash
+# 1단계: 일별 전처리
+python ml/preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
+
+# 2단계: 연도 합산
+python ml/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
+    --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+```
+
+> 현재 2025-09-14 하루치만 전처리됨. 나머지 171개는 추후 실행 예정.
 
 ---
 
