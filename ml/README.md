@@ -8,11 +8,74 @@
 
 ```
 ml/
+├── pipeline.py           # 멀티모델 학습/탐지율 비교 파이프라인 ★
 ├── preprocess.py         # AIS CSV 전처리
 ├── train_benchmark.py    # 비지도 모델 학습 (9종)
 ├── train_supervised.py   # 지도 학습 모델 학습 (5종)
 └── eval_anomaly.py       # 탐지율/오탐율 평가
 ```
+
+---
+
+## 데이터 경로
+
+| 경로 | 설명 |
+|---|---|
+| `D:\ais_data\raw\` | 원본 AIS CSV 다운로드 위치 (기본 raw_data) |
+| `data/ais_preprocessed.csv` | 전처리 완료 파일 (기본 data_file) |
+
+---
+
+## 멀티모델 비교 파이프라인 (`pipeline.py`) ★
+
+여러 모델을 한 번에 학습하고, 동일 시나리오(A~G 24종)에서 탐지율을 비교한다.
+
+```bash
+# 전체 파이프라인 (전처리 → 학습 → 비교)
+python pipeline.py --preprocess --train --eval --models dcdetect tranad sup_moderntcn
+
+# 원본 데이터 경로 직접 지정
+python pipeline.py --preprocess --raw_data D:\ais_data\raw --train --eval --models dcdetect tranad
+
+# 이미 전처리된 파일이 있으면 학습 + 평가만
+python pipeline.py --train --eval --models usad tranad dcdetect
+
+# 기존 모델 평가만 (재학습 없음)
+python pipeline.py --eval --models usad tranad dcdetect sup_moderntcn
+
+# 비지도 / 지도 / 전체 모델
+python pipeline.py --train --eval --unsup
+python pipeline.py --train --eval --sup
+python pipeline.py --train --eval --all_models
+
+# 이미 학습된 모델은 건너뛰기
+python pipeline.py --train --eval --models usad tranad conv1d --skip_trained
+
+# FP 목표값·이상 시퀀스 수 조정
+python pipeline.py --eval --models dcdetect tranad --fp_targets 1 5 10 --n_anom 1000
+```
+
+주요 옵션:
+
+| 옵션 | 기본값 | 설명 |
+|---|---|---|
+| `--preprocess` | — | 원본 CSV → 전처리 실행 |
+| `--train` | — | 지정 모델 학습 |
+| `--eval` | — | 탐지율 비교 평가 |
+| `--raw_data` | `D:\ais_data\raw` | 원본 AIS CSV 폴더 |
+| `--data_file` | `data/ais_preprocessed.csv` | 전처리 결과 파일 |
+| `--models` | — | 비교 모델 목록 |
+| `--all_models` | — | 전체 14개 모델 |
+| `--unsup` | — | 비지도 9개 모델 |
+| `--sup` | — | 지도 5개 모델 |
+| `--epochs` | 모델별 | 학습 에포크 수 |
+| `--n_anom` | 500 | 평가용 시나리오당 이상 시퀀스 수 |
+| `--fp_targets` | 1 5 10 | 비교 기준 오탐율 목표값(%) |
+| `--skip_trained` | — | 이미 학습된 모델 건너뜀 |
+
+출력:
+- `output/pipeline/comparison_TIMESTAMP.txt` — 텍스트 비교 테이블
+- `output/pipeline/comparison_TIMESTAMP.csv` — CSV 결과 파일
 
 ---
 
@@ -22,8 +85,8 @@ ml/
 pip install torch onnx onnxruntime tqdm numpy
 pip install scikit-learn   # iforest / ocsvm 사용 시
 
-# 전처리
-python preprocess.py
+# 전처리 (단독 실행)
+python preprocess.py D:\ais_data\raw --output data/ais_preprocessed.csv
 
 # 비지도 학습
 python train_benchmark.py --model dcdetect
