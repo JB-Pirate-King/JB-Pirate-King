@@ -27,11 +27,19 @@ AIS 데이터 전처리 스크립트
 
 import csv
 import glob
+import io
 import math
 import os
 import statistics
 import sys
 from datetime import datetime
+
+# zstandard — .csv.zst 압축 파일 스트리밍 지원 (없으면 .csv 만 처리)
+try:
+    import zstandard as zstd
+    _HAS_ZST = True
+except ImportError:
+    _HAS_ZST = False
 
 # ── 입력 설정 (CLI 인수가 없을 때 사용) ──────────────────────────
 INPUT_GLOB  = "ais-*.csv"   # 현재 폴더의 ais-*.csv 전부
@@ -57,6 +65,16 @@ STATUS_MAX_SOG = {
 DEFAULT_MAX_SOG = 30.0
 
 
+# ── 파일 stem 추출 (.csv.zst 이중 확장자 대응) ───────────────────
+def _file_stem(path: str) -> str:
+    name = os.path.basename(path)
+    if name.endswith(".csv.zst"):
+        return name[:-8]
+    if name.endswith(".csv"):
+        return name[:-4]
+    return os.path.splitext(name)[0]
+
+
 # ── 입력 파일 목록 결정 ───────────────────────────────────────────
 def resolve_input_files() -> list:
     # 1) CLI 인수
@@ -66,9 +84,10 @@ def resolve_input_files() -> list:
         for a in args:
             if os.path.isdir(a):
                 files += sorted(glob.glob(os.path.join(a, "*.csv")))
+                files += sorted(glob.glob(os.path.join(a, "*.csv.zst")))
             else:
-                files += sorted(glob.glob(a))   # glob 패턴도 허용
-        files = [f for f in files if os.path.isfile(f)]
+                files += sorted(glob.glob(a))   # glob 패턴 및 명시 경로 허용
+        files = sorted(set(f for f in files if os.path.isfile(f)))
         if files:
             return files
 
@@ -76,28 +95,43 @@ def resolve_input_files() -> list:
     if INPUT_FILES:
         files = [f for f in INPUT_FILES if os.path.isfile(f)]
     elif INPUT_DIR:
-        files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.csv")))
-        files = [f for f in files if os.path.isfile(f)]
+        files  = sorted(glob.glob(os.path.join(INPUT_DIR, "*.csv")))
+        files += sorted(glob.glob(os.path.join(INPUT_DIR, "*.csv.zst")))
+        files  = sorted(set(f for f in files if os.path.isfile(f)))
     else:
-        files = sorted(glob.glob(INPUT_GLOB))
-        files = [f for f in files if os.path.isfile(f)]
+        files  = sorted(glob.glob(INPUT_GLOB))
+        files += sorted(glob.glob(INPUT_GLOB.replace("*.csv", "*.csv.zst")))
+        files  = sorted(set(f for f in files if os.path.isfile(f)))
 
     if not files:
         raise FileNotFoundError(
             "입력 파일 없음. 사용법:\n"
+            "  python preprocess.py D:\\ais_data\\raw\\\n"
             "  python preprocess.py data/ais-*.csv\n"
-            "  python preprocess.py data/\n"
-            "  python preprocess.py jan.csv feb.csv\n"
+            "  python preprocess.py file.csv.zst\n"
             "또는 스크립트 상단 INPUT_GLOB / INPUT_DIR / INPUT_FILES 설정"
         )
     return files
 
 
-# ── CSV 한 줄씩 읽기 ──────────────────────────────────────────────
+# ── CSV 한 줄씩 읽기 (.csv.zst 스트리밍 지원) ────────────────────
 def iter_lines_csv(path: str):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            yield line.rstrip("\n")
+    if path.endswith(".zst"):
+        if not _HAS_ZST:
+            raise ImportError(
+                ".zst 파일을 읽으려면 zstandard 라이브러리가 필요합니다.\n"
+                "  pip install zstandard"
+            )
+        with open(path, "rb") as fh:
+            dctx   = zstd.ZstdDecompressor()
+            reader = dctx.stream_reader(fh)
+            text   = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+            for line in text:
+                yield line.rstrip("\n")
+    else:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                yield line.rstrip("\n")
 
 
 # ── 여러 파일을 헤더 통합해서 스트리밍 ───────────────────────────
@@ -280,11 +314,11 @@ def has_invalid(rows: list) -> bool:
 # ── 단일 파일 처리 (파싱→정렬→전처리→저장) ──────────────────────
 def process_file(input_path: str, output_path: str, out_cols: list) -> dict:
     """
-    input_path  : 원본 CSV 1개
+    input_path  : 원본 CSV (또는 .csv.zst) 1개
     output_path : 전처리 결과 저장 경로
     반환: {"rows": int, "mmsi_ok": int, "mmsi_skip": int, "skip_log": list}
     """
-    stem      = os.path.splitext(os.path.basename(input_path))[0]
+    stem      = _file_stem(input_path)
     TEMP_FILE = f"_tmp_{stem}.csv"
     skip_log  = []
 
@@ -362,11 +396,27 @@ def merge_outputs(part_files: list, merged_path: str):
 
 # ── 메인 ──────────────────────────────────────────────────────────
 def main():
+    # --output 를 먼저 파싱 (resolve_input_files 의 sys.argv 파싱과 분리)
+    output_override = None
+    _clean = []
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == "--output" and i + 1 < len(sys.argv):
+            output_override = sys.argv[i + 1]
+            i += 2
+        else:
+            _clean.append(sys.argv[i])
+            i += 1
+    sys.argv = [sys.argv[0]] + _clean
+
     input_files = resolve_input_files()
 
     print(f"[입력 파일 {len(input_files)}개]")
     for f in input_files:
         print(f"  {f}")
+    if output_override:
+        print(f"[출력 경로] {output_override}")
+        os.makedirs(os.path.dirname(output_override) or ".", exist_ok=True)
 
     out_cols = USE_COLS + [
         "dt", "dist_km",
@@ -383,9 +433,12 @@ def main():
 
     # ── 파일별 개별 처리 ────────────────────────────────────────────
     for fpath in input_files:
-        stem        = os.path.splitext(os.path.basename(fpath))[0]
-        out_path    = f"{stem}_preprocessed.csv"
-        skip_path   = f"{stem}_skip_log.csv"
+        stem      = _file_stem(fpath)
+        # 단일 파일이고 --output 지정 시 바로 그 경로에 씀
+        out_path  = (output_override
+                     if (output_override and len(input_files) == 1)
+                     else f"{stem}_preprocessed.csv")
+        skip_path = f"{stem}_skip_log.csv"
 
         print(f"\n[{stem}] 처리 중...")
         result = process_file(fpath, out_path, out_cols)
@@ -409,9 +462,10 @@ def main():
               f"제거 {result['mmsi_skip']:,} MMSI)")
 
     # ── 전체 합산 출력 (파일 2개 이상일 때만) ──────────────────────
+    merged_path = output_override or OUTPUT_FILE
     if len(input_files) > 1:
-        print(f"\n[합산] {OUTPUT_FILE} 생성 중...")
-        merge_outputs(part_outputs, OUTPUT_FILE)
+        print(f"\n[합산] {merged_path} 생성 중...")
+        merge_outputs(part_outputs, merged_path)
 
         # 합산 skip 로그
         merged_skip = "ais_skip_log.csv"
@@ -420,9 +474,9 @@ def main():
             w.writerows(all_skip_logs)
 
         seen_all = set()
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+        with open(merged_path, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f): seen_all.add(row.get("mmsi", ""))
-        print(f"  → {OUTPUT_FILE}  ({len(seen_all):,} MMSI, {total_rows:,} 행)")
+        print(f"  → {merged_path}  ({len(seen_all):,} MMSI, {total_rows:,} 행)")
 
     # ── 최종 요약 ───────────────────────────────────────────────────
     print(f"\n{'='*50}")
@@ -430,7 +484,7 @@ def main():
     print(f"  입력 파일:   {len(input_files)}개")
     if len(input_files) > 1:
         print(f"  개별 출력:   {len(part_outputs)}개  (*_preprocessed.csv)")
-        print(f"  합산 출력:   {OUTPUT_FILE}")
+        print(f"  합산 출력:   {merged_path}")
     else:
         print(f"  출력:        {part_outputs[0]}")
     print(f"  총 출력 행:  {total_rows:,}")
