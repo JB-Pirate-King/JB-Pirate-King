@@ -1082,7 +1082,12 @@ def main():
                         help="cuda / cpu / auto")
     parser.add_argument("--streaming",    action="store_true",
                         help="대용량 CSV 스트리밍 모드 (메모리 절약, 전체 데이터 학습)")
+    parser.add_argument("--output_dir",   type=str, default=OUTPUT_DIR,
+                        help="모델 파일 저장 디렉터리 (기본: output/)")
     args = parser.parse_args()
+
+    global OUTPUT_DIR
+    OUTPUT_DIR = args.output_dir
 
     # 출력/데이터 디렉터리 생성
     os.makedirs(OUTPUT_DIR, exist_ok=True)

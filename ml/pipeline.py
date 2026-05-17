@@ -5,19 +5,20 @@ AIS 이상 탐지 멀티모델 학습 / 탐지율 비교 파이프라인
 데이터 흐름
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  D:\\ais_data\\raw\\*.csv          ← 원본 AIS 데이터 (기본 raw 경로)
+  D:\\ais_data\\raw\\2025\\           ← 원본 AIS 데이터 (기본 raw 경로)
        │
        │  --preprocess
        ▼
-  data/ais_preprocessed.csv        ← 전처리 완료 파일 (기본 data_file)
+  D:\\ais_data\\preprocessed\\2025\\ais_preprocessed_2025.csv
        │
-       │  --train
+       │  --train  (--base_dir D:\)
        ▼
-  output/{model}/model_{model}.onnx 등
+  D:\\ais_models\\model_{model}.onnx 등
        │
        │  --eval
        ▼
-  output/pipeline/comparison_TIMESTAMP.txt / .csv
+  D:\\ais_output\\pipeline\\comparison_TIMESTAMP.txt / .csv
+  D:\\ais_output\\pipeline\\{model}_TIMESTAMP.csv     ← 모델별 개별 CSV
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 사용법
@@ -55,8 +56,9 @@ AIS 이상 탐지 멀티모델 학습 / 탐지율 비교 파이프라인
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 출력
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  output/pipeline/comparison_YYYYMMDD_HHMMSS.txt   텍스트 비교 테이블
-  output/pipeline/comparison_YYYYMMDD_HHMMSS.csv   CSV 결과 파일
+  <base_dir>/ais_output/pipeline/comparison_YYYYMMDD_HHMMSS.txt   텍스트 비교 테이블
+  <base_dir>/ais_output/pipeline/comparison_YYYYMMDD_HHMMSS.csv   통합 CSV 결과
+  <base_dir>/ais_output/pipeline/{model}_YYYYMMDD_HHMMSS.csv       모델별 개별 CSV
 """
 
 import argparse
@@ -116,6 +118,9 @@ DATA_DIR     = "data"
 PIPELINE_DIR = os.path.join(OUTPUT_DIR, "pipeline")
 SEQ_BREAK_DT = 600   # 시퀀스 분리 임계 dt (초)
 
+# main()에서 --base_dir 파싱 후 설정됨
+_MODELS_DIR = None
+
 
 # ── 유틸: 한/영 혼용 우측 정렬 ────────────────────────────────────────
 def rjust(s: str, width: int) -> str:
@@ -128,18 +133,24 @@ def rjust(s: str, width: int) -> str:
 
 # ── 모델 파일 경로 계산 ───────────────────────────────────────────────
 def _model_paths(name: str):
+    base = _MODELS_DIR  # None → 이전 동작(cwd/output/) 유지
     if name.startswith("sup_"):
-        mdir        = os.path.join(OUTPUT_DIR, name)
+        mdir        = os.path.join(base or OUTPUT_DIR, name)
         model_f     = os.path.join(mdir, f"model_{name}.onnx")
         threshold_f = os.path.join(mdir, f"threshold_{name}.txt")
         scaler_f    = os.path.join(mdir, f"scaler_{name}.json")
         if not os.path.exists(scaler_f):
-            scaler_f = os.path.join(OUTPUT_DIR, "scaler_sup.json")
+            scaler_f = os.path.join(base or OUTPUT_DIR, "scaler_sup.json")
     else:
-        # train_benchmark.py 는 cwd(ml/) 에 직접 저장
-        model_f     = f"model_{name}.onnx"
-        scaler_f    = f"scaler_{name}.json"
-        threshold_f = f"threshold_{name}.txt"
+        if base:
+            model_f     = os.path.join(base, f"model_{name}.onnx")
+            scaler_f    = os.path.join(base, f"scaler_{name}.json")
+            threshold_f = os.path.join(base, f"threshold_{name}.txt")
+        else:
+            # 이전 동작: train_benchmark.py가 cwd(ml/)에 저장
+            model_f     = f"model_{name}.onnx"
+            scaler_f    = f"scaler_{name}.json"
+            threshold_f = f"threshold_{name}.txt"
     return model_f, scaler_f, threshold_f
 
 
@@ -535,6 +546,41 @@ def save_csv(out_path, model_names, fp_rates, det_by_threshold, det_at_fp):
             writer.writerow(row)
 
 
+# ── 모델별 개별 CSV 저장 ──────────────────────────────────────────────
+def save_model_csv(out_path: str, model_name: str,
+                   fp_rate: float, det_by_threshold: dict,
+                   det_at_fp: dict):
+    """단일 모델의 시나리오별 결과를 CSV 파일로 저장"""
+    anom_rows  = [(n, ih) for n, _, ia, ih in SCENARIO_MAKERS if ia]
+    fp_targets = sorted(det_at_fp.keys())
+
+    fieldnames = ["scenario", "is_holdout", "default_dr"]
+    for fp_t in fp_targets:
+        fieldnames.append(f"fp{fp_t:.0f}_dr")
+
+    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv_mod.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        meta = {"scenario": "오탐율(저장임계값)", "is_holdout": "",
+                "default_dr": f"{fp_rate:.2f}%"}
+        for fp_t in fp_targets:
+            meta[f"fp{fp_t:.0f}_dr"] = f"{fp_t:.0f}% 목표"
+        writer.writerow(meta)
+
+        for sc_name, is_holdout in anom_rows:
+            v_d = det_by_threshold.get(sc_name, "")
+            row = {
+                "scenario":   sc_name,
+                "is_holdout": "홀드아웃" if is_holdout else "학습",
+                "default_dr": f"{v_d:.1f}%" if isinstance(v_d, float) else "",
+            }
+            for fp_t in fp_targets:
+                v = det_at_fp[fp_t].get(sc_name, "")
+                row[f"fp{fp_t:.0f}_dr"] = f"{v:.1f}%" if isinstance(v, float) else ""
+            writer.writerow(row)
+
+
 # ── 메인 ─────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -585,10 +631,18 @@ def main():
                         help="비교 기준 오탐율 목표값 %% (기본: 1 5 10)")
 
     # 출력
+    parser.add_argument("--base_dir", type=str, default="D:\\",
+                        help="출력 기본 경로 (기본: D:\\)  "
+                             "모델→base/ais_models  결과→base/ais_output/pipeline")
     parser.add_argument("--output", type=str, default=None,
-                        help="결과 파일 접두사 (기본: output/pipeline/comparison_TIMESTAMP)")
+                        help="결과 파일 접두사 (기본: <base_dir>/ais_output/pipeline/comparison_TIMESTAMP)")
 
     args = parser.parse_args()
+
+    # ── base_dir 기반 경로 설정 ───────────────────────────────────
+    global _MODELS_DIR, PIPELINE_DIR
+    _MODELS_DIR  = os.path.join(args.base_dir, "ais_models")
+    PIPELINE_DIR = os.path.join(args.base_dir, "ais_output", "pipeline")
 
     # ── 모델 목록 결정 ────────────────────────────────────────────
     model_names = []
@@ -620,6 +674,8 @@ def main():
         sys.exit(1)
 
     os.makedirs(PIPELINE_DIR, exist_ok=True)
+    if _MODELS_DIR:
+        os.makedirs(_MODELS_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_prefix = args.output or os.path.join(PIPELINE_DIR, f"comparison_{timestamp}")
@@ -636,6 +692,8 @@ def main():
           + ("평가" if args.eval else "").rstrip(" → "))
     print(f"  원본 데이터: {args.raw_data}")
     print(f"  전처리 파일: {args.data_file}")
+    print(f"  모델 경로:   {_MODELS_DIR}")
+    print(f"  결과 경로:   {PIPELINE_DIR}")
     if args.eval:
         print(f"  시나리오당 이상: {args.n_anom}  |  정상: {args.n_eval_normal or '전체'}")
         print(f"  FP 목표값: {args.fp_targets}")
@@ -667,11 +725,12 @@ def main():
             sys.exit(1)
 
         extra = []
-        if args.epochs:       extra += ["--epochs",   str(args.epochs)]
-        if args.lr:           extra += ["--lr",       str(args.lr)]
-        if args.max_mmsi:     extra += ["--max_mmsi", str(args.max_mmsi)]
-        if args.n_normal:     extra += ["--n_normal", str(args.n_normal)]
-        if args.n_anom_train: extra += ["--n_anom",   str(args.n_anom_train)]
+        if args.epochs:       extra += ["--epochs",     str(args.epochs)]
+        if args.lr:           extra += ["--lr",         str(args.lr)]
+        if args.max_mmsi:     extra += ["--max_mmsi",   str(args.max_mmsi)]
+        if args.n_normal:     extra += ["--n_normal",   str(args.n_normal)]
+        if args.n_anom_train: extra += ["--n_anom",     str(args.n_anom_train)]
+        if _MODELS_DIR:       extra += ["--output_dir", _MODELS_DIR]
 
         print(f"[학습 단계]  모델 {len(model_names)}개\n")
         for i, name in enumerate(model_names, 1):
@@ -789,6 +848,13 @@ def main():
 
     save_csv(out_csv, final_models, fp_rates, det_by_threshold, det_at_fp)
     print(f"→ CSV 저장:    {out_csv}")
+
+    for name in final_models:
+        model_csv = os.path.join(PIPELINE_DIR, f"{name}_{timestamp}.csv")
+        per_fp = {fp_t: det_at_fp[fp_t].get(name, {}) for fp_t in det_at_fp}
+        save_model_csv(model_csv, name, fp_rates.get(name, float("nan")),
+                       det_by_threshold.get(name, {}), per_fp)
+        print(f"→ 모델 CSV:   {model_csv}")
 
 
 if __name__ == "__main__":
