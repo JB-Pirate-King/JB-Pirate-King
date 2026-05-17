@@ -108,9 +108,13 @@ python ml/pipeline.py --train --eval --models conv1d tranad dcdetect --skip_trai
 
 # Evaluation only
 python ml/pipeline.py --eval --models conv1d dcdetect
+
+# Use a different base directory (default: D:\)
+python ml/pipeline.py --train --eval --models conv1d --base_dir E:\
 ```
 
 pipeline.py defaults:
+- `--base_dir`: `D:\` — all model files and output go under this root
 - `--raw_data`: `D:\ais_data\raw\2025`
 - `--data_file`: `D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv`
 
@@ -129,9 +133,29 @@ pipeline.py defaults:
 
 ---
 
+## Directory Structure (D:\ base)
+
+```
+D:\
+├── ais_data\
+│   ├── raw\2025\                     # raw .csv.zst files
+│   └── preprocessed\2025\
+│       ├── daily\                    # per-day preprocessed files
+│       └── ais_preprocessed_2025.csv # yearly merged (pipeline default)
+├── ais_models\                       # trained model files (--base_dir default)
+│   ├── model_{name}.onnx
+│   ├── scaler_{name}.json
+│   └── threshold_{name}.txt
+└── ais_output\
+    └── pipeline\                     # pipeline comparison results
+        ├── comparison_TIMESTAMP.txt
+        ├── comparison_TIMESTAMP.csv  # combined all-model CSV
+        └── {model}_TIMESTAMP.csv     # per-model individual CSV
+```
+
 ## Model File Path Rules
 
-- Unsupervised: `ml/model_{name}.onnx`, `ml/scaler_{name}.json`, `ml/threshold_{name}.txt`
+- Unsupervised: `D:\ais_models\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
 - Deploy: `ml/deploy/model.onnx`, `ml/deploy/scaler.json`, `ml/deploy/threshold.txt`
 - Plugin: `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
 
