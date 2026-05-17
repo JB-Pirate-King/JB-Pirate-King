@@ -1,18 +1,26 @@
 ais_ids_pi/build
 ais_ids_pi/po
 
-# ml: 데이터 파일 (data/ 디렉터리)
+# ── ml/ ────────────────────────────────────────────────────────────────
+# 데이터 (실제 경로: D:\ais_data\)
 ml/data/
 
-# ml: 학습 아웃풋 (output/ 디렉터리)
+# 비교 결과 (실제 경로: D:\ais_output\)
 ml/output/
 
-# 이전 방식 폴백 (ml/ 루트에 남아있는 경우)
-ml/*.csv
+# 모델 파일 — train_benchmark.py 직접 실행 시 ml/ 루트에 생성될 수 있음
+# (pipeline.py --base_dir 사용 시에는 D:\ais_models\ 로 저장)
 ml/*.onnx
+ml/*.json
 ml/threshold*.txt
-ml/scaler*.json
 ml/eval_result_*.txt
+
+# 전처리 중 생성되는 로그/임시 CSV
+ml/*.csv
+
+# PyTorch 체크포인트 (학습 중 임시 저장)
+ml/*.pt
+ml/*.pth
 
 aivdm_gen/*.csv
 
