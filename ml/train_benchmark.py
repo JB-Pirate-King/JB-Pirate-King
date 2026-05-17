@@ -1149,8 +1149,8 @@ def run_model(model_name: str, tensor: torch.Tensor,
 def main():
     parser = argparse.ArgumentParser(description="AIS 벤치마크 학습 (eval_anomaly.py 호환)")
     parser.add_argument("--model",      type=str, default="usad",
-                        choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm","all"],
-                        help="학습할 모델 (all: 전체 9개 모델 순차 학습)")
+                        choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","all"],
+                        help="학습할 모델 (all: 전체 7개 모델 순차 학습)")
     parser.add_argument("--input",      type=str, default=INPUT_FILE)
     parser.add_argument("--epochs",     type=int, default=None)
     parser.add_argument("--lr",         type=float, default=None)
@@ -1163,7 +1163,7 @@ def main():
     print(f"[피처 수]  {N_FEAT}  |  시퀀스 길이: {SEQ_LEN}")
 
     t0 = time.time()
-    models_to_run = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"] if args.model == "all" else [args.model]
+    models_to_run = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect"] if args.model == "all" else [args.model]
 
     # 데이터는 한 번만 로드 (스케일러는 모델별로 저장)
     first_scaler = f"scaler_{models_to_run[0]}.json"

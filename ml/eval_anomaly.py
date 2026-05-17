@@ -86,21 +86,30 @@ _G_N_ANOM      = 500   # 시나리오당 이상 시퀀스 수 (--n_anom으로 �
 # python eval_anomaly.py --model conv1d
 # python eval_anomaly.py              ← 기존 model.onnx 사용
 _KNOWN_MODELS = [
-    "usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm",
-    # 지도 학습 모델 (model_sup_*.onnx)
-    "sup_patchtst","sup_itrans","sup_tsmixer","sup_moderntcn","sup_mamba",
-    # seq_len 포함 버전
-    "sup_moderntcn_seq5","sup_moderntcn_seq10",
-    "sup_patchtst_seq5","sup_patchtst_seq10",
-    "sup_itrans_seq5","sup_itrans_seq10",
-    "sup_tsmixer_seq5","sup_tsmixer_seq10",
-    "sup_mamba_seq5","sup_mamba_seq10",
+    "usad", "tranad", "conv1d", "lstm", "tcn", "anomtrans", "dcdetect",
 ]
-_SUP_MODELS = [m for m in _KNOWN_MODELS if m.startswith("sup_")]
+_SUP_MODELS = []
 
 _pre = argparse.ArgumentParser(add_help=False)
-_pre.add_argument("--model", type=str, default=None)  # choices 검증 없이 받음
+_pre.add_argument("--model",      type=str, default=None)
+_pre.add_argument("--data",       type=str, default=None,
+                  help="전처리 CSV 경로 (기본: data/ais-2024-01-01_preprocessed.csv)")
+_pre.add_argument("--output_dir", type=str, default=None,
+                  help="모델/결과 저장 디렉터리 (기본: output)")
+_pre.add_argument("--seq_len",    type=int, default=None,
+                  help="시퀀스 길이 (기본: 모델명 자동 추론, 없으면 10)")
+_pre.add_argument("--seq_break_dt", type=int, default=None,
+                  help="시퀀스 분리 dt 임계값(초) (기본: 600)")
 _args_pre, _ = _pre.parse_known_args()
+
+# ── 전역 설정 덮어쓰기 (CLI 인자 우선) ──────────────────────────────
+if _args_pre.data:
+    DATA_FILE = _args_pre.data
+if _args_pre.output_dir:
+    OUTPUT_DIR = _args_pre.output_dir
+if _args_pre.seq_break_dt is not None:
+    SEQ_BREAK_DT = _args_pre.seq_break_dt
+
 if _args_pre.model and _args_pre.model in _KNOWN_MODELS:
     _mdir = os.path.join(OUTPUT_DIR, _args_pre.model)
     MODEL_FILE     = os.path.join(_mdir, f"model_{_args_pre.model}.onnx")
@@ -117,8 +126,10 @@ if _args_pre.model and _args_pre.model in _KNOWN_MODELS:
 
 IS_SUPERVISED = (_args_pre.model in _SUP_MODELS) if _args_pre.model else False
 
-# seq_len 자동 설정 (모델 이름에 _seq5/_seq10 포함 시)
-if _args_pre.model and "_seq5" in _args_pre.model:
+# seq_len 자동 설정 (모델 이름에 _seq5/_seq10 포함 시, CLI 인자 우선)
+if _args_pre.seq_len is not None:
+    SEQ_LEN = _args_pre.seq_len
+elif _args_pre.model and "_seq5" in _args_pre.model:
     SEQ_LEN = 5
 elif _args_pre.model and "_seq10" in _args_pre.model:
     SEQ_LEN = 10
@@ -1008,44 +1019,43 @@ _I_SOG_CH   = FEATURES.index("sog_change")
 _I_SPEED_C  = FEATURES.index("speed_consistency")
 
 def _rule_anchor_move(step):
-    """정박/계류 중 이동: navStatus 1/5/6 AND SOG >= 3.0"""
-    return int(round(step[_I_STATUS])) in (1, 5, 6) and step[_I_SOG] >= 3.0
+    """정박/계류 중 이동: navStatus 1/5/6 AND SOG >= 1.5kn (GPS 노이즈 제외)"""
+    return int(round(step[_I_STATUS])) in (1, 5, 6) and step[_I_SOG] >= 1.5
 
 def _rule_cog_hdg(step):
-    """COG/HDG 불일치: diff > 90° + SOG >= 2.0kn"""
+    """COG/HDG 불일치: diff > 90° + SOG >= 3.0kn (저속 표류/선회 제외)"""
     chd = step[_I_CHD]
-    return chd >= 0 and chd > 90.0 and step[_I_SOG] >= 2.0
+    return chd >= 0 and chd > 90.0 and step[_I_SOG] >= 3.0
 
 def _rule_overspeed(step):
-    """물리적 속도 초과: SOG > 50kn (일반 선박 물리적 한계 초과)"""
+    """물리적 속도 초과: SOG > 50kn"""
     return step[_I_SOG] > 50.0
 
 def _rule_sog_spike(step):
-    """순간 속도 급변: 한 스텝 내 SOG 변화 > 15kn"""
-    return step[_I_SOG_CH] > 15.0
+    """순간 속도 급변: SOG 변화 > 20kn AND dt < 60s (고속 측정 오류 제외)"""
+    return step[_I_SOG_CH] > 20.0 and step[_I_DT] < 60.0
 
 def _rule_speed_dist_mismatch(step):
-    """속도-거리 불일치: 보고 SOG 대비 실제 이동거리 10배 이상
-    speed_consistency = dist / (SOG*dt 기반 예상거리), SOG > 1kn 조건"""
+    """속도-거리 불일치: ratio > 20배 AND 실제 이동 > 0.1km (GPS 노이즈 수준 제외)"""
     sc = step[_I_SPEED_C]
-    return step[_I_SOG] > 1.0 and sc > 10.0
+    return sc > 20.0 and step[_I_DIST] > 0.1
 
 def _rule_signal_gap(step):
-    """비정상 신호 간격: dt > 600초 (10분 이상 소실 후 재등장)"""
-    return step[_I_DT] > 600.0
+    """비정상 신호 간격: dt > 1800초 (30분 이상 소실)"""
+    return step[_I_DT] > 1800.0
 
 def _rule_zero_sog_moving(step):
-    """SOG=0 보고인데 실제 이동: SOG < 0.3 AND dist_km > 0.05 AND dt < 120"""
-    return step[_I_SOG] < 0.3 and step[_I_DIST] > 0.05 and step[_I_DT] < 120.0
+    """SOG=0 보고인데 실제 이동: SOG < 0.3 AND dist > 0.1km AND dt < 60s"""
+    return step[_I_SOG] < 0.3 and step[_I_DIST] > 0.1 and step[_I_DT] < 60.0
 
 RULES = [
-    ("정박/계류 중 이동",      _rule_anchor_move),
-    ("COG/HDG 불일치(>90°)",   _rule_cog_hdg),
-    ("물리적 속도 초과(>50kn)", _rule_overspeed),
-    ("순간 SOG 급변(>15kn)",   _rule_sog_spike),
-    ("속도-거리 불일치(×10)",   _rule_speed_dist_mismatch),
-    ("신호 간격 이상(>600s)",   _rule_signal_gap),
-    ("SOG=0 실제이동",          _rule_zero_sog_moving),
+    ("정박/계류 중 이동",        _rule_anchor_move),
+    ("COG/HDG 불일치(>90°)",     _rule_cog_hdg),
+    ("물리적 속도 초과(>50kn)",  _rule_overspeed),
+    ("순간 SOG 급변(>20kn/60s)", _rule_sog_spike),
+    ("속도-거리 불일치(×20)",    _rule_speed_dist_mismatch),
+    ("신호 간격 이상(>1800s)",   _rule_signal_gap),
+    ("SOG=0 실제이동(>0.1km)",   _rule_zero_sog_moving),
 ]
 
 def _apply_rules(seqs):
@@ -1074,13 +1084,19 @@ def analysis_rule_fp(raw_seqs):
     n = len(raw_seqs)
     fp_counts, fp_any = _apply_rules(raw_seqs)
 
-    print(f"\n  [오탐율] 정상 시퀀스 {n:,}개")
-    print(f"  {'룰':<26} {'오탐율':>8}")
-    print(f"  {'─'*26} {'─'*8}")
+    # 합성 정상 시퀀스로도 비교
+    n_syn = min(n, 5000)
+    syn_seqs = [make_normal_seq() for _ in range(n_syn)]
+    syn_counts, syn_any = _apply_rules(syn_seqs)
+
+    print(f"\n  [오탐율 비교]")
+    print(f"  {'룰':<26} {'실제데이터':>10} {'합성데이터':>10}")
+    print(f"  {'─'*26} {'─'*10} {'─'*10}")
     for name, _ in RULES:
-        print(f"  {name:<26} {fp_counts[name]/n*100:>7.2f}%")
-    print(f"  {'─'*26} {'─'*8}")
-    print(f"  {'룰 합산 (OR)':<26} {fp_any/n*100:>7.2f}%")
+        print(f"  {name:<26} {fp_counts[name]/n*100:>9.2f}% {syn_counts[name]/n_syn*100:>9.2f}%")
+    print(f"  {'─'*26} {'─'*10} {'─'*10}")
+    print(f"  {'룰 합산 (OR)':<26} {fp_any/n*100:>9.2f}% {syn_any/n_syn*100:>9.2f}%")
+    print(f"  (실제: {n:,}개 / 합성: {n_syn:,}개)")
 
     # ── 탐지율 (이상 시나리오) ────────────────────────────────────
     N_ANOM = _G_N_ANOM
@@ -1667,11 +1683,20 @@ def main():
     parser.add_argument("--all",    action="store_true", help="분석 1~4 전부 실행")
     parser.add_argument("--rule",   action="store_true", help="룰 기반 오탐율 분석")
     parser.add_argument("--output", type=str, default=None,
-                        help="텍스트 결과 저장 파일명 (기본: eval_result_{model}.txt)")
+                        help="결과 저장 파일명 (기본: eval_result_{model}.csv)")
     parser.add_argument("--n_normal", type=int, default=3000,
                         help="오탐율 계산에 사용할 정상 시퀀스 수 (기본: 3000, 0=전체)")
     parser.add_argument("--n_anom", type=int, default=500,
                         help="시나리오당 생성할 이상 시퀀스 수 (기본: 500)")
+    # pre-parser 와 동일 인자 재선언 (argparse 호환)
+    parser.add_argument("--data",       type=str, default=None,
+                        help="전처리 CSV 경로 (기본: data/ais-2024-01-01_preprocessed.csv)")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="모델/결과 저장 디렉터리 (기본: output)")
+    parser.add_argument("--seq_len",    type=int, default=None,
+                        help="시퀀스 길이")
+    parser.add_argument("--seq_break_dt", type=int, default=None,
+                        help="시퀀스 분리 dt 임계값(초)")
     args = parser.parse_args()
     # --all 이면 전부, 아무것도 없으면 탐지율만(분석1), 개별 플래그 우선
     if args.all:
@@ -1689,15 +1714,15 @@ def main():
     if args.output is None:
         if args.weighted:
             args.output = os.path.join(OUTPUT_DIR, "ensemble",
-                                       f"eval_result_{'_'.join(args.weighted)}_weighted.txt")
+                                       f"eval_result_{'_'.join(args.weighted)}_weighted.csv")
         elif args.ensemble:
             args.output = os.path.join(OUTPUT_DIR, "ensemble",
-                                       f"eval_result_{'_'.join(args.ensemble)}_ensemble.txt")
+                                       f"eval_result_{'_'.join(args.ensemble)}_ensemble.csv")
         elif args.rule and not args.model:
-            args.output = os.path.join(OUTPUT_DIR, "eval_result_rule.txt")
+            args.output = os.path.join(OUTPUT_DIR, "eval_result_rule.csv")
         else:
             _m = args.model or "lstm"
-            args.output = os.path.join(OUTPUT_DIR, _m, f"eval_result_{_m}.txt")
+            args.output = os.path.join(OUTPUT_DIR, _m, f"eval_result_{_m}.csv")
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     # ── 앙상블 모드 ──────────────────────────────────────────────
@@ -1747,8 +1772,15 @@ def main():
         def flush(self):
             for s in self.streams: s.flush()
 
-    out_file = open(args.output, "w", encoding="utf-8")
+    # ── 로그 파일 (txt) + CSV 경로 설정 ──────────────────────────────
+    csv_path = args.output  # 기본값이 이미 .csv
+    log_path = csv_path.replace(".csv", ".log") if csv_path.endswith(".csv") else csv_path + ".log"
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+
+    out_file = open(log_path, "w", encoding="utf-8")
     sys.stdout = Tee(sys.__stdout__, out_file)
+
+    _csv_rows = []   # CSV 에 저장할 구조화 결과
 
     try:
         if not HAS_MPL:
@@ -1772,7 +1804,29 @@ def main():
             analysis_rule_fp(raw_seqs)
         else:
             # 탐지율(분석1)은 항상 실행
-            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
+            all_errors = analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
+            # ── CSV 구조화 ─────────────────────────────────────────
+            if all_errors:
+                ne_errs = all_errors[0][1]
+                fp_rate = float(np.sum(ne_errs > threshold) / len(ne_errs) * 100)
+                _csv_rows.append({
+                    "scenario": all_errors[0][0], "is_anomaly": False,
+                    "n_seqs": len(ne_errs),
+                    "avg_score": float(ne_errs.mean()),
+                    "p95_score": float(np.percentile(ne_errs, 95)),
+                    "detection_rate": round(fp_rate, 2),   # 정상=오탐율
+                    "threshold": round(threshold, 6),
+                })
+                for scen_name, errs in all_errors[1:]:
+                    det = float(np.sum(errs > threshold) / len(errs) * 100)
+                    _csv_rows.append({
+                        "scenario": scen_name, "is_anomaly": True,
+                        "n_seqs": len(errs),
+                        "avg_score": float(errs.mean()),
+                        "p95_score": float(np.percentile(errs, 95)),
+                        "detection_rate": round(det, 2),
+                        "threshold": round(threshold, 6),
+                    })
             if args.rule:  analysis_rule_fp(raw_seqs)
             if args.corr:  analysis_correlation()
             if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
@@ -1785,7 +1839,16 @@ def main():
                                   "permutation_importance.png"] if os.path.exists(f)]
             if saved:
                 print("저장된 그래프:", ", ".join(saved))
-        print(f"\n→ 텍스트 결과 저장: {args.output}")
+        print(f"\n→ 로그 저장: {log_path}")
+
+        # ── CSV 저장 ──────────────────────────────────────────────
+        if _csv_rows:
+            import csv as _csv_mod
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as _cf:
+                _w = _csv_mod.DictWriter(_cf, fieldnames=list(_csv_rows[0].keys()))
+                _w.writeheader()
+                _w.writerows(_csv_rows)
+            print(f"→ CSV 저장:  {csv_path}")
 
     finally:
         sys.stdout = sys.__stdout__
