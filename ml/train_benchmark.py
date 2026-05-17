@@ -1156,7 +1156,11 @@ def main():
     parser.add_argument("--lr",         type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--patience",   type=int, default=None)
+    parser.add_argument("--output_dir", type=str, default=".",
+                        help="모델 파일 저장 디렉터리 (기본: 현재 폴더)")
     args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[디바이스] {device}")
@@ -1166,7 +1170,7 @@ def main():
     models_to_run = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect"] if args.model == "all" else [args.model]
 
     # 데이터는 한 번만 로드 (스케일러는 모델별로 저장)
-    first_scaler = f"scaler_{models_to_run[0]}.json"
+    first_scaler = os.path.join(args.output_dir, f"scaler_{models_to_run[0]}.json")
     tensor = load_and_prepare(args.input, scaler_path=first_scaler)
 
     for name in models_to_run:
@@ -1176,9 +1180,9 @@ def main():
         batch_size = args.batch_size or d["batch_size"]
         patience   = args.patience   or d["patience"]
 
-        onnx_path      = f"model_{name}.onnx"
-        scaler_path    = f"scaler_{name}.json"
-        threshold_path = f"threshold_{name}.txt"
+        onnx_path      = os.path.join(args.output_dir, f"model_{name}.onnx")
+        scaler_path    = os.path.join(args.output_dir, f"scaler_{name}.json")
+        threshold_path = os.path.join(args.output_dir, f"threshold_{name}.txt")
 
         # 첫 모델 외에는 scaler 재저장 (동일 데이터이므로 값은 같음)
         if name != models_to_run[0]:
@@ -1189,7 +1193,7 @@ def main():
                   onnx_path, scaler_path, threshold_path, full_tensor=tensor)
 
     print(f"\n완료! 전체 소요: {time.time() - t0:.1f}s")
-    print("\n생성된 파일:")
+    print(f"\n생성된 파일: ({args.output_dir})")
     for name in models_to_run:
         print(f"  model_{name}.onnx  |  scaler_{name}.json  |  threshold_{name}.txt")
 
