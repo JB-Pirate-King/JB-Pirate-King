@@ -19,21 +19,23 @@ ml/
 
 ## 디렉터리 구조
 
+`--base_dir`로 출력 루트를 지정한다 (기본값: `D:\`).
+
 ```
-D:\                                         ← --base_dir 기본값
-├── ais_data\
-│   ├── raw\2025\                           # 원본 .csv.zst (172개)
-│   └── preprocessed\2025\
-│       ├── daily\                          # 일별 전처리 결과
+<base_dir>/
+├── ais_data/
+│   ├── raw/2025/                           # 원본 .csv.zst
+│   └── preprocessed/2025/
+│       ├── daily/                          # 일별 전처리 결과
 │       └── ais_preprocessed_2025.csv       # 연도 합산본 (pipeline 기본값)
-├── ais_models\                             # 학습 모델 파일
+├── ais_models/                             # 학습 모델 파일
 │   ├── model_{name}.onnx
 │   ├── scaler_{name}.json
 │   └── threshold_{name}.txt
-└── ais_output\
-    └── pipeline\
+└── ais_output/
+    └── pipeline/
         ├── comparison_TIMESTAMP.txt
-        ├── comparison_TIMESTAMP.csv        # 통합 CSV
+        ├── comparison_TIMESTAMP.csv        # 통합 CSV (전체 모델)
         └── {model}_TIMESTAMP.csv           # 모델별 개별 CSV
 ```
 
@@ -41,11 +43,11 @@ D:\                                         ← --base_dir 기본값
 
 ```bash
 # 1단계: 일별 전처리 (raw → daily/)
-python preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
+python preprocess.py <raw_dir> --output_dir <preprocessed_dir>/daily
 
 # 2단계: 합산 (daily/ → 연도 합산본)
-python preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
-    --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+python preprocess.py "<preprocessed_dir>/daily/*_preprocessed.csv" ^
+    --output <preprocessed_dir>/ais_preprocessed_2025.csv
 ```
 
 > 새 날짜 데이터가 추가되면 해당 날짜만 1단계 재실행 후 2단계로 합산.
@@ -88,9 +90,9 @@ python pipeline.py --eval --models dcdetect tranad --fp_targets 1 5 10 --n_anom 
 | `--preprocess` | — | 원본 CSV → 전처리 실행 |
 | `--train` | — | 지정 모델 학습 |
 | `--eval` | — | 탐지율 비교 평가 |
-| `--base_dir` | `D:\` | 출력 기본 경로 (모델·결과 저장 루트) |
-| `--raw_data` | `D:\ais_data\raw\2025` | 원본 AIS CSV 폴더 |
-| `--data_file` | `D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv` | 전처리 결과 파일 |
+| `--base_dir` | `D:\` | 출력 기본 경로 — 모델·결과가 이 아래에 저장됨 |
+| `--raw_data` | `<base_dir>/ais_data/raw/2025` | 원본 AIS CSV 폴더 |
+| `--data_file` | `<base_dir>/ais_data/preprocessed/2025/ais_preprocessed_2025.csv` | 전처리 결과 파일 |
 | `--models` | — | 비교 모델 목록 |
 | `--all_models` | — | 전체 14개 모델 |
 | `--unsup` | — | 비지도 9개 모델 |
@@ -115,12 +117,12 @@ pip install scikit-learn   # iforest / ocsvm 사용 시
 pip install zstandard      # .csv.zst 원본 파일 처리 시
 
 # 전처리 (일별 저장 후 합산)
-python preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
-python preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+python preprocess.py <raw_dir> --output_dir <preprocessed_dir>/daily
+python preprocess.py "<preprocessed_dir>/daily/*_preprocessed.csv" --output <preprocessed_dir>/ais_preprocessed_2025.csv
 
 # 비지도 학습 (단독 — 기본값: cwd에 저장)
 python train_benchmark.py --model dcdetect
-python train_benchmark.py --model dcdetect --output_dir D:\ais_models
+python train_benchmark.py --model dcdetect --output_dir <base_dir>/ais_models
 
 # 지도 학습 (단독)
 python train_supervised.py --model moderntcn
