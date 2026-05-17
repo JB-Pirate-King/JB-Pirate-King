@@ -22,6 +22,11 @@ ml/*.csv
 ml/*.pt
 ml/*.pth
 
+# 시각화 출력 (matplotlib 등)
+ml/**/*.png
+ml/**/*.jpg
+ml/**/*.pdf
+
 aivdm_gen/*.csv
 
 # 런타임 생성 파일
