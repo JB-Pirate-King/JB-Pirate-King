@@ -169,6 +169,99 @@ D:\
 
 ---
 
+## Release & Version Management
+
+### Version Scheme
+
+`v{major}.{minor}.{patch}` — Semantic Versioning
+
+| Bump | When | Example |
+|---|---|---|
+| **major** | Input features change (12→N), model interface breaks, SEQ_LEN change | v1.0.0 → v2.0.0 |
+| **minor** | New model added, new eval scenarios added, significant accuracy improvement | v1.0.0 → v1.1.0 |
+| **patch** | Threshold re-tuned, bug fix, same model retrained on more data | v1.0.0 → v1.0.1 |
+
+A model retrained on new data (same architecture) = **patch**. New architecture = **minor**.
+
+### Release Assets
+
+Each release should attach:
+- `model_{name}.onnx` — trained ONNX model (one per model)
+- `scaler_{name}.json` — Min-Max scaler
+- `threshold_{name}.txt` — anomaly threshold
+- `comparison_TIMESTAMP.txt` — human-readable performance table
+- `comparison_TIMESTAMP.csv` — combined model comparison CSV
+- `{model}_TIMESTAMP.csv` — per-model individual CSV (one per model)
+
+### How to Create a Release
+
+```bash
+# 1. Merge claude/* branch into develop, then develop into main
+git checkout main
+git merge develop
+
+# 2. Tag
+git tag v1.0.0
+git push origin main --tags
+
+# 3. Create release and attach files
+gh release create v1.0.0 \
+  D:\ais_models\model_conv1d.onnx \
+  D:\ais_models\scaler_conv1d.json \
+  D:\ais_models\threshold_conv1d.txt \
+  D:\ais_output\pipeline\comparison_TIMESTAMP.txt \
+  D:\ais_output\pipeline\comparison_TIMESTAMP.csv \
+  D:\ais_output\pipeline\conv1d_TIMESTAMP.csv \
+  --title "v1.0.0 — conv1d / tranad / dcdetect" \
+  --notes "$(cat <<'EOF'
+## Models
+- conv1d, tranad, dcdetect (3 epochs each)
+
+## Training Data
+- D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+- Coverage: 2025-09-14 (1 day, expand later)
+
+## Performance (FP ≈ 1%)
+- conv1d:   학습 68.3% / 홀드아웃 70.8%
+- tranad:   학습 35.4% / 홀드아웃 61.0%
+- dcdetect: 학습 47.4% / 홀드아웃 65.6%
+
+## Plugin Deploy
+Copy model.onnx / scaler.json / threshold.txt to ais_ids_pi/data/
+EOF
+)"
+
+# 4. Download on another machine
+gh release download v1.0.0 --dir D:\ais_models
+```
+
+### Release Notes Template
+
+```
+## Models
+- <model list and epoch counts>
+
+## Training Data
+- <data file path and date coverage>
+
+## Performance (FP ≈ 1%)
+- <model>: 학습 X% / 홀드아웃 Y%
+
+## Changes from previous version
+- <what changed>
+
+## Plugin Deploy
+Copy model.onnx / scaler.json / threshold.txt to ais_ids_pi/data/
+```
+
+### Version History
+
+| Version | Date | Models | Notes |
+|---|---|---|---|
+| v0.1.0 | — | conv1d, tranad, dcdetect | Initial release (1-day training data) |
+
+---
+
 ## Environment
 
 - Python 3.14 (Windows)
