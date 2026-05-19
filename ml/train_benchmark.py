@@ -87,6 +87,7 @@ OpenCPN 플러그인과 호환된다.
 """
 
 import argparse
+import os
 import shutil
 import csv
 import json

@@ -551,7 +551,7 @@ def main():
         "tag": pargs.tag,
         "source_files": [os.path.abspath(f) for f in input_files],
         "output_file": os.path.abspath(
-            merged_output if len(input_files) > 1 else part_outputs[0]
+            merged_path if len(input_files) > 1 else part_outputs[0]
         ),
         "total_rows": total_rows,
         "created": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
