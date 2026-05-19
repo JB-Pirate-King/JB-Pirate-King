@@ -143,9 +143,10 @@ def _model_paths(name: str):
             scaler_f = os.path.join(base or OUTPUT_DIR, "scaler_sup.json")
     else:
         if base:
-            model_f     = os.path.join(base, f"model_{name}.onnx")
-            scaler_f    = os.path.join(base, f"scaler_{name}.json")
-            threshold_f = os.path.join(base, f"threshold_{name}.txt")
+            mdir        = os.path.join(base, name)
+            model_f     = os.path.join(mdir, f"model_{name}.onnx")
+            scaler_f    = os.path.join(mdir, f"scaler_{name}.json")
+            threshold_f = os.path.join(mdir, f"threshold_{name}.txt")
         else:
             # 이전 동작: train_benchmark.py가 cwd(ml/)에 저장
             model_f     = f"model_{name}.onnx"
@@ -341,8 +342,14 @@ def run_training(name: str, data_file: str, extra_args: list) -> tuple:
             print(f"  ⚠ train_supervised.py 는 data/ 폴더를 고정 탐색합니다.")
             print(f"    {data_file} 을 data/ais_preprocessed.csv 에 심볼릭 링크하거나 복사하세요.")
     else:
-        cmd   = [sys.executable, "train_benchmark.py",
-                 "--model", name, "--input", data_file] + extra_args
+        model_f, _, _ = _model_paths(name)
+        out_dir = os.path.dirname(model_f) if _MODELS_DIR else None
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        cmd = [sys.executable, "train_benchmark.py",
+               "--model", name, "--input", data_file] + extra_args
+        if out_dir:
+            cmd += ["--output_dir", out_dir]
 
     print(f"\n{'─'*60}")
     print(f"  학습 시작: {name}")
@@ -730,7 +737,7 @@ def main():
         if args.max_mmsi:     extra += ["--max_mmsi",   str(args.max_mmsi)]
         if args.n_normal:     extra += ["--n_normal",   str(args.n_normal)]
         if args.n_anom_train: extra += ["--n_anom",     str(args.n_anom_train)]
-        if _MODELS_DIR:       extra += ["--output_dir", _MODELS_DIR]
+        # --output_dir 은 모델별로 다르므로 run_training 내부에서 처리
 
         print(f"[학습 단계]  모델 {len(model_names)}개\n")
         for i, name in enumerate(model_names, 1):

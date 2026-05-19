@@ -155,7 +155,7 @@ D:\
 
 ## Model File Path Rules
 
-- Unsupervised: `D:\ais_models\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
+- Unsupervised: `D:\ais_models\{name}\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
 - Deploy: `ml/deploy/model.onnx`, `ml/deploy/scaler.json`, `ml/deploy/threshold.txt`
 - Plugin: `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
 
