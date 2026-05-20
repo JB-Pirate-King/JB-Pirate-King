@@ -159,7 +159,8 @@ class MinMaxScaler:
         return self.transform(data)
 
 
-def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
+def load_and_prepare(input_file: str, scaler_path: str = "scaler.json",
+                     max_mmsi: int = None):
     """CSV 로드 → 시퀀스 생성 → 스케일러 fit → Tensor 반환"""
     print(f"[데이터] {input_file} 로드 중...")
     mmsi_data = defaultdict(list)
@@ -177,8 +178,9 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
                 continue
 
     print(f"  고유 MMSI: {len(mmsi_data):,}")
-    if SAMPLE_MMSI and len(mmsi_data) > SAMPLE_MMSI:
-        keys = random.sample(list(mmsi_data.keys()), SAMPLE_MMSI)
+    limit = max_mmsi or SAMPLE_MMSI
+    if limit and len(mmsi_data) > limit:
+        keys = random.sample(list(mmsi_data.keys()), limit)
         mmsi_data = {k: mmsi_data[k] for k in keys}
         print(f"  샘플링 후 MMSI: {len(mmsi_data):,}")
 
@@ -1159,6 +1161,8 @@ def main():
     parser.add_argument("--patience",   type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=".",
                         help="모델 파일 저장 디렉터리 (기본: 현재 폴더)")
+    parser.add_argument("--max_mmsi",  type=int, default=None,
+                        help=f"학습에 사용할 최대 MMSI 수 (기본: {SAMPLE_MMSI})")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1172,7 +1176,8 @@ def main():
 
     # 데이터는 한 번만 로드 (스케일러는 모델별로 저장)
     first_scaler = os.path.join(args.output_dir, f"scaler_{models_to_run[0]}.json")
-    tensor = load_and_prepare(args.input, scaler_path=first_scaler)
+    tensor = load_and_prepare(args.input, scaler_path=first_scaler,
+                              max_mmsi=args.max_mmsi)
 
     for name in models_to_run:
         d = DEFAULTS[name]

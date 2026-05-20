@@ -11,7 +11,7 @@ AIS 이상 탐지 멀티모델 학습 / 탐지율 비교 파이프라인
        ▼
   D:\\ais_data\\preprocessed\\2025\\ais_preprocessed_2025.csv
        │
-       │  --train  (--base_dir D:\)
+       │  --train  (--base_dir D:\\)
        ▼
   D:\\ais_models\\model_{model}.onnx 등
        │

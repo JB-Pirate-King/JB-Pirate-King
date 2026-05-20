@@ -11,7 +11,8 @@ ml/
 ├── pipeline.py           # 멀티모델 학습/탐지율 비교 파이프라인 ★
 ├── preprocess.py         # AIS CSV 전처리
 ├── train_benchmark.py    # 비지도 모델 학습 (9종)
-└── eval_anomaly.py       # 탐지율/오탐율 평가
+├── eval_anomaly.py       # 탐지율/오탐율 평가
+└── feature_engineer.py   # DCdetect 피처 엔지니어링 자동화 (Greedy Forward Selection)
 ```
 
 ---
@@ -27,15 +28,19 @@ ml/
 │   └── preprocessed/2025/
 │       ├── daily/                          # 일별 전처리 결과
 │       └── ais_preprocessed_2025.csv       # 연도 합산본 (pipeline 기본값)
-├── ais_models/                             # 학습 모델 파일
-│   ├── model_{name}.onnx
-│   ├── scaler_{name}.json
-│   └── threshold_{name}.txt
+├── ais_models/
+│   └── {name}/                             # 모델별 서브디렉터리
+│       ├── model_{name}.onnx
+│       ├── scaler_{name}.json
+│       └── threshold_{name}.txt
 └── ais_output/
-    └── pipeline/
-        ├── comparison_TIMESTAMP.txt
-        ├── comparison_TIMESTAMP.csv        # 통합 CSV (전체 모델)
-        └── {model}_TIMESTAMP.csv           # 모델별 개별 CSV
+    ├── pipeline/
+    │   ├── comparison_TIMESTAMP.txt
+    │   ├── comparison_TIMESTAMP.csv        # 통합 CSV (전체 모델)
+    │   └── {model}_TIMESTAMP.csv           # 모델별 개별 CSV
+    └── feat_eng/
+        ├── feat_eng_TIMESTAMP.txt          # 피처 엔지니어링 결과 보고서
+        └── feat_eng_TIMESTAMP.json         # 결과 JSON
 ```
 
 ### 전처리 실행 순서
@@ -101,6 +106,42 @@ python pipeline.py --train --eval --models conv1d --base_dir E:\
 - `<base_dir>/ais_output/pipeline/comparison_TIMESTAMP.txt` — 텍스트 비교 테이블
 - `<base_dir>/ais_output/pipeline/comparison_TIMESTAMP.csv` — 통합 CSV 결과
 - `<base_dir>/ais_output/pipeline/{model}_TIMESTAMP.csv` — 모델별 개별 CSV
+
+---
+
+## 피처 엔지니어링 자동화 (`feature_engineer.py`)
+
+DCdetect 모델을 기준으로 파생 피처를 하나씩 추가하며 탐지율이 향상될 때만 채택하는
+Greedy Forward Selection을 수행한다. FP 1% 임계값 기준으로 평가.
+
+```bash
+python feature_engineer.py \
+  --input  <base_dir>/ais_data/preprocessed/2025/ais_preprocessed_2025.csv \
+  --base_dir <base_dir> \
+  --max_mmsi 500 --epochs 5 --n_anom 200
+```
+
+| 옵션 | 기본값 | 설명 |
+|---|---|---|
+| `--input` | (필수) | 전처리 CSV 경로 |
+| `--base_dir` | `C:\Users\imcas` | 결과 저장 루트 |
+| `--max_mmsi` | 500 | 학습에 사용할 MMSI 수 |
+| `--epochs` | 5 | 에폭 수 |
+| `--n_anom` | 200 | 시나리오당 이상 시퀀스 수 |
+
+후보 파생 피처 7종:
+
+| 피처 | 설명 |
+|---|---|
+| `cog_change` | COG 변화량 (도) |
+| `heading_change` | Heading 변화량 (도) |
+| `turn_rate` | COG 변화율 (도/초) |
+| `heading_rate` | Heading 변화율 (도/초) |
+| `accel` | 속도 변화율 (노트/초) |
+| `dist_speed_err` | 거리/속도 불일치 (km) |
+| `status_change` | 상태코드 변화 (0/1) |
+
+출력: `<base_dir>/ais_output/feat_eng/feat_eng_TIMESTAMP.txt/.json`
 
 ---
 
