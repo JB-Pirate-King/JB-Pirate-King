@@ -135,6 +135,31 @@ CANDIDATE_FEATURES: dict = {
             else 0.0
         ),
     ),
+    "anchor_suspicion": (
+        "정박의심 (저속+Heading변화)",
+        lambda seq, t: (
+            float(seq[t][_B["sog"]] < 0.5
+                  and _ang_diff(seq[t][_B["heading"]], seq[t - 1][_B["heading"]]) > 15)
+            if t > 0 else 0.0
+        ),
+    ),
+    "cog_move_diff": (
+        "COG vs 실이동방향 차이 (도)",
+        lambda seq, t: _ang_diff(
+            seq[t][_B["cog"]],
+            math.degrees(math.atan2(seq[t][_B["lon_speed"]], seq[t][_B["lat_speed"]])) % 360
+        ) if (abs(seq[t][_B["lat_speed"]]) + abs(seq[t][_B["lon_speed"]]) > 1e-6) else 0.0,
+    ),
+    "speed_ratio": (
+        "상대 속도 변화율 (변화/현재속도)",
+        lambda seq, t: abs(seq[t][_B["sog_change"]]) / max(seq[t][_B["sog"]], 0.5),
+    ),
+    "dist_speed_ratio": (
+        "거리/속도 비율 (차이 대신 비율)",
+        lambda seq, t: seq[t][_B["dist_km"]] / max(
+            seq[t][_B["sog"]] * seq[t][_B["dt"]] / 3600.0 * 1.852, 0.001
+        ),
+    ),
 }
 
 
@@ -314,6 +339,89 @@ def evaluate(
     return float(np.mean(all_dets)), scenario_results
 
 
+# ── Permutation Importance ────────────────────────────────────────
+def permutation_importance(
+    model,
+    scaler,
+    extra_names: list,
+    raw_seqs: list,
+    n_anom: int = 200,
+    n_normal: int = 3000,
+    n_repeat: int = 3,
+) -> list:
+    """
+    학습된 모델로 피처별 순열 중요도 계산.
+    각 피처를 랜덤 셔플 → 탐지율 하락량 = 중요도.
+    반환: [(feat_name, base_det, shuffled_det, importance), ...] 내림차순
+    """
+    device = next(model.parameters()).device
+    model.eval()
+    mins  = scaler.data_min_
+    maxs  = scaler.data_max_
+    scale_range = maxs - mins
+    all_feat_names = BASE_FEATURES + extra_names
+
+    def _scale_row(row):
+        return [(v - mn) / (rng + 1e-9)
+                for v, mn, rng in zip(row, mins, scale_range)]
+
+    def _score(seq: list) -> float:
+        aug = augment_seq(seq, extra_names)
+        scaled = [_scale_row(row) for row in aug]
+        x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            out = model(x)
+            return float(((out - x) ** 2).mean())
+
+    # 기준 탐지율
+    normal_raw  = random.sample(raw_seqs, min(n_normal, len(raw_seqs)))
+    normal_scores = [_score(seq) for seq in normal_raw]
+    fp1_thr     = float(np.percentile(normal_scores, 99))
+
+    anom_scenarios = [(name, maker) for name, maker, is_anom, _ in SCENARIO_MAKERS if is_anom]
+    anom_seqs_all  = {name: [maker() for _ in range(n_anom)] for name, maker in anom_scenarios}
+
+    def _det_rate(score_fn):
+        dets = []
+        for name, _ in anom_scenarios:
+            scores = [score_fn(seq) for seq in anom_seqs_all[name]]
+            dets.append(sum(1 for s in scores if s > fp1_thr) / len(scores) * 100.0)
+        return float(np.mean(dets))
+
+    print("\n[피처 중요도] Permutation Importance 계산 중...")
+    base_det = _det_rate(_score)
+    print(f"  기준 탐지율: {base_det:.1f}%")
+
+    results = []
+    for fi, feat in enumerate(tqdm(all_feat_names, desc="  피처 순열", leave=False)):
+        drop_sum = 0.0
+        for _ in range(n_repeat):
+            # fi번 열만 셔플한 스코어 함수
+            def _score_shuffled(seq, _fi=fi):
+                aug = augment_seq(seq, extra_names)
+                scaled = [_scale_row(row) for row in aug]
+                # _fi 열 값 추출 후 랜덤 대체
+                col_vals = [row[_fi] for row in scaled]
+                random.shuffle(col_vals)
+                for t, row in enumerate(scaled):
+                    row = list(row)
+                    row[_fi] = col_vals[t]
+                    scaled[t] = row
+                x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    out = model(x)
+                    return float(((out - x) ** 2).mean())
+
+            drop_sum += base_det - _det_rate(_score_shuffled)
+
+        importance = drop_sum / n_repeat
+        results.append((feat, base_det, importance))
+        print(f"  {feat:<25s}  중요도: {importance:+.2f}pp")
+
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results
+
+
 # ── Greedy Forward Selection 메인 루프 ────────────────────────────
 def greedy_forward_selection(raw_seqs: list, args) -> tuple:
     current_extra: list = []
@@ -444,7 +552,7 @@ def print_report(history: list):
 
 
 # ── 텍스트 보고서 저장 ────────────────────────────────────────────
-def save_txt_report(history: list, args, txt_path: str, ts: str):
+def save_txt_report(history: list, args, txt_path: str, ts: str, perm_results: list = None):
     """결과를 사람이 읽기 쉬운 .txt 파일로 저장"""
     W = 70
     lines = []
@@ -514,6 +622,21 @@ def save_txt_report(history: list, args, txt_path: str, ts: str):
           f"{float(np.mean(list(baseline_sc.values()))):>9.1f}%  "
           f"{best['det']:>9.1f}%")
 
+    # ── 피처 중요도 (Permutation Importance) ──
+    if perm_results:
+        L()
+        L("[ 피처 중요도 (Permutation Importance, FP 1% 기준) ]")
+        L(f"  탐지율 하락량 = 해당 피처 셔플 시 탐지율 변화. 클수록 중요.")
+        L()
+        L(f"  {'순위':>4}  {'피처':<25}  {'중요도':>9}  막대")
+        L(f"  {'─'*55}")
+        for rank, (feat, base_det, imp) in enumerate(perm_results, 1):
+            bar = "█" * max(0, int(abs(imp) / 1.5))
+            sign = "+" if imp >= 0 else ""
+            L(f"  {rank:>4}  {feat:<25}  {sign}{imp:>7.2f}pp  {bar}")
+        L(f"  {'─'*55}")
+        L(f"  기준 탐지율: {perm_results[0][1]:.1f}%")
+
     # ── 후보 피처 전체 목록 ──
     L()
     L("[ 후보 피처 목록 ]")
@@ -565,6 +688,23 @@ def main():
     history, best_extra = greedy_forward_selection(raw_seqs, args)
     print_report(history)
 
+    # ── 최적 피처셋으로 재학습 → Permutation Importance ──────────────
+    best = max(history, key=lambda x: x["det"])
+    best_extra = best.get("extra", [])
+    print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
+    tensor_best, scaler_best = prepare_tensor(raw_seqs, best_extra)
+    model_best, _ = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
+    perm_results = permutation_importance(
+        model_best, scaler_best, best_extra, raw_seqs, n_anom=args.n_anom
+    )
+
+    print("\n  피처 중요도 순위 (탐지율 하락량):")
+    print(f"  {'피처':<25s}  {'중요도':>8}")
+    print(f"  {'─'*36}")
+    for feat, base_det, imp in perm_results:
+        bar = "█" * max(0, int(imp / 2)) if imp > 0 else ""
+        print(f"  {feat:<25s}  {imp:>+7.2f}pp  {bar}")
+
     # 저장 경로 준비
     out_dir = os.path.join(args.base_dir, "ais_output", "feat_eng")
     os.makedirs(out_dir, exist_ok=True)
@@ -573,21 +713,26 @@ def main():
     json_path = args.out_json or os.path.join(out_dir, f"feat_eng_{ts}.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
-            [
-                {k: v for k, v in r.items() if k != "scenarios"}
-                | {"scenarios": [(n, d, h) for n, d, h in r.get("scenarios", [])]}
-                for r in history
-            ],
+            {
+                "history": [
+                    {k: v for k, v in r.items() if k != "scenarios"}
+                    | {"scenarios": [(n, d, h) for n, d, h in r.get("scenarios", [])]}
+                    for r in history
+                ],
+                "permutation_importance": [
+                    {"feature": feat, "base_det": base_det, "importance": imp}
+                    for feat, base_det, imp in perm_results
+                ],
+            },
             f, indent=2, ensure_ascii=False,
         )
 
-    # 텍스트 보고서 저장
+    # 텍스트 보고서 저장 (perm_results 전달)
     txt_path = os.path.join(out_dir, f"feat_eng_{ts}.txt")
-    save_txt_report(history, args, txt_path, ts)
+    save_txt_report(history, args, txt_path, ts, perm_results=perm_results)
 
     print(f"\n  JSON:  {json_path}")
-    best = max(history, key=lambda x: x["det"])
-    print(f"\n  최적 추가 피처: {best.get('extra', [])}")
+    print(f"\n  최적 추가 피처: {best_extra}")
     print(f"  탐지율 향상: {history[0]['det']:.1f}% → {best['det']:.1f}%"
           f"  ({best['det']-history[0]['det']:+.1f}pp)")
 
