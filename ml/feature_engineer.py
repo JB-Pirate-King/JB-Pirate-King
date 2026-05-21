@@ -388,31 +388,56 @@ def permutation_importance(
             dets.append(sum(1 for s in scores if s > fp1_thr) / len(scores) * 100.0)
         return float(np.mean(dets))
 
-    print("\n[피처 중요도] Permutation Importance 계산 중...")
-    base_det = _det_rate(_score)
+    # 이상 시퀀스 스케일링 미리 계산 (시퀀스 간 셔플을 위해)
+    anom_scaled_all: dict = {}
+    for sc_name, _ in anom_scenarios:
+        seqs = anom_seqs_all[sc_name]
+        anom_scaled_all[sc_name] = [
+            [_scale_row(row) for row in augment_seq(seq, extra_names)]
+            for seq in seqs
+        ]
+
+    def _det_rate_scaled(scaled_dict):
+        """스케일된 시퀀스 딕셔너리로 탐지율 계산"""
+        dets = []
+        for sc_name, _ in anom_scenarios:
+            cnt = 0
+            for scaled in scaled_dict[sc_name]:
+                x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    out = model(x)
+                    score = float(((out - x) ** 2).mean())
+                if score > fp1_thr:
+                    cnt += 1
+            dets.append(cnt / len(scaled_dict[sc_name]) * 100.0)
+        return float(np.mean(dets))
+
+    print("\n[피처 중요도] Permutation Importance 계산 중 (시퀀스 간 셔플)...")
+    base_det = _det_rate_scaled(anom_scaled_all)
     print(f"  기준 탐지율: {base_det:.1f}%")
 
     results = []
     for fi, feat in enumerate(tqdm(all_feat_names, desc="  피처 순열", leave=False)):
         drop_sum = 0.0
         for _ in range(n_repeat):
-            # fi번 열만 셔플한 스코어 함수
-            def _score_shuffled(seq, _fi=fi):
-                aug = augment_seq(seq, extra_names)
-                scaled = [_scale_row(row) for row in aug]
-                # _fi 열 값 추출 후 랜덤 대체
-                col_vals = [row[_fi] for row in scaled]
-                random.shuffle(col_vals)
-                for t, row in enumerate(scaled):
-                    row = list(row)
-                    row[_fi] = col_vals[t]
-                    scaled[t] = row
-                x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    out = model(x)
-                    return float(((out - x) ** 2).mean())
+            # fi번 열을 시퀀스 간 셔플 (각 timestep마다 독립적으로)
+            shuffled = {
+                sc_name: [list(map(list, s)) for s in seqs]
+                for sc_name, seqs in anom_scaled_all.items()
+            }
+            for t in range(SEQ_LEN):
+                # 모든 시나리오의 t번 timestep fi번 피처값 모아서 셔플
+                pool = []
+                keys = []
+                for sc_name in shuffled:
+                    for si, seq in enumerate(shuffled[sc_name]):
+                        pool.append(seq[t][fi])
+                        keys.append((sc_name, si, t))
+                random.shuffle(pool)
+                for (sc_name, si, t_), val in zip(keys, pool):
+                    shuffled[sc_name][si][t_][fi] = val
 
-            drop_sum += base_det - _det_rate(_score_shuffled)
+            drop_sum += base_det - _det_rate_scaled(shuffled)
 
         importance = drop_sum / n_repeat
         results.append((feat, base_det, importance))
