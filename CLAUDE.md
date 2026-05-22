@@ -161,6 +161,20 @@ D:\
 
 ---
 
+## Plugin Build & Deploy (native Linux ONLY)
+
+**The OpenCPN plugin is built and deployed on native Linux. Windows is used only for ML model training (the `ml/` pipeline). Do not add Windows/WSL-specific workarounds to the build scripts.**
+
+- Target: Ubuntu 24.04 (noble) — matches `OCPN_TARGET=noble` in `local-build-package.sh`.
+- `ais_ids_pi/opencpn-libs/` is a git submodule (`https://github.com/OpenCPN/opencpn-libs`). Before the first build run `git submodule update --init --recursive`, otherwise cmake fails with "opencpn-libs/... is not an existing directory".
+- ONNX Runtime is bundled at `ais_ids_pi/onnxruntime/{include,lib}`. On Linux the `.so`/`.so.1` files are real symlinks (only break when checked out on NTFS/Windows).
+- Build deps: `g++ cmake`, wxWidgets 3.2 dev (`libwxgtk3.2-dev`), `nlohmann-json3-dev`, and full OpenCPN build deps (`sudo mk-build-deps --install ci/control`).
+- Build command (from `ais_ids_pi/`): `./local-build-package.sh` → produces `ais_ids_pi-<version>-ubuntu-x86_64-24.04-noble.tar.gz`.
+- Plugin loads `model.onnx`/`scaler.json`/`threshold.txt` by default (single-model). For ensemble, drop an `ensemble_config.json` in `data/`. `model_seq5.*` is the optional early-detection seq5 model.
+- C++ feature count is hardcoded: `ML_FEATURE_COUNT` in `ais_ids_pi/include/ais_ml.h`. It MUST match the deployed model/scaler feature count (currently 12). Changing features requires updating `ML_FEATURE_COUNT`, `PushFeature()` (decl + impl in `ais_ml.cpp`), and the compute/call sites in `ais_ids.cpp`.
+
+---
+
 ## Branch Strategy
 
 - `main`: stable releases
@@ -259,12 +273,20 @@ Copy model.onnx / scaler.json / threshold.txt to ais_ids_pi/data/
 | Version | Date | Models | Notes |
 |---|---|---|---|
 | v0.1.0 | — | conv1d, tranad, dcdetect | Initial release (1-day training data) |
+| v0.2.0 | 2026-05-22 | dcdetect | Plugin default model.onnx → dcdetect (12 feat, 3yr data). Adds model_dcdetect.* + Linux tar.gz to release assets |
 
 ---
 
 ## Environment
 
+Two distinct environments — keep them separate:
+
+**ML training (Windows)**
 - Python 3.14 (Windows)
 - Console encoding: cp949 — `sys.stdout.reconfigure(encoding='utf-8')` applied in pipeline.py
 - GPU: Intel Arc B390 (iGPU, shared memory) — no CUDA, torch-directml not installed
 - Training runs on CPU
+
+**Plugin build/deploy (native Linux)**
+- Ubuntu 24.04 (noble). See "Plugin Build & Deploy" section above.
+- Windows/WSL is NOT the build target — don't add Windows-specific hacks to build scripts.
