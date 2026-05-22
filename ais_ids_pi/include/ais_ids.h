@@ -33,6 +33,8 @@ public:
     static const int AIS_CLASS_B = 1;
 
     AIS_Parser *ais_parser;
-    AIS_ML     *ais_ml;
+    AIS_ML     *ais_ml;        // seq10 메인 모델
+    AIS_ML     *ais_ml_short;  // seq5  조기 탐지 모델
     std::string ml_error_msg;
+    std::string ml_short_error_msg;
 };

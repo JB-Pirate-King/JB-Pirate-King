@@ -583,7 +583,7 @@ void ais_ids_pi::UpdateAppendToFile(bool bAppendToFile)
 }
 
 
-void ais_ids_pi::SetAISSentence(wxString &sentence) 
+void ais_ids_pi::SetAISSentence(wxString &sentence)
 {
 
     AISTarget t;
