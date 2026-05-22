@@ -1034,6 +1034,29 @@ def main():
 
     # JSON 저장
     json_path = args.out_json or os.path.join(out_dir, f"feat_eng_{ts}.json")
+
+    # 피처 설명 딕셔너리 (베이스 + 후보)
+    _base_descs = {
+        "sog":              "선속 (Speed Over Ground, knots)",
+        "cog":              "항로 방향 (Course Over Ground, 0~360°)",
+        "heading":          "선수 방향 (True Heading, 0~360°, 511=불가)",
+        "status":           "AIS 항법 상태 코드 (0=운항, 1=정박, 5=계류 등)",
+        "dt":               "이전 포인트와의 시간 간격 (초)",
+        "dist_km":          "이전 포인트로부터의 이동 거리 (km)",
+        "cog_hdg_diff":     "COG-Heading 각도 차이 (0~180°, -1=heading 불가)",
+        "sog_change":       "SOG 변화량 (현재 - 이전, knots)",
+        "cog_hdg_change":   "cog_hdg_diff 변화량 (현재 - 이전)",
+        "speed_consistency":"SOG와 거리/시간 속력의 일관성 (1=완전일치)",
+        "lat_speed":        "위도 방향 속도 성분 (deg/s, GPS 기반)",
+        "lon_speed":        "경도 방향 속도 성분 (deg/s, GPS 기반)",
+    }
+    _all_feat_descs: dict = {}
+    _all_feat_descs.update(_base_descs)
+    for name, (desc, _) in CANDIDATE_FEATURES.items():
+        _all_feat_descs[name] = desc
+
+    all_feats_in_result = list(dict.fromkeys(INITIAL_EXTRA + best_extra))
+
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -1041,6 +1064,10 @@ def main():
                 "best_det": best["det"],
                 "baseline_det": history[0]["det"],
                 "initial_extra": INITIAL_EXTRA,
+                "feature_descriptions": {
+                    f: _all_feat_descs.get(f, "") for f in
+                    BASE_FEATURES + all_feats_in_result
+                },
                 "history": [
                     {k: v for k, v in r.items() if k != "scenarios"}
                     | {"scenarios": [(n, d, h) for n, d, h in r.get("scenarios", [])]}

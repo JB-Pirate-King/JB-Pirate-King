@@ -218,6 +218,8 @@ def send_notion_iter_report(
     newly_adopted: list,
     history: list,
     permutation_importance: list,
+    feature_descriptions: Optional[dict] = None,
+    json_path: Optional[str] = None,
     cfg: Optional[dict] = None,
 ) -> bool:
     """피처 엔지니어링 결과를 구조화된 Notion 페이지로 생성."""
@@ -233,8 +235,9 @@ def send_notion_iter_report(
         return False
 
     intra_gain = best_det - baseline_det
-    gain_color  = "green" if intra_gain >= 3 else ("orange" if intra_gain >= 0 else "red")
-    emoji_icon  = "✅" if newly_adopted else "➡️"
+    emoji_icon = "✅" if newly_adopted else "➡️"
+    removed    = [f for f in initial_extra if f not in best_extra]
+    feat_desc  = feature_descriptions or {}
 
     # ── 요약 콜아웃 ─────────────────────────────────────────────────
     summary_txt = (
@@ -246,20 +249,28 @@ def send_notion_iter_report(
     # ── Greedy 히스토리 테이블 ───────────────────────────────────────
     hist_rows = []
     for h in history:
-        candidate = h.get("candidate", "baseline")
+        candidate = h.get("candidate", h.get("added", "baseline"))
         det   = h.get("det", 0.0)
         score = h.get("score", 0.0)
-        adopted = "✅" if h.get("adopted") else ("베이스라인" if candidate == "baseline" else "❌")
+        adopted = "✅" if h.get("adopted") else ("베이스라인" if candidate in ("baseline", "베이스라인") else "❌")
         hist_rows.append([candidate, f"{det:.1f}%", f"{score:.3f}", adopted])
 
     # ── 순열 중요도 테이블 ───────────────────────────────────────────
-    perm_rows = [[p.get("feature",""), f"{p.get('importance',0):.4f}"]
-                 for p in (permutation_importance or [])]
+    perm_rows = [
+        [p.get("feature", ""), f"{p.get('importance', 0):+.2f}pp",
+         "█" * max(0, int(abs(p.get("importance", 0)) / 1.5))]
+        for p in (permutation_importance or [])
+    ]
 
-    # ── 채택 피처 변화 ───────────────────────────────────────────────
-    removed = [f for f in initial_extra if f not in best_extra]
+    # ── 피처 계산법 상세 테이블 ─────────────────────────────────────
+    all_feats = list(dict.fromkeys(initial_extra + best_extra))
+    feat_formula_rows = []
+    for f in all_feats:
+        tag = "🆕 신규" if f in newly_adopted else ("◆ 기채택" if f in initial_extra else "✅ 채택")
+        desc = feat_desc.get(f, "—")
+        feat_formula_rows.append([tag, f, desc])
 
-    children = [
+    children: list = [
         _nb_callout(summary_txt, emoji_icon),
         _nb_divider(),
 
@@ -273,20 +284,26 @@ def send_notion_iter_report(
         ),
         _nb_divider(),
 
-        _nb_h2("✨ 채택 피처"),
-        _nb_h3("이전 → 이번"),
+        _nb_h2("✨ 채택 피처 변화"),
         _nb_table(
             ["구분", "피처 목록"],
             [
                 ["이전 (initial_extra)", ", ".join(initial_extra) or "없음"],
-                ["채택 (best_extra)",    ", ".join(best_extra)   or "없음"],
-                ["신규 채택",            ", ".join(newly_adopted) or "없음"],
-                ["제거",                 ", ".join(removed)       or "없음"],
+                ["이번 채택 (best_extra)", ", ".join(best_extra) or "없음"],
+                ["신규 채택",             ", ".join(newly_adopted) or "없음"],
+                ["제거",                  ", ".join(removed) or "없음"],
             ]
         ),
         _nb_divider(),
 
-        _nb_h2("🔄 Greedy 히스토리"),
+        _nb_h2("🧮 채택 피처 계산법"),
+        _nb_table(
+            ["구분", "피처명", "계산 설명"],
+            feat_formula_rows or [["—", "—", "—"]]
+        ),
+        _nb_divider(),
+
+        _nb_h2("🔄 Greedy Forward Selection 히스토리"),
         _nb_table(
             ["후보 피처", "탐지율", "목적 점수", "채택"],
             hist_rows or [["(데이터 없음)", "", "", ""]]
@@ -297,8 +314,20 @@ def send_notion_iter_report(
         children += [
             _nb_divider(),
             _nb_h2("🔬 순열 중요도 (Permutation Importance)"),
-            _nb_table(["피처", "중요도"], perm_rows),
+            _nb_para(_nb_txt("피처를 무작위 셔플했을 때 탐지율 하락량. 클수록 모델이 해당 피처에 의존.")),
+            _nb_table(["피처", "중요도 (탐지율 하락)", "시각화"], perm_rows),
         ]
+
+    # ── 결과 JSON 파일 전문 업로드 ───────────────────────────────────
+    if json_path and __import__("os").path.exists(json_path):
+        try:
+            with open(json_path, encoding="utf-8") as jf:
+                json_content = jf.read()
+            children += [_nb_divider(), _nb_h2("📄 결과 JSON (전문)")]
+            for chunk in _chunk_text(json_content, size=1900):
+                children.append(_nb_code(chunk, lang="json"))
+        except Exception as e:
+            print(f"[notify] JSON 읽기 실패: {e}")
 
     payload = {
         "parent": {"page_id": parent},
@@ -309,10 +338,21 @@ def send_notion_iter_report(
         },
         "children": children[:100],
     }
-    status, _ = _http_json("https://api.notion.com/v1/pages", payload,
-                           _notion_headers(cfg))
+    status, resp = _http_json("https://api.notion.com/v1/pages", payload,
+                              _notion_headers(cfg))
     ok = status == 200
     print(f"[notify] Notion 보고서 {'생성' if ok else '실패'} (HTTP {status})")
+
+    # 블록 100개 초과 시 나머지 append
+    if ok and len(children) > 100:
+        page_id = resp.get("id") if resp else None
+        if page_id:
+            for i in range(100, len(children), 100):
+                _http_json(
+                    f"https://api.notion.com/v1/blocks/{page_id}/children",
+                    {"children": children[i:i + 100]},
+                    _notion_headers(cfg),
+                )
     return ok
 
 
