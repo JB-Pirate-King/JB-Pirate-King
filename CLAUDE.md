@@ -25,7 +25,7 @@ AIS anomaly detection system for ships. Consists of an OpenCPN plugin (C++), ML 
 JB-Pirate-King/
 ├── ml/                    # ML pipeline (training & evaluation)
 │   ├── pipeline.py        # Multi-model training/detection rate comparison ★
-│   ├── preprocess.py      # AIS CSV preprocessing (.csv.zst supported)
+│   ├── preprocess.py      # AIS preprocessing (.csv / .csv.zst / .zip; old & new column formats)
 │   ├── train_benchmark.py # Unsupervised model training (9 models)
 │   ├── eval_anomaly.py    # Detection rate / false positive evaluation
 │   ├── compare_models.py  # Model comparison tool
@@ -43,22 +43,40 @@ JB-Pirate-King/
 
 ## Data Paths (Local D Drive)
 
+`--base_dir` defaults to `D:\`; everything lives under it.
+
 ```
-D:\ais_data\
-├── raw\
-│   └── 2025\                          # Raw .csv.zst files (172 files)
-└── preprocessed\
-    └── 2025\
-        ├── daily\                     # Per-day preprocessed files (to be created)
-        │   ├── ais-2025-07-13_preprocessed.csv
-        │   └── ...
-        └── ais_preprocessed_2025.csv  # Yearly merged file (870 MB, pipeline default)
+D:\
+├── ais_data\
+│   ├── raw\
+│   │   ├── 2023\                      # AIS_YYYY_MM_DD.zip (Marine Cadastre, old format)
+│   │   ├── 2024\                      # .zip (old format)
+│   │   └── 2025\                      # .csv.zst (new format)
+│   └── preprocessed\
+│       ├── 2025\
+│       │   ├── daily\                 # Per-day preprocessed files
+│       │   └── ais_preprocessed_2025.csv   # Yearly merged (pipeline default)
+│       ├── _3yr_daily\                # Per-day temp files for the 3yr build
+│       └── ais_preprocessed_3yr.csv   # 3-year balanced dataset (~10.9 GB)
+├── ais_models\
+│   └── {name}\                        # per-model dir (e.g. dcdetect\)
+│       ├── model_{name}.onnx
+│       ├── scaler_{name}.json
+│       └── threshold_{name}.txt
+└── ais_output\
+    ├── pipeline\                      # comparison_TIMESTAMP.{txt,csv}, {model}_TIMESTAMP.csv
+    └── feat_eng\ , feat_eng_iter\     # feature-engineering reports (JSON/txt)
 ```
+
+### Input Format Support (preprocess.py)
+- Accepts `.csv`, `.csv.zst` (2025+), and `.zip` (Marine Cadastre ≤2024, one CSV inside; corrupt zips are skipped with a warning).
+- Normalizes old vs new column headers (case/underscore-insensitive): `MMSI/BaseDateTime/LAT/LON/VesselType/Status` ↔ `mmsi/base_date_time/latitude/longitude/vessel_type/status`.
+- Timestamps parsed with `datetime.fromisoformat` (handles both `YYYY-MM-DD HH:MM:SS` and ISO `...T...`).
 
 ### Preprocessing Steps
 
 ```bash
-# Step 1: Per-day preprocessing
+# Step 1: Per-day preprocessing (a dir mixes .csv/.csv.zst/.zip automatically)
 python ml/preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
 
 # Step 2: Yearly merge
@@ -66,7 +84,7 @@ python ml/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv"
     --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
 ```
 
-> Currently only 2025-09-14 (1 day) has been preprocessed. Remaining 171 files to be run later.
+For the 3-year balanced dataset use `build_3yr_dataset.py` (see Feature Engineering section), which calls preprocess.py per selected day across 2023–2025.
 
 ---
 
@@ -159,29 +177,10 @@ Goal: find derived features that raise DCdetect detection rate, then export a de
 
 ---
 
-## Directory Structure (D:\ base)
-
-```
-D:\
-├── ais_data\
-│   ├── raw\2025\                     # raw .csv.zst files
-│   └── preprocessed\2025\
-│       ├── daily\                    # per-day preprocessed files
-│       └── ais_preprocessed_2025.csv # yearly merged (pipeline default)
-├── ais_models\                       # trained model files (--base_dir default)
-│   ├── model_{name}.onnx
-│   ├── scaler_{name}.json
-│   └── threshold_{name}.txt
-└── ais_output\
-    └── pipeline\                     # pipeline comparison results
-        ├── comparison_TIMESTAMP.txt
-        ├── comparison_TIMESTAMP.csv  # combined all-model CSV
-        └── {model}_TIMESTAMP.csv     # per-model individual CSV
-```
-
 ## Model File Path Rules
 
-- Unsupervised: `D:\ais_models\{name}\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
+(For the full D:\ tree see "Data Paths" above.)
+- Trained (per model): `D:\ais_models\{name}\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
 - Deploy: `ml/deploy/model.onnx`, `ml/deploy/scaler.json`, `ml/deploy/threshold.txt`
 - Plugin: `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
 

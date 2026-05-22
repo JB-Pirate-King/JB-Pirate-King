@@ -9,7 +9,7 @@
 ```
 ml/
 ├── pipeline.py           # 멀티모델 학습/탐지율 비교 파이프라인 ★
-├── preprocess.py         # AIS CSV 전처리
+├── preprocess.py         # AIS 전처리 (.csv / .csv.zst / .zip, 구·신형 컬럼 포맷 호환)
 ├── train_benchmark.py    # 비지도 모델 학습 (9종)
 ├── eval_anomaly.py       # 탐지율/오탐율 평가
 ├── feature_engineer.py   # DCdetect 피처 엔지니어링 (Greedy Forward Selection + ONNX export)
@@ -46,16 +46,24 @@ ml/
         └── feat_eng_TIMESTAMP.json         # 결과 JSON
 ```
 
+### 입력 포맷 지원 (preprocess.py)
+
+- `.csv`, `.csv.zst`(2025+), `.zip`(Marine Cadastre 2024 이전, 내부 CSV 1개. 손상 zip은 경고 후 건너뜀) 모두 처리.
+- 구·신형 컬럼명 자동 정규화(대소문자·언더스코어 무시): `MMSI/BaseDateTime/LAT/LON/VesselType/Status` ↔ `mmsi/base_date_time/latitude/longitude/vessel_type/status`.
+- 시간은 `datetime.fromisoformat`로 파싱(`YYYY-MM-DD HH:MM:SS` / ISO `...T...` 모두 처리).
+
 ### 전처리 실행 순서
 
 ```bash
-# 1단계: 일별 전처리 (raw → daily/)
+# 1단계: 일별 전처리 (raw → daily/). 폴더 안에 .csv/.csv.zst/.zip 혼재해도 자동 인식
 python preprocess.py <raw_dir> --output_dir <preprocessed_dir>/daily
 
 # 2단계: 합산 (daily/ → 연도 합산본)
 python preprocess.py "<preprocessed_dir>/daily/*_preprocessed.csv" ^
     --output <preprocessed_dir>/ais_preprocessed_2025.csv
 ```
+
+> 3년 균형 데이터셋은 `build_3yr_dataset.py` 사용 (2023–2025 선택 일자별로 preprocess.py 호출).
 
 > 새 날짜 데이터가 추가되면 해당 날짜만 1단계 재실행 후 2단계로 합산.
 
