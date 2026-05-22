@@ -48,6 +48,7 @@ WEAK_WEIGHT    = 1.5
 MIN_GAIN       = 3.0
 MAX_FEAT       = 18
 MAX_ITER       = 5      # 피처 엔지니어링 최대 반복 횟수
+EXPORT_DIR     = r"D:\ais_models\dcdetect"  # 최적 피처셋 배포 모델 저장 경로
 
 
 # ── 알림 헬퍼 ────────────────────────────────────────────────────────
@@ -157,6 +158,7 @@ def run_feat_eng_iter(
         "--min_gain",    str(args.min_gain),
         "--max_feat",    str(args.max_feat),
         "--out_json",    out_json,
+        "--export_dir",  args.export_dir,
     ]
     if initial_extra:
         cmd += ["--initial_extra"] + initial_extra
@@ -281,6 +283,8 @@ def main():
     ap.add_argument("--weak_weight",    type=float, default=WEAK_WEIGHT)
     ap.add_argument("--min_gain",       type=float, default=MIN_GAIN)
     ap.add_argument("--max_feat",       type=int,   default=MAX_FEAT)
+    ap.add_argument("--export_dir",     default=EXPORT_DIR,
+                    help="최적 피처셋 배포 모델 저장 경로")
     ap.add_argument("--max_iter",       type=int,   default=MAX_ITER,
                     help=f"피처 엔지니어링 최대 반복 횟수 (기본: {MAX_ITER})")
     ap.add_argument("--skip_build",     action="store_true",

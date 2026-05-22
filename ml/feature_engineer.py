@@ -21,6 +21,7 @@ import csv as csv_mod
 import json
 import math
 import os
+import pickle
 import random
 import sys
 import time
@@ -342,6 +343,21 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
     2. MMSI당 시퀀스 상한       — 고빈도 선박 지배 방지
     (스케일러 편향은 ClippedMinMaxScaler 에서 처리)
     """
+    # ── 시퀀스 캐시 (반복 iteration 간 10.9GB 재파싱 방지) ──────────────
+    # 키: 입력파일 + max_mmsi + SEED + 시퀀스 파라미터. SEED 고정이라 결정적.
+    cache_path = (f"{input_file}.s{max_mmsi}_seed{SEED}"
+                  f"_L{SEQ_LEN}_b{SEQ_BREAK}_c{MAX_SEQ_PER_MMSI}.seqs.pkl")
+    if (os.path.exists(cache_path)
+            and os.path.getmtime(cache_path) >= os.path.getmtime(input_file)):
+        print(f"\n[데이터] 시퀀스 캐시 로드: {cache_path}")
+        try:
+            with open(cache_path, "rb") as cf:
+                sequences = pickle.load(cf)
+            print(f"  총 시퀀스: {len(sequences):,} (캐시 적중)")
+            return sequences
+        except Exception as e:
+            print(f"  [캐시 로드 실패 → 원본 재파싱] {e}")
+
     print(f"\n[데이터] {input_file} 로드 중...")
 
     mmsi_data:        dict = defaultdict(list)   # mmsi → [record, ...]
@@ -435,6 +451,15 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
     if capped:
         print(f"  MMSI당 상한({MAX_SEQ_PER_MMSI}) 적용: {capped:,}개 MMSI 절감")
     print(f"  총 시퀀스: {len(sequences):,}")
+
+    # 다음 iteration을 위해 캐시 저장 (실패해도 진행에 영향 없음)
+    try:
+        with open(cache_path, "wb") as cf:
+            pickle.dump(sequences, cf, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  시퀀스 캐시 저장: {cache_path}")
+    except Exception as e:
+        print(f"  [캐시 저장 실패] {e}")
+
     return sequences
 
 
@@ -990,6 +1015,8 @@ def main():
                     help=f"목적점수 채택 임계 (기본: {MIN_GAIN_DEFAULT})")
     ap.add_argument("--max_feat", type=int, default=None,
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
+    ap.add_argument("--export_dir", default=None,
+                    help="최적 피처셋 모델을 배포용 ONNX/scaler/threshold로 저장할 디렉터리 (선택)")
     args = ap.parse_args()
 
     # 이전 반복 채택 피처를 CLI로 받았으면 전역 INITIAL_EXTRA 오버라이드
@@ -1016,7 +1043,7 @@ def main():
     best_extra = best.get("extra", [])
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
     tensor_best, scaler_best = prepare_tensor(raw_seqs, best_extra)
-    model_best, _ = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
+    model_best, val_loader_best = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
     perm_results = permutation_importance(
         model_best, scaler_best, best_extra, raw_seqs, n_anom=args.n_anom
     )
@@ -1084,6 +1111,50 @@ def main():
     # 텍스트 보고서 저장 (perm_results 전달)
     txt_path = os.path.join(out_dir, f"feat_eng_{ts}.txt")
     save_txt_report(history, args, txt_path, ts, perm_results=perm_results)
+
+    # ── 배포용 모델 export (--export_dir 지정 시) ──────────────────────
+    # 최적 피처셋으로 학습된 model_best 를 플러그인 배포용 ONNX/scaler/threshold 로 저장.
+    # 실패해도 FE 결과(JSON/txt)에는 영향 없도록 try/except 로 격리.
+    if args.export_dir:
+        try:
+            import torch as _torch
+            import warnings as _warnings
+            os.makedirs(args.export_dir, exist_ok=True)
+            all_feat_names = BASE_FEATURES + best_extra
+            n_feat         = best["n_feat"]
+            onnx_path      = os.path.join(args.export_dir, "model_dcdetect.onnx")
+            scaler_path    = os.path.join(args.export_dir, "scaler_dcdetect.json")
+            threshold_path = os.path.join(args.export_dir, "threshold_dcdetect.txt")
+
+            # ONNX (input "x", shape (1, SEQ_LEN, n_feat))
+            model_best.eval()
+            dummy = _torch.zeros(1, SEQ_LEN, n_feat, dtype=_torch.float32)
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                _torch.onnx.export(
+                    model_best, (dummy,), onnx_path,
+                    dynamo=False, opset_version=14,
+                    input_names=["x"], output_names=["output"],
+                )
+
+            # scaler (C++ MLScaler 호환: features/min/max. clamp == 클리핑이므로 min/max만)
+            with open(scaler_path, "w", encoding="utf-8") as sf:
+                json.dump({
+                    "features": all_feat_names,
+                    "min": [float(x) for x in scaler_best.data_min_],
+                    "max": [float(x) for x in scaler_best.data_max_],
+                }, sf, indent=2, ensure_ascii=False)
+
+            # threshold (FP≈1% 백분위)
+            thr = compute_threshold(model_best, val_loader_best)
+            with open(threshold_path, "w", encoding="utf-8") as tf:
+                tf.write(str(thr))
+
+            print(f"\n  [배포 export] {args.export_dir}  (피처 {n_feat}개)")
+            print(f"    features: {all_feat_names}")
+            print(f"    threshold: {thr}")
+        except Exception as _e:
+            print(f"  [배포 export 실패] {_e}")
 
     print(f"\n  JSON:  {json_path}")
     print(f"\n  최적 추가 피처: {best_extra}")
