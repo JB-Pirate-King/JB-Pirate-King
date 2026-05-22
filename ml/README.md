@@ -287,9 +287,9 @@ ais_ids_pi/data/
 | **patch** — 임계값 재조정, 버그픽스, 동일 구조 재학습 | v1.0.0→v1.0.1 |
 
 릴리즈 첨부 파일:
-- `model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
-- `comparison_TIMESTAMP.txt/.csv` — 비교 결과
-- `{model}_TIMESTAMP.csv` — 모델별 개별 CSV
+- **(필수) 플러그인 패키지** `ais_ids_pi-{version}-ubuntu-x86_64-{ver}-noble.tar.gz` — `local-build-package.sh` 산출물 (모델 포함, native Linux 빌드)
+- **(필수) 모델 파일** `model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
+- (선택) `comparison_TIMESTAMP.txt/.csv` — 비교 결과, `{model}_TIMESTAMP.csv` — 모델별 개별 CSV
 
 ```bash
 # 태그 생성 후 릴리즈

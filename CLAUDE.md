@@ -225,13 +225,23 @@ A model retrained on new data (same architecture) = **patch**. New architecture 
 
 ### Release Assets
 
-Each release should attach:
+Every release MUST attach the following.
+
+**1. Plugin package (필수) — `local-build-package.sh` 산출물**
+- `ais_ids_pi-{version}-ubuntu-x86_64-{ubuntu_ver}-noble.tar.gz` — 빌드된 플러그인 (model/scaler/threshold가 `data/`에 포함됨 + ONNX Runtime .so). 사용자가 압축만 풀면 바로 동작.
+- native Linux에서 빌드 (Windows ❌). 빌드 전 `git submodule update --init --recursive` 필요. 자세히는 "Plugin Build & Deploy" 섹션.
+
+**2. Model files (필수) — 개별 다운로드용**
 - `model_{name}.onnx` — trained ONNX model (one per model)
-- `scaler_{name}.json` — Min-Max scaler
+- `scaler_{name}.json` — Min-Max scaler (`features` 배열로 피처 순서·수 확인 가능)
 - `threshold_{name}.txt` — anomaly threshold
+
+**3. Performance reports (선택)**
 - `comparison_TIMESTAMP.txt` — human-readable performance table
 - `comparison_TIMESTAMP.csv` — combined model comparison CSV
 - `{model}_TIMESTAMP.csv` — per-model individual CSV (one per model)
+
+> 모델 파일 수치(탐지율)는 실제 그 모델의 평가값을 적을 것 — 다른 피처셋의 수치를 잘못 인용하지 말 것.
 
 ### How to Create a Release
 
@@ -245,13 +255,14 @@ git tag v1.0.0
 git push origin main --tags
 
 # 3. Create release and attach files
+#    (1) 플러그인 tar.gz  (2) 모델 파일  (3) 성능 리포트(선택)
 gh release create v1.0.0 \
-  D:\ais_models\model_conv1d.onnx \
-  D:\ais_models\scaler_conv1d.json \
-  D:\ais_models\threshold_conv1d.txt \
+  ais_ids_pi/ais_ids_pi-1.0.358.1-ubuntu-x86_64-24.04-noble.tar.gz \
+  D:\ais_models\dcdetect\model_dcdetect.onnx \
+  D:\ais_models\dcdetect\scaler_dcdetect.json \
+  D:\ais_models\dcdetect\threshold_dcdetect.txt \
   D:\ais_output\pipeline\comparison_TIMESTAMP.txt \
   D:\ais_output\pipeline\comparison_TIMESTAMP.csv \
-  D:\ais_output\pipeline\conv1d_TIMESTAMP.csv \
   --title "v1.0.0 — conv1d / tranad / dcdetect" \
   --notes "$(cat <<'EOF'
 ## Models
@@ -291,7 +302,8 @@ gh release download v1.0.0 --dir D:\ais_models
 - <what changed>
 
 ## Plugin Deploy
-Copy model.onnx / scaler.json / threshold.txt to ais_ids_pi/data/
+- 권장: `ais_ids_pi-*.tar.gz`를 OpenCPN 플러그인 경로에 압축 해제 (모델 포함, 바로 동작)
+- 수동: model_{name}.onnx/scaler/threshold를 ais_ids_pi/data/ 의 model.onnx/scaler.json/threshold.txt로 복사
 ```
 
 ### Version History
