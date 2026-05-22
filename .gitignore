@@ -29,9 +29,14 @@ ml/**/*.pdf
 
 aivdm_gen/*.csv
 
+# 시크릿 / 설정
+ml/notify_config.json
+
 # 런타임 생성 파일
 ais_ids_alerts.log
 *.log
+ml/preprocess_progress.log
+ml/preprocess_error.log
 
 # Python 캐시
 __pycache__/
