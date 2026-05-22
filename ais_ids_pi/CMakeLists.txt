@@ -130,8 +130,10 @@ option(PLUGIN_USE_SVG "Use SVG graphics" ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ONNX Runtime 설정
-set(ONNXRUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime")
+# ONNX Runtime 설정 (-DONNXRUNTIME_DIR=... 로 외부에서 재정의 가능)
+if(NOT DEFINED ONNXRUNTIME_DIR)
+  set(ONNXRUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime")
+endif()
 include_directories(${ONNXRUNTIME_DIR}/include)
 
 # Use local version of GLU library requires libs/glu directory
