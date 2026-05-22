@@ -64,6 +64,7 @@ from train_benchmark import (
 SEQ_LEN         = 10
 SEQ_BREAK       = 600   # dt 임계값 (초) — 시퀀스 분리
 MAX_SEQ_PER_MMSI = 500  # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
+EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 비율 (학습 풀에서 분리)
 
 # ── Greedy 목적함수 (약한 시나리오 가중) 기본값 ─────────────────────
 # 전체 평균만 최적화하면 90~100%인 다수 시나리오에 묻혀
@@ -333,27 +334,29 @@ def augment_seqs(seqs: list, extra_names: list) -> list:
 
 
 # ── 데이터 로드 (편향 제거) ────────────────────────────────────────
-def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
-    """전처리 CSV → BASE_FEATURES 기준 raw 시퀀스 리스트
+def load_raw_seqs(input_file: str, max_mmsi: int,
+                  eval_ratio: float = EVAL_NORMAL_RATIO) -> tuple:
+    """전처리 CSV → (train_seqs, eval_normal_seqs) 반환.
 
-    편향 제거 3종:
-    1. 연·월별 균등 MMSI 샘플링 — 연도/계절/시간 편향 방지
-       (3년 통합 시 2025 전체가 2023·2024 하반기를 압도하지 않도록 YYYY-MM 버킷)
+    편향 제거:
+    1. 연·월별 균등 MMSI 샘플링 — 연도/계절 편향 방지 (YYYY-MM 버킷)
     2. MMSI당 시퀀스 상한       — 고빈도 선박 지배 방지
+    3. 홀드아웃 정상셋          — FP(오탐) 측정용 정상 시퀀스를 MMSI 단위로 학습과 분리.
+       eval_ratio 만큼을 '월별 균등하게' 떼어내 학습에 한 번도 쓰지 않음(누수 방지).
     (스케일러 편향은 ClippedMinMaxScaler 에서 처리)
     """
-    # ── 시퀀스 캐시 (반복 iteration 간 10.9GB 재파싱 방지) ──────────────
-    # 키: 입력파일 + max_mmsi + SEED + 시퀀스 파라미터. SEED 고정이라 결정적.
-    cache_path = (f"{input_file}.s{max_mmsi}_seed{SEED}"
-                  f"_L{SEQ_LEN}_b{SEQ_BREAK}_c{MAX_SEQ_PER_MMSI}.seqs.pkl")
+    # ── 시퀀스 캐시 (반복 iteration 간 대용량 재파싱 방지) ──────────────
+    # 키: 입력파일 + max_mmsi + eval_ratio + SEED + 시퀀스 파라미터 (결정적)
+    cache_path = (f"{input_file}.s{max_mmsi}_seed{SEED}_ev{eval_ratio}"
+                  f"_L{SEQ_LEN}_b{SEQ_BREAK}_c{MAX_SEQ_PER_MMSI}.holdout.pkl")
     if (os.path.exists(cache_path)
             and os.path.getmtime(cache_path) >= os.path.getmtime(input_file)):
         print(f"\n[데이터] 시퀀스 캐시 로드: {cache_path}")
         try:
             with open(cache_path, "rb") as cf:
-                sequences = pickle.load(cf)
-            print(f"  총 시퀀스: {len(sequences):,} (캐시 적중)")
-            return sequences
+                train_seqs, eval_seqs = pickle.load(cf)
+            print(f"  학습 정상 {len(train_seqs):,} / FP측정 정상 {len(eval_seqs):,} (캐시 적중)")
+            return train_seqs, eval_seqs
         except Exception as e:
             print(f"  [캐시 로드 실패 → 원본 재파싱] {e}")
 
@@ -381,13 +384,14 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
     all_mmsis = list(mmsi_data.keys())
     print(f"  고유 MMSI: {len(all_mmsis):,}")
 
+    # MMSI별 주요 기간 (최빈 YYYY-MM) — 균등 샘플링/홀드아웃 분리에 공통 사용
+    mmsi_main_period = {
+        m: (max(cnt, key=cnt.get) if cnt else "")
+        for m, cnt in mmsi_period_cnt.items()
+    }
+
     # ── 1. 연·월별 균등 MMSI 샘플링 ───────────────────────────────
     if max_mmsi and len(all_mmsis) > max_mmsi:
-        # MMSI별 주요 기간 결정 (최빈 YYYY-MM)
-        mmsi_main_period = {
-            m: max(cnt, key=cnt.get) if cnt else ""
-            for m, cnt in mmsi_period_cnt.items()
-        }
         period_buckets: dict = defaultdict(list)
         for mmsi in all_mmsis:
             period_buckets[mmsi_main_period.get(mmsi, "")].append(mmsi)
@@ -405,7 +409,6 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
                 extra    = min(max_mmsi - len(selected), len(leftover))
                 selected.extend(random.sample(leftover, extra))
             selected = selected[:max_mmsi]
-            # 기간 분포 출력
             dist = defaultdict(int)
             for m in selected:
                 dist[mmsi_main_period.get(m, "")] += 1
@@ -417,49 +420,67 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
         else:
             selected = random.sample(all_mmsis, max_mmsi)
             print(f"  랜덤 샘플: {len(selected):,}개 MMSI")
+    else:
+        selected = all_mmsis
 
-        mmsi_data = {k: mmsi_data[k] for k in selected}
+    # ── 2. 홀드아웃 정상셋 분리 (월별 균등하게 eval_ratio 만큼) ──────────
+    # 각 YYYY-MM 버킷에서 eval_ratio 비율씩 떼어내 학습/FP측정 모두 월 균등 유지.
+    split_rng = random.Random(SEED + 777)
+    eval_set: set = set()
+    sel_buckets: dict = defaultdict(list)
+    for m in selected:
+        sel_buckets[mmsi_main_period.get(m, "")].append(m)
+    for p, ms in sel_buckets.items():
+        k = int(round(len(ms) * eval_ratio))
+        k = min(k, len(ms) - 1) if len(ms) > 1 else 0   # 월별 최소 1개는 학습에
+        if k > 0:
+            eval_set.update(split_rng.sample(ms, k))
+    train_mmsis = [m for m in selected if m not in eval_set]
+    eval_mmsis  = [m for m in selected if m in eval_set]
+    print(f"  홀드아웃: 학습 {len(train_mmsis):,} MMSI / FP측정 {len(eval_mmsis):,} MMSI "
+          f"(eval_ratio={eval_ratio}, 월별 균등)")
 
-    # ── 2. 시퀀스 생성 + MMSI당 상한 적용 ────────────────────────
-    dt_idx   = _B["dt"]
-    sequences: list = []
-    capped   = 0
+    # ── 3. 시퀀스 생성 + MMSI당 상한 (MMSI 집합별로 독립 생성) ──────────
+    dt_idx = _B["dt"]
 
-    for records in mmsi_data.values():
-        seg, cur = [], [records[0]]
-        for rec in records[1:]:
-            if rec[dt_idx] >= SEQ_BREAK:
-                seg.append(cur); cur = [rec]
-            else:
-                cur.append(rec)
-        seg.append(cur)
+    def _build(mmsi_keys: list) -> tuple:
+        seqs: list = []
+        capped = 0
+        for m in mmsi_keys:
+            records = mmsi_data[m]
+            seg, cur = [], [records[0]]
+            for rec in records[1:]:
+                if rec[dt_idx] >= SEQ_BREAK:
+                    seg.append(cur); cur = [rec]
+                else:
+                    cur.append(rec)
+            seg.append(cur)
+            mmsi_seqs: list = []
+            for s in seg:
+                if len(s) < SEQ_LEN:
+                    continue
+                for i in range(len(s) - SEQ_LEN + 1):
+                    mmsi_seqs.append(s[i: i + SEQ_LEN])
+            if len(mmsi_seqs) > MAX_SEQ_PER_MMSI:
+                mmsi_seqs = random.sample(mmsi_seqs, MAX_SEQ_PER_MMSI)
+                capped += 1
+            seqs.extend(mmsi_seqs)
+        return seqs, capped
 
-        mmsi_seqs: list = []
-        for s in seg:
-            if len(s) < SEQ_LEN:
-                continue
-            for i in range(len(s) - SEQ_LEN + 1):
-                mmsi_seqs.append(s[i: i + SEQ_LEN])
-
-        if len(mmsi_seqs) > MAX_SEQ_PER_MMSI:
-            mmsi_seqs = random.sample(mmsi_seqs, MAX_SEQ_PER_MMSI)
-            capped += 1
-
-        sequences.extend(mmsi_seqs)
-
-    if capped:
-        print(f"  MMSI당 상한({MAX_SEQ_PER_MMSI}) 적용: {capped:,}개 MMSI 절감")
-    print(f"  총 시퀀스: {len(sequences):,}")
+    train_seqs, cap_tr = _build(train_mmsis)
+    eval_seqs,  cap_ev = _build(eval_mmsis)
+    print(f"  시퀀스: 학습 {len(train_seqs):,} (상한적용 {cap_tr}) / "
+          f"FP측정 {len(eval_seqs):,} (상한적용 {cap_ev})")
 
     # 다음 iteration을 위해 캐시 저장 (실패해도 진행에 영향 없음)
     try:
         with open(cache_path, "wb") as cf:
-            pickle.dump(sequences, cf, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump((train_seqs, eval_seqs), cf, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"  시퀀스 캐시 저장: {cache_path}")
     except Exception as e:
         print(f"  [캐시 저장 실패] {e}")
 
-    return sequences
+    return train_seqs, eval_seqs
 
 
 # ── Tensor 준비 ────────────────────────────────────────────────────
@@ -731,7 +752,7 @@ def _objective(sc: list, weak_names: set, weak_weight: float) -> float:
 
 
 # ── Greedy Forward Selection 메인 루프 ────────────────────────────
-def greedy_forward_selection(raw_seqs: list, args) -> tuple:
+def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     weak_floor  = getattr(args, "weak_floor",  WEAK_FLOOR_DEFAULT)
     weak_weight = getattr(args, "weak_weight", WEAK_WEIGHT_DEFAULT)
     min_gain    = getattr(args, "min_gain",    MIN_GAIN_DEFAULT)
@@ -758,9 +779,9 @@ def greedy_forward_selection(raw_seqs: list, args) -> tuple:
     print(f"[베이스라인]  피처 {n_base_total}개: {BASE_FEATURES + current_extra}")
     print(f"{'─'*W}")
     t0 = time.time()
-    tensor, scaler = prepare_tensor(raw_seqs, current_extra)
+    tensor, scaler = prepare_tensor(train_seqs, current_extra)
     model, val_loader = train_dcdetect(tensor, n_base_total, args.epochs)
-    det0, sc0 = evaluate(model, scaler, current_extra, args.n_anom, raw_seqs=raw_seqs)
+    det0, sc0 = evaluate(model, scaler, current_extra, args.n_anom, raw_seqs=eval_seqs)
     elapsed = time.time() - t0
 
     # 약세 시나리오 집합 = 베이스라인 탐지율 < weak_floor (전 과정 고정)
@@ -804,9 +825,9 @@ def greedy_forward_selection(raw_seqs: list, args) -> tuple:
             print(f"  + {cand:<20s}  ({desc})  →  {n_feat}개 학습 중...",
                   end="", flush=True)
             t0 = time.time()
-            tensor, scaler = prepare_tensor(raw_seqs, trial_extra)
+            tensor, scaler = prepare_tensor(train_seqs, trial_extra)
             model, val_loader = train_dcdetect(tensor, n_feat, args.epochs)
-            det, sc = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=raw_seqs)
+            det, sc = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=eval_seqs)
             elapsed = time.time() - t0
             score = _objective(sc, weak_names, weak_weight)
             gain  = score - best_score          # 목적 점수 기준 향상
@@ -1034,6 +1055,8 @@ def main():
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
     ap.add_argument("--export_dir", default=None,
                     help="최적 피처셋 모델을 배포용 ONNX/scaler/threshold로 저장할 디렉터리 (선택)")
+    ap.add_argument("--eval_ratio", type=float, default=EVAL_NORMAL_RATIO,
+                    help=f"FP 측정용 홀드아웃 정상 시퀀스 비율 (월별 균등, 기본: {EVAL_NORMAL_RATIO})")
     args = ap.parse_args()
 
     # 이전 반복 채택 피처를 CLI로 받았으면 전역 INITIAL_EXTRA 오버라이드
@@ -1051,18 +1074,20 @@ def main():
     print(f"입력: {args.input}")
     print(f"설정: max_mmsi={args.max_mmsi}  epochs={args.epochs}  n_anom={args.n_anom}")
 
-    raw_seqs = load_raw_seqs(args.input, args.max_mmsi)
-    history, best_extra = greedy_forward_selection(raw_seqs, args)
+    train_seqs, eval_normal_seqs = load_raw_seqs(
+        args.input, args.max_mmsi, args.eval_ratio)
+    history, best_extra = greedy_forward_selection(train_seqs, eval_normal_seqs, args)
     print_report(history)
 
     # ── 최적 피처셋으로 재학습 → Permutation Importance ──────────────
+    # 학습은 train_seqs, FP(오탐)·중요도 평가는 홀드아웃 eval_normal_seqs 사용
     best = max(history, key=lambda x: x.get("score", x["det"]))
     best_extra = best.get("extra", [])
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
-    tensor_best, scaler_best = prepare_tensor(raw_seqs, best_extra)
+    tensor_best, scaler_best = prepare_tensor(train_seqs, best_extra)
     model_best, _ = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
     perm_results = permutation_importance(
-        model_best, scaler_best, best_extra, raw_seqs, n_anom=args.n_anom
+        model_best, scaler_best, best_extra, eval_normal_seqs, n_anom=args.n_anom
     )
 
     print("\n  피처 중요도 순위 (탐지율 하락량):")
@@ -1162,9 +1187,9 @@ def main():
                     "max": [float(x) for x in scaler_best.data_max_],
                 }, sf, indent=2, ensure_ascii=False)
 
-            # threshold: 실제 정상 시퀀스 99퍼센타일 = FP 1% (평가 탐지율과 동일 기준)
+            # threshold: 홀드아웃 정상셋 99퍼센타일 = FP 1% (평가 탐지율과 동일 기준)
             thr = compute_fp_threshold(model_best, scaler_best, best_extra,
-                                       raw_seqs, fp_pct=1.0)
+                                       eval_normal_seqs, fp_pct=1.0)
             with open(threshold_path, "w", encoding="utf-8") as tf:
                 tf.write(str(thr))
 
