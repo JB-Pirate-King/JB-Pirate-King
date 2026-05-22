@@ -123,8 +123,13 @@ python pipeline.py --train --eval --models conv1d --base_dir E:\
 ## 피처 엔지니어링 (`feature_engineer.py` + `auto_feat_eng.py`)
 
 DCdetect를 기준으로 파생 피처를 하나씩 추가하며 탐지율이 향상될 때만 채택하는
-**Greedy Forward Selection** + 채택셋 **Permutation Importance**를 수행한다 (FP 1% 임계 기준).
+**Greedy Forward Selection** + 채택셋 **Permutation Importance**를 수행한다.
 선택이 끝나면 최적 피처셋으로 학습한 모델을 **배포용 ONNX/scaler/threshold로 export**한다.
+
+> **오탐율(FP) 기준 = 1%, 실제 정상 시퀀스 대상.** 탐지율과 export되는 threshold 모두
+> 실제 CSV 정상 시퀀스 10,000개 점수의 **99퍼센타일**(상위 1% = FP 1%)로 고정된다
+> (`compute_fp_threshold(fp_pct=1.0)`). 합성 데이터가 아니라 실데이터 기준이며,
+> 배포 threshold도 평가와 동일한 FP 1%로 맞춰진다.
 
 ```bash
 # 단일 패스

@@ -58,7 +58,6 @@ from train_benchmark import (
     train_standard,
     SEED,
     VAL_RATIO,
-    THRESHOLD_PERCENTILE,
 )
 
 # ── 고정 상수 ──────────────────────────────────────────────────────
@@ -502,20 +501,38 @@ def train_dcdetect(
     return model, val_loader
 
 
-# ── 임계값 계산 ────────────────────────────────────────────────────
-def compute_threshold(model, val_loader) -> float:
+# ── 임계값 계산 (실제 정상 시퀀스 기준 목표 FP) ──────────────────────
+def compute_fp_threshold(model, scaler, extra_names: list, raw_seqs: list,
+                         fp_pct: float = 1.0, n_normal: int = 10000) -> float:
+    """실제 정상 시퀀스 점수의 (100-fp_pct) 퍼센타일 = 목표 FP 임계값.
+    evaluate()의 fp1_thr 와 동일 산식 → 배포 threshold가 평가 탐지율과 같은 FP 기준."""
     device = next(model.parameters()).device
     model.eval()
-    errors = []
-    with torch.no_grad():
-        for (batch,) in val_loader:
-            batch = batch.to(device)
-            out = model(batch)
-            mse = ((out - batch) ** 2).mean(dim=(1, 2))
-            errors.extend(mse.cpu().tolist())
-    errors.sort()
-    idx = int(len(errors) * THRESHOLD_PERCENTILE / 100)
-    return errors[min(idx, len(errors) - 1)]
+    mins        = scaler.data_min_
+    scale_range = scaler.data_max_ - mins
+    clip_lo = getattr(scaler, "clip_lo", None)
+    clip_hi = getattr(scaler, "clip_hi", None)
+
+    def _score(seq):
+        aug = augment_seq(seq, extra_names)
+        rows = []
+        for row in aug:
+            arr = np.asarray(row)
+            if clip_lo is not None:
+                arr = np.clip(arr, clip_lo, clip_hi)
+            rows.append([(v - mn) / (rng + 1e-9)
+                         for v, mn, rng in zip(arr.tolist(), mins, scale_range)])
+        x = torch.tensor(rows, dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            out = model(x)
+            return float(((out - x) ** 2).mean())
+
+    if raw_seqs:
+        sample = random.sample(raw_seqs, min(n_normal, len(raw_seqs)))
+    else:
+        sample = [make_normal_seq() for _ in range(n_normal)]
+    scores = [_score(s) for s in sample]
+    return float(np.percentile(scores, 100 - fp_pct))
 
 
 # ── 평가 ────────────────────────────────────────────────────────────
@@ -1043,7 +1060,7 @@ def main():
     best_extra = best.get("extra", [])
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
     tensor_best, scaler_best = prepare_tensor(raw_seqs, best_extra)
-    model_best, val_loader_best = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
+    model_best, _ = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
     perm_results = permutation_importance(
         model_best, scaler_best, best_extra, raw_seqs, n_anom=args.n_anom
     )
@@ -1145,8 +1162,9 @@ def main():
                     "max": [float(x) for x in scaler_best.data_max_],
                 }, sf, indent=2, ensure_ascii=False)
 
-            # threshold (FP≈1% 백분위)
-            thr = compute_threshold(model_best, val_loader_best)
+            # threshold: 실제 정상 시퀀스 99퍼센타일 = FP 1% (평가 탐지율과 동일 기준)
+            thr = compute_fp_threshold(model_best, scaler_best, best_extra,
+                                       raw_seqs, fp_pct=1.0)
             with open(threshold_path, "w", encoding="utf-8") as tf:
                 tf.write(str(thr))
 

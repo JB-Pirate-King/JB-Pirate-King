@@ -153,6 +153,12 @@ Goal: find derived features that raise DCdetect detection rate, then export a de
 - **`auto_feat_eng.py`** — automation loop: (optionally wait for downloads →) build 3yr dataset → run `feature_engineer.py` up to `--max_iter` times, chaining each iteration's best set as the next `--initial_extra`, stopping when no new feature is adopted. Sends Discord + Notion per-iteration reports. Defaults: `MAX_MMSI=3000, EPOCHS=5, N_ANOM=150, MAX_ITER=5, EXPORT_DIR=D:\ais_models\dcdetect`.
   - Run: `python ml/auto_feat_eng.py --no_wait --skip_build` (dataset already built). Use `PYTHONUNBUFFERED=1` for live logs.
 
+### Evaluation & Threshold (target FP = 1% on REAL normal sequences)
+- Detection rate and the deployed threshold are BOTH pinned to a **1% false-positive rate measured on real normal AIS sequences** (sampled from the preprocessed CSV `raw_seqs`, n_normal=10,000), NOT on synthetic data.
+- `evaluate()` scores those real normal sequences and sets `fp1_thr = np.percentile(normal_scores, 99)` (top 1% → FP 1%); detection rate = % of synthetic attack sequences scoring above it.
+- `--export_dir` writes `threshold_dcdetect.txt` via `compute_fp_threshold(..., fp_pct=1.0)` — the **same** 99th-percentile-of-real-normal value, so the deployed plugin threshold matches the reported FP=1% (do NOT use the old 95th-percentile `compute_threshold`, which was ~5% FP).
+- To change the target FP, pass a different `fp_pct` (threshold = `percentile(real_normal_scores, 100 - fp_pct)`).
+
 ### 3-Year Balanced Dataset (`build_3yr_dataset.py`)
 - Output: `D:\ais_data\preprocessed\ais_preprocessed_3yr.csv` (~10.9 GB).
 - Purpose: avoid confirmation bias from a single day/season. Picks N days/month across 2023–2024–2025.
