@@ -126,10 +126,12 @@ DCdetect를 기준으로 파생 피처를 하나씩 추가하며 탐지율이 �
 **Greedy Forward Selection** + 채택셋 **Permutation Importance**를 수행한다.
 선택이 끝나면 최적 피처셋으로 학습한 모델을 **배포용 ONNX/scaler/threshold로 export**한다.
 
-> **오탐율(FP) 기준 = 1%, 실제 정상 시퀀스 대상.** 탐지율과 export되는 threshold 모두
-> 실제 CSV 정상 시퀀스 10,000개 점수의 **99퍼센타일**(상위 1% = FP 1%)로 고정된다
-> (`compute_fp_threshold(fp_pct=1.0)`). 합성 데이터가 아니라 실데이터 기준이며,
-> 배포 threshold도 평가와 동일한 FP 1%로 맞춰진다.
+> **오탐율(FP) 기준 = 1%, 홀드아웃 실제 정상 시퀀스 대상.** 탐지율과 export threshold 모두
+> 학습에 쓰지 않은 **홀드아웃 정상셋** 점수의 **99퍼센타일**(상위 1% = FP 1%)로 고정된다
+> (`compute_fp_threshold(fp_pct=1.0)`).
+> `load_raw_seqs`가 월별 균등 MMSI를 **MMSI 단위로** train / eval-normal 로 분리하며
+> (`--eval_ratio`, 기본 0.2), eval-normal은 월별 균등 + 학습 선박과 완전 분리(누수 없음).
+> 합성이 아니라 실데이터 기준이고, 배포 threshold도 평가와 동일한 FP 1%다.
 
 ```bash
 # 단일 패스
