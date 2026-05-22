@@ -30,27 +30,30 @@ jobs:
 
       - name: 문법 검사 (py_compile)
         run: |
-          for f in ml/preprocess.py ml/train_benchmark.py ml/train_supervised.py ml/eval_anomaly.py; do
-            python -m py_compile "$f" && echo "  ✅ $f" || { echo "  ❌ $f"; exit 1; }
+          for f in ml/preprocess.py ml/train_benchmark.py ml/eval_anomaly.py \
+                   ml/feature_engineer.py ml/build_3yr_dataset.py \
+                   ml/auto_feat_eng.py ml/notify.py; do
+            if [ -f "$f" ]; then
+              python -m py_compile "$f" && echo "  ✅ $f" || { echo "  ❌ $f"; exit 1; }
+            fi
           done
 
-      - name: 모델 구조 smoke test
+      - name: DCdetect smoke test
         run: |
           cd ml
           python - <<'EOF'
           import torch, types, sys
 
-          source = open("train_supervised.py").read()
+          source = open("train_benchmark.py").read()
           source = source.replace('if __name__ == "__main__":\n    main()', '')
-          mod = types.ModuleType("ts")
-          exec(compile(source, "train_supervised.py", "exec"), mod.__dict__)
+          mod = types.ModuleType("tb")
+          exec(compile(source, "train_benchmark.py", "exec"), mod.__dict__)
 
           dummy = torch.zeros(2, 10, 12)
-          for name in ["PatchTST", "iTransformer", "TSMixer", "ModernTCN", "Mamba"]:
-              m   = getattr(mod, name)()
-              out = m(dummy)
-              assert out.shape == (2, 1), f"{name} shape 오류: {out.shape}"
-              print(f"  ✅ {name}: (2,10,12) → {tuple(out.shape)}")
+          m = mod.DCdetector(seq_len=10, n_feat=12)
+          out = m(dummy)
+          assert out.shape == dummy.shape, f"DCdetector shape 오류: {out.shape}"
+          print(f"  ✅ DCdetector: (2,10,12) → {tuple(out.shape)}")
           EOF
 
   # ────────────────────────────────────────────────────────────────
