@@ -21,7 +21,7 @@ OR 앙상블 평가 (개별 임계값 기준):
     python eval_anomaly.py --weighted dcdetect tranad conv1d --weights 0.6 0.2 0.2
 
 입력 데이터:
-    data/ais-2025-01-25_preprocessed.csv
+    data/ais-2024-01-01_preprocessed.csv
 
 결과 파일:
     output/{model}/eval_result_{model}.txt
@@ -75,9 +75,10 @@ DATA_DIR       = "data"
 MODEL_FILE     = f"{OUTPUT_DIR}/model.onnx"
 SCALER_FILE    = f"{OUTPUT_DIR}/scaler.json"
 THRESHOLD_FILE = f"{OUTPUT_DIR}/threshold.txt"
-DATA_FILE      = f"{DATA_DIR}/ais-2025-01-25_preprocessed.csv"
+DATA_FILE      = f"{DATA_DIR}/ais-2024-01-01_preprocessed.csv"
 SEQ_BREAK_DT   = 600   # 이 시간(초) 이상 간격이면 새 세그먼트로 분리
 _KN_TO_DPS     = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
+_G_N_ANOM      = 500   # 시나리오당 이상 시퀀스 수 (--n_anom으로 덮어씌워짐)
 
 # ── --model 인자로 파일명 자동 설정 ──────────────────────────────
 # python eval_anomaly.py --model usad
@@ -85,40 +86,74 @@ _KN_TO_DPS     = 1852.0 / 111320.0 / 3600.0   # knot → deg/s
 # python eval_anomaly.py --model conv1d
 # python eval_anomaly.py              ← 기존 model.onnx 사용
 _KNOWN_MODELS = [
-    "usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm",
-    # 지도 학습 모델 (model_sup_*.onnx)
-    "sup_patchtst","sup_itrans","sup_tsmixer","sup_moderntcn","sup_mamba",
+    "usad", "tranad", "conv1d", "lstm", "tcn", "anomtrans", "dcdetect",
 ]
-_SUP_MODELS = [m for m in _KNOWN_MODELS if m.startswith("sup_")]
+_SUP_MODELS = []
 
 _pre = argparse.ArgumentParser(add_help=False)
-_pre.add_argument("--model", type=str, default=None)  # choices 검증 없이 받음
+_pre.add_argument("--model",      type=str, default=None)
+_pre.add_argument("--data",       type=str, default=None,
+                  help="전처리 CSV 경로 (기본: data/ais-2024-01-01_preprocessed.csv)")
+_pre.add_argument("--output_dir", type=str, default=None,
+                  help="모델/결과 저장 디렉터리 (기본: output)")
+_pre.add_argument("--seq_len",    type=int, default=None,
+                  help="시퀀스 길이 (기본: 모델명 자동 추론, 없으면 10)")
+_pre.add_argument("--seq_break_dt", type=int, default=None,
+                  help="시퀀스 분리 dt 임계값(초) (기본: 600)")
 _args_pre, _ = _pre.parse_known_args()
+
+# ── 전역 설정 덮어쓰기 (CLI 인자 우선) ──────────────────────────────
+if _args_pre.data:
+    DATA_FILE = _args_pre.data
+if _args_pre.output_dir:
+    OUTPUT_DIR = _args_pre.output_dir
+if _args_pre.seq_break_dt is not None:
+    SEQ_BREAK_DT = _args_pre.seq_break_dt
+
 if _args_pre.model and _args_pre.model in _KNOWN_MODELS:
     _mdir = os.path.join(OUTPUT_DIR, _args_pre.model)
     MODEL_FILE     = os.path.join(_mdir, f"model_{_args_pre.model}.onnx")
     THRESHOLD_FILE = os.path.join(_mdir, f"threshold_{_args_pre.model}.txt")
-    # 지도 학습 모델은 전용 스케일러(scaler_sup.json) 사용
+    # 지도 학습 모델: 모델 폴더 내 스케일러 우선, 없으면 output/ 루트 폴백
     if _args_pre.model in _SUP_MODELS:
-        SCALER_FILE = os.path.join(OUTPUT_DIR, "scaler_sup.json")
+        _scaler_in_dir = os.path.join(_mdir, f"scaler_{_args_pre.model}.json")
+        if os.path.exists(_scaler_in_dir):
+            SCALER_FILE = _scaler_in_dir
+        else:
+            SCALER_FILE = os.path.join(OUTPUT_DIR, "scaler_sup.json")
     else:
         SCALER_FILE = os.path.join(OUTPUT_DIR, f"scaler_{_args_pre.model}.json")
 
-IS_SUPERVISED = MODEL_FILE.startswith("model_sup_")
+IS_SUPERVISED = (_args_pre.model in _SUP_MODELS) if _args_pre.model else False
+
+# seq_len 자동 설정 (모델 이름에 _seq5/_seq10 포함 시, CLI 인자 우선)
+if _args_pre.seq_len is not None:
+    SEQ_LEN = _args_pre.seq_len
+elif _args_pre.model and "_seq5" in _args_pre.model:
+    SEQ_LEN = 5
+elif _args_pre.model and "_seq10" in _args_pre.model:
+    SEQ_LEN = 10
 
 
 # ── 스케일러 ──────────────────────────────────────────────────────
 def load_scaler(path):
     with open(path) as f:
         j = json.load(f)
-    return j["min"], j["max"]
+    # clip_lo/hi: ClippedMinMaxScaler 버전 이상치 클리핑 범위
+    # 구버전 JSON(clip_lo 없음)은 None 반환 → 클리핑 스킵
+    return j["min"], j["max"], j.get("clip_lo"), j.get("clip_hi")
 
-def scale_val(val, mn, mx):
+def scale_val(val, mn, mx, lo=None, hi=None):
+    if lo is not None:
+        val = max(lo, min(hi, val))
     d = mx - mn
     return (val - mn) / d if d != 0 else 0.0
 
-def scale_seq(seq, mins, maxs):
-    return [[scale_val(v, mins[i], maxs[i]) for i, v in enumerate(row)]
+def scale_seq(seq, mins, maxs, clip_lo=None, clip_hi=None):
+    return [[scale_val(v, mins[i], maxs[i],
+                       clip_lo[i] if clip_lo else None,
+                       clip_hi[i] if clip_hi else None)
+             for i, v in enumerate(row)]
             for row in seq]
 
 
@@ -147,7 +182,7 @@ def infer_score(session, seq_scaled):
 
 
 # ── 실제 정상 시퀀스 로더 ─────────────────────────────────────────
-def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
+def load_real_normal_seqs(mins, maxs, clip_lo=None, clip_hi=None, n_seqs=3000, max_rows=300000) -> list:
     import csv, os
     if not os.path.exists(DATA_FILE):
         return None
@@ -186,9 +221,9 @@ def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
 
     random.shuffle(all_seqs)
     sampled = all_seqs if n_seqs is None else all_seqs[:n_seqs]
-    scaled  = [scale_seq(seq, mins, maxs) for seq in sampled]
+    scaled  = [scale_seq(seq, mins, maxs, clip_lo, clip_hi) for seq in sampled]
     print(f"  실제 정상 시퀀스 로드: {len(scaled):,}개 (전체 풀: {len(all_seqs):,})")
-    return scaled
+    return scaled, sampled   # scaled(ML용), raw(룰 평가용)
 
 
 
@@ -631,11 +666,13 @@ def make_traj_stitch_seq():
     hdg_a = random.uniform(0, 360)
     hdg_b = (hdg_a + random.uniform(120, 240)) % 360
     sog = random.uniform(8, 15)
-    stitch_steps = random.randint(3, 5)
+    max_stitch = max(2, SEQ_LEN - 3)   # switch_at(≥2) + stitch + 최소 1스텝
+    stitch_steps = random.randint(2, max_stitch)
     lat = 37. + random.uniform(-0.05, 0.05)
     lon = 126. + random.uniform(-0.05, 0.05)
     cog = hdg_a
-    switch_at = random.randint(2, SEQ_LEN - stitch_steps - 1)
+    hi = max(2, SEQ_LEN - stitch_steps - 1)
+    switch_at = random.randint(1, hi)
     steps = []
     for i in range(SEQ_LEN):
         dt = random.uniform(10, 25)
@@ -766,6 +803,170 @@ def make_lstm_beat_seq():
     return _build_derived(steps)
 
 
+# ── G: 완전 신규 홀드아웃 시나리오 ────────────────────────────────
+
+def make_circular_loop_seq():
+    """G1-CircularLoop: 좁은 해역 반복 배회 (밀수/대기 패턴)"""
+    radius_deg = random.uniform(0.005, 0.02)   # ~0.5~2km 반경
+    center_lat = 37. + random.uniform(-0.1, 0.1)
+    center_lon = 126. + random.uniform(-0.1, 0.1)
+    start_ang  = random.uniform(0, 360)
+    sog        = random.uniform(3, 8)
+    # 원주를 SEQ_LEN 스텝으로 균등 분할
+    arc        = random.uniform(180, 360)       # 반원~한 바퀴
+    steps = []
+    prev_lat, prev_lon = center_lat, center_lon
+    for i in range(SEQ_LEN):
+        ang = math.radians(start_ang + arc * i / max(SEQ_LEN - 1, 1))
+        lat = center_lat + radius_deg * math.cos(ang)
+        lon = center_lon + radius_deg * math.sin(ang)
+        dt  = random.uniform(15, 40)
+        if i == 0:
+            dist = 0.0; cog = start_ang % 360
+        else:
+            dlat = lat - prev_lat; dlon = lon - prev_lon
+            dist = math.hypot(dlat, dlon) * 111.
+            cog  = math.degrees(math.atan2(dlon, dlat)) % 360
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+        prev_lat, prev_lon = lat, lon
+    return _build_derived(steps)
+
+
+def make_speed_burst_seq():
+    """G2-SpeedBurst: 정상 속도 중 급격한 속도 급증 후 즉시 복귀 (회피 기동)"""
+    base_sog  = random.uniform(5, 12)
+    burst_sog = random.uniform(35, 60)           # 물리적으로 불가능한 속도
+    burst_at  = random.randint(1, max(1, SEQ_LEN - 2))
+    cog = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    steps = []
+    for i in range(SEQ_LEN):
+        sog = burst_sog if i == burst_at else base_sog
+        dt  = random.uniform(10, 30)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-5, 5)) % 360
+    return _build_derived(steps)
+
+
+def make_phantom_hdg_seq():
+    """G3-PhantomHDG: 정지/저속인데 HDG가 계속 랜덤하게 바뀜 (유령 선박)"""
+    sog = random.uniform(0, 1.5)
+    lat, lon = 37. + random.uniform(-0.05, 0.05), 126. + random.uniform(-0.05, 0.05)
+    steps = []
+    for _ in range(SEQ_LEN):
+        hdg  = random.randint(0, 359)           # 랜덤 HDG
+        cog  = random.uniform(0, 360)
+        dt   = random.uniform(10, 30)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": hdg,
+                       "status": random.choice([0, 1, 5]),
+                       "dt": dt, "dist_km": dist, "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+
+def make_status_flicker_seq():
+    """G4-StatusFlicker: navStatus가 빠르게 무작위 변환 (상태 조작)"""
+    sog = random.uniform(5, 12)
+    cog = random.uniform(0, 360)
+    lat, lon = 37., 126.
+    status_pool = [0, 1, 2, 3, 5, 6, 7, 8]
+    steps = []
+    for _ in range(SEQ_LEN):
+        status = random.choice(status_pool)
+        dt     = random.uniform(10, 30)
+        dist   = sog * dt / 3600 * 1.852
+        lat   += math.cos(math.radians(cog)) * dist / 111.
+        lon   += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": status, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-3, 3)) % 360
+    return _build_derived(steps)
+
+
+def make_zigzag_accel_seq():
+    """G5-ZigzagAccel: 속도와 방향을 교대로 급변 (비정상 기동)"""
+    lat, lon = 37., 126.
+    sog = random.uniform(6, 10)
+    cog = random.uniform(0, 360)
+    steps = []
+    for i in range(SEQ_LEN):
+        # 짝수 스텝: 방향 +60~120도 전환 + 속도 증가
+        # 홀수 스텝: 방향 -60~120도 전환 + 속도 감소
+        if i % 2 == 0:
+            cog = (cog + random.uniform(60, 120)) % 360
+            sog = min(30, sog + random.uniform(5, 10))
+        else:
+            cog = (cog - random.uniform(60, 120)) % 360
+            sog = max(1, sog - random.uniform(5, 10))
+        dt   = random.uniform(10, 25)
+        dist = sog * dt / 3600 * 1.852
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+    return _build_derived(steps)
+
+
+def make_land_route_seq():
+    """G6-LandRoute: 해상이 아닌 육지 경유 직선 이동 (위치 조작)"""
+    # 실제 육지 좌표 (한국 내륙)로 이동하는 궤적 시뮬레이션
+    # 위도 변화량이 비정상적으로 커서 dist vs SOG 불일치
+    sog  = random.uniform(8, 14)
+    cog  = random.uniform(0, 360)
+    lat  = 37. + random.uniform(-0.05, 0.05)
+    lon  = 126. + random.uniform(-0.05, 0.05)
+    # 비정상: dist_km이 SOG×dt 대비 10~30배 과장
+    fake_scale = random.uniform(10, 30)
+    steps = []
+    for _ in range(SEQ_LEN):
+        dt      = random.uniform(10, 30)
+        real_d  = sog * dt / 3600 * 1.852
+        fake_d  = real_d * fake_scale       # 실제 이동보다 훨씬 큰 거리 보고
+        lat    += math.cos(math.radians(cog)) * fake_d / 111.
+        lon    += math.sin(math.radians(cog)) * fake_d / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": fake_d,
+                       "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-5, 5)) % 360
+    return _build_derived(steps)
+
+
+def make_mmsi_spoof_seq():
+    """G7-MMSISpoof: 정상처럼 보이나 SOG/dist 일관성이 미세하게 깨짐 (MMSI 복제 흔적)"""
+    # 두 선박의 신호가 합쳐진 것처럼 위치 연속성이 미세 불일치
+    sog  = random.uniform(8, 14)
+    cog  = random.uniform(0, 360)
+    lat  = 37. + random.uniform(-0.05, 0.05)
+    lon  = 126. + random.uniform(-0.05, 0.05)
+    steps = []
+    for i in range(SEQ_LEN):
+        dt   = random.uniform(10, 30)
+        dist = sog * dt / 3600 * 1.852
+        # 짝수 스텝마다 위치를 살짝 다른 선박 위치로 점프 (미세 불연속)
+        if i % 2 == 0 and i > 0:
+            lat += random.uniform(-0.003, 0.003)
+            lon += random.uniform(-0.003, 0.003)
+        lat += math.cos(math.radians(cog)) * dist / 111.
+        lon += math.sin(math.radians(cog)) * dist / 111.
+        steps.append({"sog": sog, "cog": cog, "hdg": int(cog),
+                       "status": 0, "dt": dt, "dist_km": dist,
+                       "lat": lat, "lon": lon})
+        cog = (cog + random.uniform(-2, 2)) % 360
+        sog = max(2, min(25, sog + random.gauss(0, 0.3)))
+    return _build_derived(steps)
+
+
 # ── SCENARIO_MAKERS ───────────────────────────────────────────────
 SCENARIO_MAKERS = [
     # (name, maker, is_anom, is_holdout)
@@ -799,9 +1000,136 @@ SCENARIO_MAKERS = [
     ("F5-MultiCoord",make_multi_coord_seq,       True,  True),
     ("F6-AISGap",    make_ais_gap_seq,           True,  True),
     ("F7-LSTMBeat",  make_lstm_beat_seq,         True,  True),
+    # G: 완전 신규 홀드아웃 — 학습에 전혀 없는 공격 유형
+    ("G1-CircularLoop", make_circular_loop_seq,  True,  True),
+    ("G2-SpeedBurst",   make_speed_burst_seq,    True,  True),
+    ("G3-PhantomHDG",   make_phantom_hdg_seq,    True,  True),
+    ("G4-StatusFlicker",make_status_flicker_seq, True,  True),
+    ("G5-ZigzagAccel",  make_zigzag_accel_seq,   True,  True),
+    ("G6-LandRoute",    make_land_route_seq,      True,  True),
+    ("G7-MMSISpoof",    make_mmsi_spoof_seq,      True,  True),
 ]
 
 
+
+
+# ══════════════════════════════════════════════════════════════════
+# 룰 기반 오탐율 분석
+# ══════════════════════════════════════════════════════════════════
+# FEATURES 인덱스
+_I_SOG      = FEATURES.index("sog")
+_I_STATUS   = FEATURES.index("status")
+_I_CHD      = FEATURES.index("cog_hdg_diff")
+_I_DT       = FEATURES.index("dt")
+_I_DIST     = FEATURES.index("dist_km")
+_I_SOG_CH   = FEATURES.index("sog_change")
+_I_SPEED_C  = FEATURES.index("speed_consistency")
+
+def _rule_anchor_move(step):
+    """정박/계류 중 이동: navStatus 1/5/6 AND SOG >= 1.5kn (GPS 노이즈 제외)"""
+    return int(round(step[_I_STATUS])) in (1, 5, 6) and step[_I_SOG] >= 1.5
+
+def _rule_cog_hdg(step):
+    """COG/HDG 불일치: diff > 90° + SOG >= 3.0kn (저속 표류/선회 제외)"""
+    chd = step[_I_CHD]
+    return chd >= 0 and chd > 90.0 and step[_I_SOG] >= 3.0
+
+def _rule_overspeed(step):
+    """물리적 속도 초과: SOG > 50kn"""
+    return step[_I_SOG] > 50.0
+
+def _rule_sog_spike(step):
+    """순간 속도 급변: SOG 변화 > 20kn AND dt < 60s (고속 측정 오류 제외)"""
+    return step[_I_SOG_CH] > 20.0 and step[_I_DT] < 60.0
+
+def _rule_speed_dist_mismatch(step):
+    """속도-거리 불일치: ratio > 20배 AND 실제 이동 > 0.1km (GPS 노이즈 수준 제외)"""
+    sc = step[_I_SPEED_C]
+    return sc > 20.0 and step[_I_DIST] > 0.1
+
+def _rule_signal_gap(step):
+    """비정상 신호 간격: dt > 1800초 (30분 이상 소실)"""
+    return step[_I_DT] > 1800.0
+
+def _rule_zero_sog_moving(step):
+    """SOG=0 보고인데 실제 이동: SOG < 0.3 AND dist > 0.1km AND dt < 60s"""
+    return step[_I_SOG] < 0.3 and step[_I_DIST] > 0.1 and step[_I_DT] < 60.0
+
+RULES = [
+    ("정박/계류 중 이동",        _rule_anchor_move),
+    ("COG/HDG 불일치(>90°)",     _rule_cog_hdg),
+    ("물리적 속도 초과(>50kn)",  _rule_overspeed),
+    ("순간 SOG 급변(>20kn/60s)", _rule_sog_spike),
+    ("속도-거리 불일치(×20)",    _rule_speed_dist_mismatch),
+    ("신호 간격 이상(>1800s)",   _rule_signal_gap),
+    ("SOG=0 실제이동(>0.1km)",   _rule_zero_sog_moving),
+]
+
+def _apply_rules(seqs):
+    """시퀀스 리스트에 룰 적용 → {rule_name: 탐지수}, 합산 탐지수 반환"""
+    counts = {name: 0 for name, _ in RULES}
+    any_count = 0
+    for seq in seqs:
+        fired = False
+        for name, rule_fn in RULES:
+            if any(rule_fn(step) for step in seq):
+                counts[name] += 1
+                fired = True
+        if fired:
+            any_count += 1
+    return counts, any_count
+
+def analysis_rule_fp(raw_seqs):
+    """룰 기반: 정상 시퀀스 오탐율 + 이상 시나리오 탐지율"""
+    if raw_seqs is None:
+        return
+    print("\n" + "="*60)
+    print("  [룰 기반 탐지율 / 오탐율 분석]")
+    print("="*60)
+
+    # ── 오탐율 (정상 시퀀스) ──────────────────────────────────────
+    n = len(raw_seqs)
+    fp_counts, fp_any = _apply_rules(raw_seqs)
+
+    # 합성 정상 시퀀스로도 비교
+    n_syn = min(n, 5000)
+    syn_seqs = [make_normal_seq() for _ in range(n_syn)]
+    syn_counts, syn_any = _apply_rules(syn_seqs)
+
+    print(f"\n  [오탐율 비교]")
+    print(f"  {'룰':<26} {'실제데이터':>10} {'합성데이터':>10}")
+    print(f"  {'─'*26} {'─'*10} {'─'*10}")
+    for name, _ in RULES:
+        print(f"  {name:<26} {fp_counts[name]/n*100:>9.2f}% {syn_counts[name]/n_syn*100:>9.2f}%")
+    print(f"  {'─'*26} {'─'*10} {'─'*10}")
+    print(f"  {'룰 합산 (OR)':<26} {fp_any/n*100:>9.2f}% {syn_any/n_syn*100:>9.2f}%")
+    print(f"  (실제: {n:,}개 / 합성: {n_syn:,}개)")
+
+    # ── 탐지율 (이상 시나리오) ────────────────────────────────────
+    N_ANOM = _G_N_ANOM
+    anom_scenarios = [(name, maker, is_holdout)
+                      for name, maker, is_anom, is_holdout in SCENARIO_MAKERS if is_anom]
+
+    print(f"\n  [탐지율] 시나리오당 {N_ANOM:,}개")
+    col_w = 10
+    header = f"  {'시나리오':<22}"
+    for name, _ in RULES:
+        header += rjust(name, col_w + len(name) - sum(2 if 0xAC00<=ord(c)<=0xD7A3 else 1 for c in name) + col_w)[:col_w+4]
+    header += f"  {'OR합산':>8}  {'구분':>6}"
+    print(f"\n  {'시나리오':<22}" +
+          "".join(f"  {n:>12}" for n, _ in RULES) +
+          f"  {'OR합산':>8}  {'구분':>6}")
+    print("  " + "─" * (22 + 14*len(RULES) + 18))
+
+    for scen_name, maker, is_holdout in anom_scenarios:
+        seqs = [maker() for _ in range(N_ANOM)]
+        counts, any_c = _apply_rules(seqs)
+        tag = "홀드아웃" if is_holdout else "학습"
+        row = f"  {scen_name:<22}"
+        row += "".join(f"  {counts[n]/N_ANOM*100:>11.1f}%" for n, _ in RULES)
+        row += f"  {any_c/N_ANOM*100:>7.1f}%  {tag:>6}"
+        print(row)
+    print()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -815,6 +1143,7 @@ def infer_weighted_score(sessions, weights, seq_scaled):
     return score, mses
 
 def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
+                                 clip_lo=None, clip_hi=None,
                                  target_fp=5.0, real_seqs=None):
     print("\n" + "="*60)
     print(f"  [가중 앙상블] {' + '.join(model_names)}")
@@ -822,14 +1151,14 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
     print(f"  목표 오탐율: {target_fp}%")
     print("="*60)
 
-    N_ANOM = 500  # 시나리오당 생성할 이상 시퀀스 수
+    N_ANOM = _G_N_ANOM  # 시나리오당 생성할 이상 시퀀스 수 (--n_anom)
 
     # 정상 시퀀스 스코어 수집
     if real_seqs is not None:
         normal_scores = [infer_weighted_score(sessions, weights, seq)[0]
                          for seq in tqdm(real_seqs, desc="정상 시퀀스", leave=False)]
     else:
-        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(3000)]
+        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi) for _ in range(3000)]
         normal_scores = [infer_weighted_score(sessions, weights, seq)[0]
                          for seq in tqdm(normal_seqs, desc="정상 시퀀스", leave=False)]
 
@@ -855,14 +1184,14 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
         if is_holdout != prev_holdout and prev_holdout is not None:
             print("  " + sep)
             print(f"  ── 홀드아웃 (학습 미포함) ──")
-        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        seqs = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(N_ANOM)]
         scores_and_mses = [infer_weighted_score(sessions, weights, seq) for seq in seqs]
         ens_rate = sum(1 for score, _ in scores_and_mses if score > thr) / N_ANOM * 100
 
         # 개별 단독 탐지율 (참고용 — 정상 스코어의 target_fp 퍼센타일 임계값 기준)
         indiv_normal_mses = [
             [infer_mse(sessions[i], seq) for seq in (real_seqs or
-             [scale_seq(make_normal_seq(), mins, maxs) for _ in range(500)])]
+             [scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi) for _ in range(500)])]
             for i in range(len(sessions))
         ]
         indiv_rates = []
@@ -886,7 +1215,7 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
     sc_names = [n for n, _ in anom_scenarios]
     anom_seqs = {}
     for sc_name, maker in tqdm(anom_scenarios, desc="시퀀스 생성", leave=False):
-        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs) for _ in range(200)]
+        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(200)]
 
     # 시나리오별 스코어 미리 계산
     anom_scores = {}
@@ -922,7 +1251,7 @@ def infer_mse_ensemble(sessions, thresholds, seq_scaled):
     detected = any(mse > thr for mse, thr in zip(mses, thresholds))
     return mses, detected
 
-def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, real_seqs=None):
+def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, clip_lo=None, clip_hi=None, real_seqs=None):
     print("\n" + "="*60)
     print(f"  [앙상블] {' + '.join(model_names)} OR 탐지율 테이블")
     print("="*60)
@@ -934,7 +1263,7 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
     if real_seqs is not None:
         normal_results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in tqdm(real_seqs, desc="정상 시퀀스", leave=False)]
     else:
-        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(3000)]
+        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi) for _ in range(3000)]
         normal_results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in tqdm(normal_seqs, desc="정상 시퀀스", leave=False)]
 
     fp_count  = sum(1 for _, det in normal_results if det)
@@ -960,7 +1289,7 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
         if is_holdout != prev_holdout and prev_holdout is not None:
             print("  " + sep)
             print(f"  ── 홀드아웃 (학습 미포함) ──")
-        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        seqs = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(N_ANOM)]
         results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in seqs]
         indiv_rates = []
         for i, thr in enumerate(thresholds):
@@ -989,7 +1318,7 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
     # 시나리오별 시퀀스 미리 생성 (반복 방지)
     anom_seqs = {}
     for sc_name, maker in tqdm(anom_scenarios, desc="시나리오 시퀀스 생성", leave=False):
-        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs) for _ in range(200)]
+        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(200)]
 
     # 헤더
     sc_names = [n for n, _ in anom_scenarios]
@@ -1019,7 +1348,7 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
 # ══════════════════════════════════════════════════════════════════
 # 분석 1: 탐지율/오탐율 테이블
 # ══════════════════════════════════════════════════════════════════
-def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
+def analysis_detection(session, mins, maxs, threshold, clip_lo=None, clip_hi=None, real_seqs=None, N=None):
     print("\n" + "="*60)
     print("  [분석 1] 탐지율 / 오탐율 테이블")
     print("="*60)
@@ -1036,7 +1365,7 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
                              for seq in tqdm(seqs, desc=f"  {name}", leave=False, unit="seq")])
         else:
             n = N_ANOM if N is None else N
-            errs = np.array([infer_score(session, scale_seq(maker(), mins, maxs))
+            errs = np.array([infer_score(session, scale_seq(maker(), mins, maxs, clip_lo, clip_hi))
                              for _ in tqdm(range(n), desc=f"  {name}", leave=False, unit="seq")])
         all_errors.append((name, errs))
 
@@ -1070,7 +1399,7 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
         print("  " + "임계값".rjust(12) + "오탐율".rjust(9) +
               "".join(rjust(n,16) for n,_ in anom_list))
         print("  " + "─"*(12+9+16*len(anom_list)))
-        for pct in [99,98,97,95,90]:
+        for pct in [99.9, 99.5, 99,98,97,95,90]:
             thr = np.percentile(ne, pct)
             fp  = np.sum(ne>thr)/N_ne*100
             row = rjust(f"{thr:.6f}",12) + rjust(f"{fp:.1f}%",9)
@@ -1155,7 +1484,7 @@ def analysis_correlation():
 # ══════════════════════════════════════════════════════════════════
 # 분석 3: 시나리오별 재구성 오차 분해 (피처별 MSE)
 # ══════════════════════════════════════════════════════════════════
-def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
+def analysis_reconstruction(session, mins, maxs, clip_lo=None, clip_hi=None, real_seqs=None, N=None):
     print("\n" + "="*60)
     print("  [분석 3] 시나리오별 재구성 오차 분해 (피처별 MSE)")
     print("="*60)
@@ -1177,7 +1506,7 @@ def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
         else:
             n = N_ANOM if N is None else N
             for _ in tqdm(range(n), desc=f"  {name}", leave=False, unit="seq"):
-                seq = scale_seq(maker(), mins, maxs)
+                seq = scale_seq(maker(), mins, maxs, clip_lo, clip_hi)
                 _, x, out = infer(session, seq)
                 feat_mse += ((out - x) ** 2).mean(axis=(0, 1))
             feat_mse /= n
@@ -1223,7 +1552,7 @@ def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
 # ══════════════════════════════════════════════════════════════════
 # 분석 4: Permutation Importance
 # ══════════════════════════════════════════════════════════════════
-def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
+def analysis_permutation(session, mins, maxs, clip_lo=None, clip_hi=None, real_seqs=None, N=3000, repeat=5):
     print("\n" + "="*60)
     print("  [분석 4] Permutation Importance")
     print("="*60)
@@ -1233,7 +1562,7 @@ def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
         print(f"  실제 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회")
     else:
         n = 5000 if N is None else N
-        seqs_scaled = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(n)]
+        seqs_scaled = [scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi) for _ in range(n)]
         print(f"  합성 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회 (CSV 없음)")
 
     N_ANOM = 500
@@ -1245,7 +1574,7 @@ def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
 
     anom_arrays = {}
     for name, maker in tqdm(anom_scenarios, desc="이상 시퀀스 생성", unit="시나리오"):
-        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        seqs = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(N_ANOM)]
         anom_arrays[name] = np.array(seqs, dtype=np.float32)
 
     def batch_score(x_arr, desc="추론"):
@@ -1356,13 +1685,35 @@ def main():
     parser.add_argument("--ensemble", type=str, nargs="+", default=None,
                         metavar="MODEL", choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"],
                         help="앙상블 모델 목록 (예: --ensemble conv1d tranad)")
-    parser.add_argument("--corr",   action="store_true")
-    parser.add_argument("--recon",  action="store_true")
-    parser.add_argument("--perm",   action="store_true")
+    parser.add_argument("--corr",   action="store_true", help="[분석 2] 피처 상관행렬")
+    parser.add_argument("--recon",  action="store_true", help="[분석 3] 재구성 오차 분해")
+    parser.add_argument("--perm",   action="store_true", help="[분석 4] Permutation Importance")
+    parser.add_argument("--all",    action="store_true", help="분석 1~4 전부 실행")
+    parser.add_argument("--rule",   action="store_true", help="룰 기반 오탐율 분석")
     parser.add_argument("--output", type=str, default=None,
-                        help="텍스트 결과 저장 파일명 (기본: eval_result_{model}.txt)")
+                        help="결과 저장 파일명 (기본: eval_result_{model}.csv)")
+    parser.add_argument("--n_normal", type=int, default=3000,
+                        help="오탐율 계산에 사용할 정상 시퀀스 수 (기본: 3000, 0=전체)")
+    parser.add_argument("--n_anom", type=int, default=500,
+                        help="시나리오당 생성할 이상 시퀀스 수 (기본: 500)")
+    # pre-parser 와 동일 인자 재선언 (argparse 호환)
+    parser.add_argument("--data",       type=str, default=None,
+                        help="전처리 CSV 경로 (기본: data/ais-2024-01-01_preprocessed.csv)")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="모델/결과 저장 디렉터리 (기본: output)")
+    parser.add_argument("--seq_len",    type=int, default=None,
+                        help="시퀀스 길이")
+    parser.add_argument("--seq_break_dt", type=int, default=None,
+                        help="시퀀스 분리 dt 임계값(초)")
     args = parser.parse_args()
-    run_all = not any([args.corr, args.recon, args.perm])
+    # --all 이면 전부, 아무것도 없으면 탐지율만(분석1), 개별 플래그 우선
+    if args.all:
+        args.corr = args.recon = args.perm = True
+    run_all = args.all
+
+    # 전역으로 노출 (함수 내부 N_ANOM 하드코딩 대체용)
+    global _G_N_ANOM
+    _G_N_ANOM = args.n_anom
 
     # output 기본값: 모델명 포함
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1371,13 +1722,15 @@ def main():
     if args.output is None:
         if args.weighted:
             args.output = os.path.join(OUTPUT_DIR, "ensemble",
-                                       f"eval_result_{'_'.join(args.weighted)}_weighted.txt")
+                                       f"eval_result_{'_'.join(args.weighted)}_weighted.csv")
         elif args.ensemble:
             args.output = os.path.join(OUTPUT_DIR, "ensemble",
-                                       f"eval_result_{'_'.join(args.ensemble)}_ensemble.txt")
+                                       f"eval_result_{'_'.join(args.ensemble)}_ensemble.csv")
+        elif args.rule and not args.model:
+            args.output = os.path.join(OUTPUT_DIR, "eval_result_rule.csv")
         else:
             _m = args.model or "lstm"
-            args.output = os.path.join(OUTPUT_DIR, _m, f"eval_result_{_m}.txt")
+            args.output = os.path.join(OUTPUT_DIR, _m, f"eval_result_{_m}.csv")
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     # ── 앙상블 모드 ──────────────────────────────────────────────
@@ -1386,16 +1739,18 @@ def main():
     IS_WEIGHTED = bool(args.weighted)
     IS_ENSEMBLE = bool(args.ensemble) and not IS_WEIGHTED
 
+    # --rule 단독 모드: 모델 없이 룰만 실행
+    RULE_ONLY = args.rule and not args.model and not args.weighted and not args.ensemble
+
     if IS_WEIGHTED:
         model_names = args.weighted
         w_sessions, w_scalers = [], []
         for name in model_names:
             w_sessions.append(ort.InferenceSession(os.path.join(OUTPUT_DIR, name, f"model_{name}.onnx"), providers=["CPUExecutionProvider"]))
             w_scalers.append(load_scaler(os.path.join(OUTPUT_DIR, f"scaler_{name}.json")))
-        mins, maxs = w_scalers[0]
+        mins, maxs, clip_lo, clip_hi = w_scalers[0]
         n_models = len(model_names)
         weights = args.weights if args.weights and len(args.weights)==n_models                   else [1.0/n_models]*n_models
-        # 정규화
         wsum = sum(weights)
         weights = [w/wsum for w in weights]
     elif IS_ENSEMBLE:
@@ -1406,9 +1761,11 @@ def main():
             with open(os.path.join(OUTPUT_DIR, name, f"threshold_{name}.txt")) as f:
                 thresholds.append(float(f.read()))
             scalers.append(load_scaler(os.path.join(OUTPUT_DIR, f"scaler_{name}.json")))
-        mins, maxs = scalers[0]
+        mins, maxs, clip_lo, clip_hi = scalers[0]
+    elif RULE_ONLY:
+        mins, maxs, clip_lo, clip_hi = [0.0]*len(FEATURES), [1.0]*len(FEATURES), None, None
     else:
-        mins, maxs = load_scaler(SCALER_FILE)
+        mins, maxs, clip_lo, clip_hi = load_scaler(SCALER_FILE)
         with open(THRESHOLD_FILE) as f:
             threshold = float(f.readline())
         session = ort.InferenceSession(MODEL_FILE, providers=["CPUExecutionProvider"])
@@ -1423,32 +1780,66 @@ def main():
         def flush(self):
             for s in self.streams: s.flush()
 
-    out_file = open(args.output, "w", encoding="utf-8")
+    # ── 로그 파일 (txt) + CSV 경로 설정 ──────────────────────────────
+    csv_path = args.output  # 기본값이 이미 .csv
+    log_path = csv_path.replace(".csv", ".log") if csv_path.endswith(".csv") else csv_path + ".log"
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+
+    out_file = open(log_path, "w", encoding="utf-8")
     sys.stdout = Tee(sys.__stdout__, out_file)
+
+    _csv_rows = []   # CSV 에 저장할 구조화 결과
 
     try:
         if not HAS_MPL:
             print("  ⚠ matplotlib 없음 - 그래프 저장 건너뜀 (pip install matplotlib)")
 
         print("\n실제 정상 시퀀스 로드 중...")
-        real_seqs = load_real_normal_seqs(mins, maxs, n_seqs=3000)
-        if real_seqs is None:
+        _n_normal = None if args.n_normal == 0 else args.n_normal
+        result = load_real_normal_seqs(mins, maxs, clip_lo, clip_hi, n_seqs=_n_normal)
+        if result is None:
             print(f"  ⚠ {DATA_FILE} 없음 - 합성 정상 시퀀스 사용")
+            real_seqs, raw_seqs = None, None
+        else:
+            real_seqs, raw_seqs = result
 
         if IS_WEIGHTED:
             analysis_detection_weighted(w_sessions, model_names, weights, mins, maxs,
+                                        clip_lo, clip_hi,
                                         target_fp=args.target_fp, real_seqs=real_seqs)
         elif IS_ENSEMBLE:
-            analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, real_seqs=real_seqs)
-        elif run_all:
-            analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
-            analysis_correlation()
-            analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-            analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+            analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, clip_lo, clip_hi, real_seqs=real_seqs)
+        elif RULE_ONLY:
+            analysis_rule_fp(raw_seqs)
         else:
+            # 탐지율(분석1)은 항상 실행
+            all_errors = analysis_detection(session, mins, maxs, threshold, clip_lo, clip_hi, real_seqs=real_seqs)
+            # ── CSV 구조화 ─────────────────────────────────────────
+            if all_errors:
+                ne_errs = all_errors[0][1]
+                fp_rate = float(np.sum(ne_errs > threshold) / len(ne_errs) * 100)
+                _csv_rows.append({
+                    "scenario": all_errors[0][0], "is_anomaly": False,
+                    "n_seqs": len(ne_errs),
+                    "avg_score": float(ne_errs.mean()),
+                    "p95_score": float(np.percentile(ne_errs, 95)),
+                    "detection_rate": round(fp_rate, 2),   # 정상=오탐율
+                    "threshold": round(threshold, 6),
+                })
+                for scen_name, errs in all_errors[1:]:
+                    det = float(np.sum(errs > threshold) / len(errs) * 100)
+                    _csv_rows.append({
+                        "scenario": scen_name, "is_anomaly": True,
+                        "n_seqs": len(errs),
+                        "avg_score": float(errs.mean()),
+                        "p95_score": float(np.percentile(errs, 95)),
+                        "detection_rate": round(det, 2),
+                        "threshold": round(threshold, 6),
+                    })
+            if args.rule:  analysis_rule_fp(raw_seqs)
             if args.corr:  analysis_correlation()
-            if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-            if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+            if args.recon: analysis_reconstruction(session, mins, maxs, clip_lo, clip_hi, real_seqs=real_seqs)
+            if args.perm:  analysis_permutation(session, mins, maxs, clip_lo, clip_hi, real_seqs=real_seqs)
 
         print("\n완료!")
         if HAS_MPL:
@@ -1457,7 +1848,16 @@ def main():
                                   "permutation_importance.png"] if os.path.exists(f)]
             if saved:
                 print("저장된 그래프:", ", ".join(saved))
-        print(f"\n→ 텍스트 결과 저장: {args.output}")
+        print(f"\n→ 로그 저장: {log_path}")
+
+        # ── CSV 저장 ──────────────────────────────────────────────
+        if _csv_rows:
+            import csv as _csv_mod
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as _cf:
+                _w = _csv_mod.DictWriter(_cf, fieldnames=list(_csv_rows[0].keys()))
+                _w.writeheader()
+                _w.writerows(_csv_rows)
+            print(f"→ CSV 저장:  {csv_path}")
 
     finally:
         sys.stdout = sys.__stdout__

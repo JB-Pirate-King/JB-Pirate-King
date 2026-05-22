@@ -1,0 +1,14 @@
+{
+  "timestamp": "2026-05-15T11:34:53.472549",
+  "results": {
+    "preprocess": {
+      "status": "실패",
+      "timestamp": "2026-05-15T11:34:53.472503",
+      "elapsed_seconds": 0.059754
+    }
+  },
+  "summary": {
+    "total": 1,
+    "passed": 0
+  }
+}

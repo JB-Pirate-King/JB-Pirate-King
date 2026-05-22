@@ -87,6 +87,7 @@ OpenCPN 플러그인과 호환된다.
 """
 
 import argparse
+import os
 import shutil
 import csv
 import json
@@ -126,6 +127,7 @@ SEQ_BREAK_DT         = 600
 SAMPLE_MMSI          = 10000
 VAL_RATIO            = 0.1
 THRESHOLD_PERCENTILE = 95
+MAX_SEQ_PER_MMSI     = 500   # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -133,23 +135,45 @@ THRESHOLD_PERCENTILE = 95
 # ══════════════════════════════════════════════════════════════════
 
 class MinMaxScaler:
+    """1~99 퍼센타일 클리핑 후 MinMaxScaling (이상치 편향 방지).
+
+    - clip_lo / clip_hi: 학습 데이터 1·99 퍼센타일
+    - min_ / max_: 클리핑 후 실제 min/max (스케일 기준)
+    - JSON 저장 시 clip_lo, clip_hi 포함 → eval_anomaly도 동일 처리
+    """
     def __init__(self):
-        self.min_ = None
-        self.max_ = None
+        self.min_    = None
+        self.max_    = None
+        self.clip_lo = None   # 1 퍼센타일
+        self.clip_hi = None   # 99 퍼센타일
 
     def fit(self, data: list):
-        n = len(data[0])
-        self.min_ = [min(row[i] for row in data) for i in range(n)]
-        self.max_ = [max(row[i] for row in data) for i in range(n)]
+        import numpy as _np
+        arr = _np.array(data, dtype=float)
+        lo = _np.percentile(arr, 1,  axis=0)
+        hi = _np.percentile(arr, 99, axis=0)
+        # 희소 피처(정상 99%가 동일값) 보호: 클리핑 구간 붕괴 열은
+        # 실제 min/max로 대체해 클리핑 비활성화 → 희소 이상신호 보존
+        degenerate = (hi - lo) <= 1e-9
+        if _np.any(degenerate):
+            lo = _np.where(degenerate, arr.min(axis=0), lo)
+            hi = _np.where(degenerate, arr.max(axis=0), hi)
+        self.clip_lo = lo.tolist()
+        self.clip_hi = hi.tolist()
+        arr_c = _np.clip(arr, self.clip_lo, self.clip_hi)
+        self.min_ = arr_c.min(axis=0).tolist()
+        self.max_ = arr_c.max(axis=0).tolist()
 
     def transform(self, data: list) -> list:
         result = []
         for row in data:
             scaled = []
             for i, val in enumerate(row):
+                # 클리핑 후 MinMax
+                v     = max(self.clip_lo[i], min(self.clip_hi[i], val))
                 denom = self.max_[i] - self.min_[i]
-                s = (val - self.min_[i]) / denom if denom != 0 else 0.0
-                scaled.append(max(0.0, min(1.0, s)))
+                s     = (v - self.min_[i]) / denom if denom != 0 else 0.0
+                scaled.append(s)   # [0,1] 범위 (이상치는 초과 가능)
             result.append(scaled)
         return result
 
@@ -158,10 +182,19 @@ class MinMaxScaler:
         return self.transform(data)
 
 
-def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
-    """CSV 로드 → 시퀀스 생성 → 스케일러 fit → Tensor 반환"""
+def load_and_prepare(input_file: str, scaler_path: str = "scaler.json",
+                     max_mmsi: int = None):
+    """CSV 로드 → 시퀀스 생성 → 스케일러 fit → Tensor 반환
+
+    편향 제거:
+    - 연·월별 균등 MMSI 샘플링 (base_date_time 컬럼, YYYY-MM 버킷)
+      3년 통합 시 2025 전체가 2023·2024 하반기를 압도하지 않도록 연도까지 층화
+    - MMSI당 시퀀스 상한 MAX_SEQ_PER_MMSI
+    - ClippedMinMaxScaler (1~99 퍼센타일)
+    """
     print(f"[데이터] {input_file} 로드 중...")
-    mmsi_data = defaultdict(list)
+    mmsi_data       = defaultdict(list)
+    mmsi_period_cnt = defaultdict(lambda: defaultdict(int))  # mmsi → {"YYYY-MM": cnt}
 
     with open(input_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -174,16 +207,51 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
                 mmsi_data[mmsi].append(record)
             except (ValueError, KeyError):
                 continue
+            dt_str = row.get("base_date_time", "")
+            if len(dt_str) >= 7 and dt_str[4] == "-":
+                mmsi_period_cnt[mmsi][dt_str[0:7]] += 1   # "YYYY-MM"
 
-    print(f"  고유 MMSI: {len(mmsi_data):,}")
-    if SAMPLE_MMSI and len(mmsi_data) > SAMPLE_MMSI:
-        keys = random.sample(list(mmsi_data.keys()), SAMPLE_MMSI)
-        mmsi_data = {k: mmsi_data[k] for k in keys}
-        print(f"  샘플링 후 MMSI: {len(mmsi_data):,}")
+    all_mmsis = list(mmsi_data.keys())
+    print(f"  고유 MMSI: {len(all_mmsis):,}")
 
+    # ── 연·월별 균등 MMSI 샘플링 ──────────────────────────────────
+    limit = max_mmsi or SAMPLE_MMSI
+    if limit and len(all_mmsis) > limit:
+        mmsi_main_period = {
+            m: max(cnt, key=cnt.get) if cnt else ""
+            for m, cnt in mmsi_period_cnt.items()
+        }
+        period_buckets = defaultdict(list)
+        for mmsi in all_mmsis:
+            period_buckets[mmsi_main_period.get(mmsi, "")].append(mmsi)
+
+        active_periods = sorted(p for p in period_buckets if p)
+        if active_periods:
+            per_period = max(1, limit // len(active_periods))
+            selected  = []
+            for p in active_periods:
+                pool = period_buckets[p]
+                selected.extend(random.sample(pool, min(per_period, len(pool))))
+            if len(selected) < limit:
+                leftover = [m for m in all_mmsis if m not in set(selected)]
+                selected.extend(random.sample(leftover, min(limit - len(selected), len(leftover))))
+            selected = selected[:limit]
+            dist = defaultdict(int)
+            for m in selected:
+                dist[mmsi_main_period.get(m, "")] += 1
+            dist_str = "  ".join(f"{p}:{c}" for p, c in sorted(dist.items()) if p)
+            print(f"  연·월별 균등 샘플: {len(selected):,}개 MMSI  "
+                  f"({len(active_periods)}개 기간)  [{dist_str}]")
+        else:
+            selected = random.sample(all_mmsis, limit)
+            print(f"  랜덤 샘플: {len(selected):,}개 MMSI")
+        mmsi_data = {k: mmsi_data[k] for k in selected}
+
+    # ── 시퀀스 생성 + MMSI당 상한 ────────────────────────────────
     dt_idx      = FEATURES.index("dt")
     dist_km_idx = FEATURES.index("dist_km")
     sequences   = []
+    capped      = 0
 
     for records in mmsi_data.values():
         segments, current = [], [records[0]]
@@ -196,12 +264,21 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
             else:
                 current.append(rec)
         segments.append(current)
+
+        mmsi_seqs = []
         for seg in segments:
             if len(seg) < SEQ_LEN:
                 continue
             for i in range(len(seg) - SEQ_LEN + 1):
-                sequences.append(seg[i: i + SEQ_LEN])
+                mmsi_seqs.append(seg[i: i + SEQ_LEN])
 
+        if len(mmsi_seqs) > MAX_SEQ_PER_MMSI:
+            mmsi_seqs = random.sample(mmsi_seqs, MAX_SEQ_PER_MMSI)
+            capped += 1
+        sequences.extend(mmsi_seqs)
+
+    if capped:
+        print(f"  MMSI당 상한({MAX_SEQ_PER_MMSI}) 적용: {capped:,}개 MMSI 절감")
     print(f"  총 시퀀스: {len(sequences):,}")
 
     flat   = [row for seq in sequences for row in seq]
@@ -210,7 +287,13 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
     scaled = [scaler.transform(seq) for seq in sequences]
 
     with open(scaler_path, "w") as f:
-        json.dump({"features": FEATURES, "min": scaler.min_, "max": scaler.max_}, f, indent=2)
+        json.dump({
+            "features": FEATURES,
+            "min":      scaler.min_,
+            "max":      scaler.max_,
+            "clip_lo":  scaler.clip_lo,   # 1 퍼센타일 (eval 시 클리핑용)
+            "clip_hi":  scaler.clip_hi,   # 99 퍼센타일
+        }, f, indent=2)
     print(f"  스케일러 저장: {scaler_path}")
 
     tensor = torch.tensor(scaled, dtype=torch.float32)
@@ -1149,25 +1232,32 @@ def run_model(model_name: str, tensor: torch.Tensor,
 def main():
     parser = argparse.ArgumentParser(description="AIS 벤치마크 학습 (eval_anomaly.py 호환)")
     parser.add_argument("--model",      type=str, default="usad",
-                        choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm","all"],
-                        help="학습할 모델 (all: 전체 9개 모델 순차 학습)")
+                        choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","all"],
+                        help="학습할 모델 (all: 전체 7개 모델 순차 학습)")
     parser.add_argument("--input",      type=str, default=INPUT_FILE)
     parser.add_argument("--epochs",     type=int, default=None)
     parser.add_argument("--lr",         type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--patience",   type=int, default=None)
+    parser.add_argument("--output_dir", type=str, default=".",
+                        help="모델 파일 저장 디렉터리 (기본: 현재 폴더)")
+    parser.add_argument("--max_mmsi",  type=int, default=None,
+                        help=f"학습에 사용할 최대 MMSI 수 (기본: {SAMPLE_MMSI})")
     args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[디바이스] {device}")
     print(f"[피처 수]  {N_FEAT}  |  시퀀스 길이: {SEQ_LEN}")
 
     t0 = time.time()
-    models_to_run = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"] if args.model == "all" else [args.model]
+    models_to_run = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect"] if args.model == "all" else [args.model]
 
     # 데이터는 한 번만 로드 (스케일러는 모델별로 저장)
-    first_scaler = f"scaler_{models_to_run[0]}.json"
-    tensor = load_and_prepare(args.input, scaler_path=first_scaler)
+    first_scaler = os.path.join(args.output_dir, f"scaler_{models_to_run[0]}.json")
+    tensor = load_and_prepare(args.input, scaler_path=first_scaler,
+                              max_mmsi=args.max_mmsi)
 
     for name in models_to_run:
         d = DEFAULTS[name]
@@ -1176,9 +1266,9 @@ def main():
         batch_size = args.batch_size or d["batch_size"]
         patience   = args.patience   or d["patience"]
 
-        onnx_path      = f"model_{name}.onnx"
-        scaler_path    = f"scaler_{name}.json"
-        threshold_path = f"threshold_{name}.txt"
+        onnx_path      = os.path.join(args.output_dir, f"model_{name}.onnx")
+        scaler_path    = os.path.join(args.output_dir, f"scaler_{name}.json")
+        threshold_path = os.path.join(args.output_dir, f"threshold_{name}.txt")
 
         # 첫 모델 외에는 scaler 재저장 (동일 데이터이므로 값은 같음)
         if name != models_to_run[0]:
@@ -1189,7 +1279,7 @@ def main():
                   onnx_path, scaler_path, threshold_path, full_tensor=tensor)
 
     print(f"\n완료! 전체 소요: {time.time() - t0:.1f}s")
-    print("\n생성된 파일:")
+    print(f"\n생성된 파일: ({args.output_dir})")
     for name in models_to_run:
         print(f"  model_{name}.onnx  |  scaler_{name}.json  |  threshold_{name}.txt")
 
