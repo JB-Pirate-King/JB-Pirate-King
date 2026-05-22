@@ -40,9 +40,9 @@ OUT_CSV        = r"D:\ais_data\preprocessed\ais_preprocessed_3yr.csv"
 
 # feature_engineer 파라미터
 BASE_DIR       = r"D:\\"
-MAX_MMSI       = 5000
-EPOCHS         = 10
-N_ANOM         = 300
+MAX_MMSI       = 3000
+EPOCHS         = 5
+N_ANOM         = 150
 WEAK_FLOOR     = 55.0
 WEAK_WEIGHT    = 1.5
 MIN_GAIN       = 3.0
@@ -229,6 +229,8 @@ def feat_eng_loop(args):
                 newly_adopted=newly_adopted,
                 history=result.get("history", []),
                 permutation_importance=result.get("permutation_importance", []),
+                feature_descriptions=result.get("feature_descriptions", {}),
+                json_path=out_json,
             )
         except Exception as e:
             print(f"  [Notion 건너뜀] {e}")
