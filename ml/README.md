@@ -12,7 +12,10 @@ ml/
 ├── preprocess.py         # AIS CSV 전처리
 ├── train_benchmark.py    # 비지도 모델 학습 (9종)
 ├── eval_anomaly.py       # 탐지율/오탐율 평가
-└── feature_engineer.py   # DCdetect 피처 엔지니어링 자동화 (Greedy Forward Selection)
+├── feature_engineer.py   # DCdetect 피처 엔지니어링 (Greedy Forward Selection + ONNX export)
+├── auto_feat_eng.py      # 피처 엔지니어링 자동 반복 루프 (데이터셋 빌드 → FE 반복)
+├── build_3yr_dataset.py  # 2023–2025 균형 통합 데이터셋 빌더
+└── notify.py             # Discord 웹훅 + Notion 보고 (notify_config.json, gitignore)
 ```
 
 ---
@@ -109,37 +112,53 @@ python pipeline.py --train --eval --models conv1d --base_dir E:\
 
 ---
 
-## 피처 엔지니어링 자동화 (`feature_engineer.py`)
+## 피처 엔지니어링 (`feature_engineer.py` + `auto_feat_eng.py`)
 
-DCdetect 모델을 기준으로 파생 피처를 하나씩 추가하며 탐지율이 향상될 때만 채택하는
-Greedy Forward Selection을 수행한다. FP 1% 임계값 기준으로 평가.
+DCdetect를 기준으로 파생 피처를 하나씩 추가하며 탐지율이 향상될 때만 채택하는
+**Greedy Forward Selection** + 채택셋 **Permutation Importance**를 수행한다 (FP 1% 임계 기준).
+선택이 끝나면 최적 피처셋으로 학습한 모델을 **배포용 ONNX/scaler/threshold로 export**한다.
 
 ```bash
+# 단일 패스
 python feature_engineer.py \
-  --input  <base_dir>/ais_data/preprocessed/2025/ais_preprocessed_2025.csv \
-  --base_dir <base_dir> \
-  --max_mmsi 500 --epochs 5 --n_anom 200
+  --input  D:\ais_data\preprocessed\ais_preprocessed_3yr.csv \
+  --base_dir D:\ --max_mmsi 3000 --epochs 5 --n_anom 150 \
+  --max_feat 18 --export_dir D:\ais_models\dcdetect
+
+# 자동 반복 루프 (데이터셋 이미 빌드된 경우). 실시간 로그는 PYTHONUNBUFFERED=1
+python auto_feat_eng.py --no_wait --skip_build
 ```
+
+`feature_engineer.py` 주요 옵션:
 
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
 | `--input` | (필수) | 전처리 CSV 경로 |
-| `--base_dir` | `C:\Users\imcas` | 결과 저장 루트 |
+| `--base_dir` | `C:\Users\imcas` | 결과(`ais_output/feat_eng`) 저장 루트 |
 | `--max_mmsi` | 500 | 학습에 사용할 MMSI 수 |
 | `--epochs` | 5 | 에폭 수 |
 | `--n_anom` | 200 | 시나리오당 이상 시퀀스 수 |
+| `--min_gain` | 3.0 | 피처 채택 최소 향상폭(pp) |
+| `--weak_floor` / `--weak_weight` | 50.0 / 1.0 | 약세 시나리오를 목적함수에서 가중 |
+| `--max_feat` | 없음 | 총 피처 수 상한 (16이면 nhead=8 유지) |
+| `--initial_extra` | 코드값 | Greedy 시작 추가 피처셋 |
+| `--export_dir` | 없음 | 최적 모델을 `model_dcdetect.onnx`/`scaler_dcdetect.json`/`threshold_dcdetect.txt`로 저장 |
+| `--out_json` | 자동 | 결과 JSON 경로 |
 
-후보 파생 피처 7종:
+- 후보 파생 피처는 코드의 `CANDIDATE_FEATURES`에 ~19종 정의됨 (cog_change, turn_rate, heading_rate, accel, vec_sog_diff, heading_change, lowspeed_crab, hdg_perp_score 등).
+- **검증 결과**: 16피처 = 12 base + `accel, heading_rate, vec_sog_diff, heading_change` 가 최적(~88.8%). 그 이상은 향상 없음.
+- **scaler의 `features` 배열이 피처 순서의 기준** — 플러그인 C++ `ML_FEATURE_COUNT`/`PushFeature`가 이 순서와 일치해야 함.
 
-| 피처 | 설명 |
-|---|---|
-| `cog_change` | COG 변화량 (도) |
-| `heading_change` | Heading 변화량 (도) |
-| `turn_rate` | COG 변화율 (도/초) |
-| `heading_rate` | Heading 변화율 (도/초) |
-| `accel` | 속도 변화율 (노트/초) |
-| `dist_speed_err` | 거리/속도 불일치 (km) |
-| `status_change` | 상태코드 변화 (0/1) |
+### 시퀀스 캐시
+`load_raw_seqs`는 첫 로드 시 시퀀스를 `<input>.s<max_mmsi>_seed<SEED>_…seqs.pkl`로 캐시한다.
+이후 iteration/실행은 대용량 CSV(예: 3년치 ~10.9GB)를 재파싱하지 않고 캐시를 재사용한다 (SEED 고정 → 결정적).
+
+### 3년 균형 데이터셋 (`build_3yr_dataset.py`)
+- 출력: `D:\ais_data\preprocessed\ais_preprocessed_3yr.csv`
+- 단일 일자/계절 편향(confirmation bias) 방지를 위해 2023–2025 전 기간에서 월별로 고르게 추출.
+- MMSI 샘플링: 각 MMSI를 주요 `YYYY-MM`로 버킷팅 → `max_mmsi`를 활성 월에 균등 배분 (버킷 내 무작위, SEED 고정).
+
+`auto_feat_eng.py`는 다운로드 감지 → 데이터셋 빌드 → FE를 `--max_iter`회 반복(이전 best를 다음 `--initial_extra`로 연결, 신규 채택 없으면 종료)하며 매 iteration Discord·Notion 보고를 보낸다.
 
 출력: `<base_dir>/ais_output/feat_eng/feat_eng_TIMESTAMP.txt/.json`
 
