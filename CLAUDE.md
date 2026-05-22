@@ -227,21 +227,21 @@ A model retrained on new data (same architecture) = **patch**. New architecture 
 
 Every release MUST attach the following.
 
-**1. Plugin package (필수) — `local-build-package.sh` 산출물**
-- `ais_ids_pi-{version}-ubuntu-x86_64-{ubuntu_ver}-noble.tar.gz` — 빌드된 플러그인 (model/scaler/threshold가 `data/`에 포함됨 + ONNX Runtime .so). 사용자가 압축만 풀면 바로 동작.
-- native Linux에서 빌드 (Windows ❌). 빌드 전 `git submodule update --init --recursive` 필요. 자세히는 "Plugin Build & Deploy" 섹션.
+**1. Plugin package (REQUIRED) — output of `local-build-package.sh`**
+- `ais_ids_pi-{version}-ubuntu-x86_64-{ubuntu_ver}-noble.tar.gz` — built plugin (model/scaler/threshold bundled under `data/` + ONNX Runtime `.so`). Users just extract it and it works.
+- Built on native Linux (NOT Windows). Run `git submodule update --init --recursive` before building. See the "Plugin Build & Deploy" section.
 
-**2. Model files (필수) — 개별 다운로드용**
+**2. Model files (REQUIRED) — for individual download**
 - `model_{name}.onnx` — trained ONNX model (one per model)
-- `scaler_{name}.json` — Min-Max scaler (`features` 배열로 피처 순서·수 확인 가능)
+- `scaler_{name}.json` — Min-Max scaler (the `features` array shows feature order/count)
 - `threshold_{name}.txt` — anomaly threshold
 
-**3. Performance reports (선택)**
+**3. Performance reports (optional)**
 - `comparison_TIMESTAMP.txt` — human-readable performance table
 - `comparison_TIMESTAMP.csv` — combined model comparison CSV
 - `{model}_TIMESTAMP.csv` — per-model individual CSV (one per model)
 
-> 모델 파일 수치(탐지율)는 실제 그 모델의 평가값을 적을 것 — 다른 피처셋의 수치를 잘못 인용하지 말 것.
+> For the detection-rate numbers, use the actual evaluation values of THAT model — do not misquote numbers from a different feature set.
 
 ### How to Create a Release
 
@@ -255,7 +255,7 @@ git tag v1.0.0
 git push origin main --tags
 
 # 3. Create release and attach files
-#    (1) 플러그인 tar.gz  (2) 모델 파일  (3) 성능 리포트(선택)
+#    (1) plugin tar.gz  (2) model files  (3) performance reports (optional)
 gh release create v1.0.0 \
   ais_ids_pi/ais_ids_pi-1.0.358.1-ubuntu-x86_64-24.04-noble.tar.gz \
   D:\ais_models\dcdetect\model_dcdetect.onnx \
@@ -273,9 +273,9 @@ gh release create v1.0.0 \
 - Coverage: 2025-09-14 (1 day, expand later)
 
 ## Performance (FP ≈ 1%)
-- conv1d:   학습 68.3% / 홀드아웃 70.8%
-- tranad:   학습 35.4% / 홀드아웃 61.0%
-- dcdetect: 학습 47.4% / 홀드아웃 65.6%
+- conv1d:   train 68.3% / holdout 70.8%
+- tranad:   train 35.4% / holdout 61.0%
+- dcdetect: train 47.4% / holdout 65.6%
 
 ## Plugin Deploy
 Copy model.onnx / scaler.json / threshold.txt to ais_ids_pi/data/
@@ -296,14 +296,14 @@ gh release download v1.0.0 --dir D:\ais_models
 - <data file path and date coverage>
 
 ## Performance (FP ≈ 1%)
-- <model>: 학습 X% / 홀드아웃 Y%
+- <model>: train X% / holdout Y%
 
 ## Changes from previous version
 - <what changed>
 
 ## Plugin Deploy
-- 권장: `ais_ids_pi-*.tar.gz`를 OpenCPN 플러그인 경로에 압축 해제 (모델 포함, 바로 동작)
-- 수동: model_{name}.onnx/scaler/threshold를 ais_ids_pi/data/ 의 model.onnx/scaler.json/threshold.txt로 복사
+- Recommended: extract `ais_ids_pi-*.tar.gz` into the OpenCPN plugin path (model bundled, works immediately)
+- Manual: copy model_{name}.onnx/scaler/threshold to ais_ids_pi/data/ as model.onnx/scaler.json/threshold.txt
 ```
 
 ### Version History
