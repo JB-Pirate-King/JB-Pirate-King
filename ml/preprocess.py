@@ -58,6 +58,30 @@ USE_COLS = [
     "status", "vessel_type",
 ]
 
+# ── 컬럼명 정규화 (구형/신형 Marine Cadastre 포맷 호환) ──────────────
+# 신형(2025+, .zst): mmsi, base_date_time, longitude, latitude, ...
+# 구형(~2024, .zip): MMSI, BaseDateTime, LAT, LON, ..., VesselType, Status
+# 키 = 소문자·언더스코어제거,  값 = canonical(USE_COLS) 이름
+COL_ALIAS = {
+    "mmsi":         "mmsi",
+    "basedatetime": "base_date_time",
+    "lat":          "latitude",
+    "latitude":     "latitude",
+    "lon":          "longitude",
+    "longitude":    "longitude",
+    "sog":          "sog",
+    "cog":          "cog",
+    "heading":      "heading",
+    "status":       "status",
+    "vesseltype":   "vessel_type",
+}
+
+
+def _norm_col(c: str) -> str:
+    """헤더 컬럼명을 canonical 이름으로 정규화 (대소문자/언더스코어 무시)."""
+    key = c.strip().lower().replace("_", "")
+    return COL_ALIAS.get(key, c.strip().lower())
+
 # 출력 피처 컬럼 (모듈 레벨 공개 — run_pipeline.py 에서 참조)
 OUT_COLS = USE_COLS + [
     "dt", "dist_km",
@@ -81,6 +105,8 @@ def _file_stem(path: str) -> str:
     if name.endswith(".csv.zst"):
         return name[:-8]
     if name.endswith(".csv"):
+        return name[:-4]
+    if name.endswith(".zip"):
         return name[:-4]
     return os.path.splitext(name)[0]
 
@@ -131,6 +157,7 @@ def resolve_input_files(years: int = None) -> list:
             if os.path.isdir(a):
                 files += sorted(glob.glob(os.path.join(a, "*.csv")))
                 files += sorted(glob.glob(os.path.join(a, "*.csv.zst")))
+                files += sorted(glob.glob(os.path.join(a, "*.zip")))
             else:
                 files += sorted(glob.glob(a))
         files = sorted(set(f for f in files if os.path.isfile(f)))
@@ -145,6 +172,7 @@ def resolve_input_files(years: int = None) -> list:
     elif INPUT_DIR:
         files  = sorted(glob.glob(os.path.join(INPUT_DIR, "*.csv")))
         files += sorted(glob.glob(os.path.join(INPUT_DIR, "*.csv.zst")))
+        files += sorted(glob.glob(os.path.join(INPUT_DIR, "*.zip")))
         files  = sorted(set(f for f in files if os.path.isfile(f)))
     else:
         files  = sorted(glob.glob(INPUT_GLOB))
@@ -164,7 +192,7 @@ def resolve_input_files(years: int = None) -> list:
     return files
 
 
-# ── CSV 한 줄씩 읽기 (.csv.zst 스트리밍 지원) ────────────────────
+# ── CSV 한 줄씩 읽기 (.csv / .csv.zst / .zip 지원) ──────────────
 def iter_lines_csv(path: str):
     if path.endswith(".zst"):
         if not _HAS_ZST:
@@ -178,6 +206,28 @@ def iter_lines_csv(path: str):
                 text = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
                 for line in text:
                     yield line.rstrip("\n")
+    elif path.endswith(".zip"):
+        # Marine Cadastre 2024 이전: AIS_YYYY_MM_DD.zip 안에 CSV 1개
+        import zipfile
+        try:
+            zf = zipfile.ZipFile(path, "r")
+        except zipfile.BadZipFile:
+            # 손상/잘린 zip (다운로드 중단, 404 HTML 등) → 경고 후 건너뜀
+            print(f"  [경고] 손상 zip 건너뜀: {os.path.basename(path)}")
+            return
+        with zf:
+            csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+            if not csv_names:
+                return
+            with zf.open(csv_names[0]) as inner:
+                text = io.TextIOWrapper(inner, encoding="utf-8", errors="replace")
+                try:
+                    for line in text:
+                        yield line.rstrip("\n")
+                except zipfile.BadZipFile:
+                    # 압축 해제 중간에 잘린 경우
+                    print(f"  [경고] zip 해제 중 손상: {os.path.basename(path)}")
+                    return
     else:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -196,7 +246,8 @@ def iter_all_files(input_files: list, writer):
             if not line:
                 continue
             if header is None:
-                header = [c.strip() for c in line.split(",")]
+                # 구형/신형 컬럼명을 canonical 로 정규화
+                header = [_norm_col(c) for c in line.split(",")]
                 continue
             values = line.split(",")
             if len(values) != len(header):
@@ -260,10 +311,10 @@ def add_derived_features(rows: list) -> list:
 
         prev = rows[i - 1]
 
-        # dt
+        # dt  (fromisoformat: 신형 "YYYY-MM-DD HH:MM:SS" / 구형 "...T..." 모두 처리)
         try:
-            t1 = datetime.strptime(prev["base_date_time"], "%Y-%m-%d %H:%M:%S")
-            t2 = datetime.strptime(row["base_date_time"],  "%Y-%m-%d %H:%M:%S")
+            t1 = datetime.fromisoformat(prev["base_date_time"].strip())
+            t2 = datetime.fromisoformat(row["base_date_time"].strip())
             row["dt"] = max(0.0, (t2 - t1).total_seconds())
         except Exception:
             row["dt"] = 0.0

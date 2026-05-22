@@ -61,8 +61,17 @@ from train_benchmark import (
 )
 
 # ── 고정 상수 ──────────────────────────────────────────────────────
-SEQ_LEN   = 10
-SEQ_BREAK = 600    # dt 임계값 (초) — 시퀀스 분리
+SEQ_LEN         = 10
+SEQ_BREAK       = 600   # dt 임계값 (초) — 시퀀스 분리
+MAX_SEQ_PER_MMSI = 500  # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
+
+# ── Greedy 목적함수 (약한 시나리오 가중) 기본값 ─────────────────────
+# 전체 평균만 최적화하면 90~100%인 다수 시나리오에 묻혀
+# 0% 고착 시나리오를 살리는 피처가 영원히 채택되지 않는다.
+# 목적 점수 = 전체평균 + WEAK_WEIGHT × (베이스라인 약세 시나리오 평균)
+WEAK_FLOOR_DEFAULT  = 50.0   # 베이스라인 탐지율 < 이 값 → "약세" 시나리오로 분류
+WEAK_WEIGHT_DEFAULT = 1.0    # 약세 시나리오 평균에 곱할 가중치
+MIN_GAIN_DEFAULT    = 3.0    # 목적 점수 채택 임계 (노이즈 오채택 방지)
 
 # ── 베이스 피처 (현재 12개) ────────────────────────────────────────
 BASE_FEATURES = [
@@ -72,6 +81,20 @@ BASE_FEATURES = [
     "speed_consistency", "lat_speed", "lon_speed",
 ]
 _B = {name: i for i, name in enumerate(BASE_FEATURES)}
+
+# ── 이전 반복에서 검증·채택된 피처 (Greedy 탐색의 출발점) ──────────────
+# Iteration 1: accel (+12.0pp)
+# Iteration 2: heading_rate (+3.1pp) → 14피처(nhead=2)
+# Iteration 3: 희소피처 클리핑 버그 수정
+# Iteration 4: 약세가중 목적함수 + heading_change·vec_sog_diff 채택 → 16피처(89.4%)
+#              단, heading_change가 FN2(-39.5)·FN3(-21) 퇴보 유발 의심
+# Iteration 5: heading_change 제외 후 재탐색 → heading_change 재선택(16피처 수렴 확정)
+#              {accel, heading_rate, vec_sog_diff, heading_change} = 검증된 최적 16피처
+# Iteration 6: 16피처 고정, 잔존 약점 FN3-COG경계(~28%)·FN4-status(~8%) 정조준
+#              weak_floor 55로 FN3 보호, max_feat 18로 타겟 피처 추가 기회
+# Iteration 7: hdg_perp_score·status_fn4_flag 신규 후보 추가, weak_weight=1.5
+#              (Iteration 7 결과 따라 INITIAL_EXTRA 갱신 예정)
+INITIAL_EXTRA: list = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
 
 
 # ── 각도 차이 헬퍼 ────────────────────────────────────────────────
@@ -86,6 +109,7 @@ def _ang_diff(a: float, b: float) -> float:
 # fn(seq: List[List[float]], t: int) -> float
 #   seq[t] 는 BASE_FEATURES 순서의 현재 행
 CANDIDATE_FEATURES: dict = {
+    # ── 기존 후보 (Iteration 1 미채택) ──
     "cog_change": (
         "COG 변화량 (도)",
         lambda seq, t: (
@@ -160,7 +184,133 @@ CANDIDATE_FEATURES: dict = {
             seq[t][_B["sog"]] * seq[t][_B["dt"]] / 3600.0 * 1.852, 0.001
         ),
     ),
+    # ── Iteration 2 신규 후보 ──────────────────────────────────────
+    "hdg_vec_diff": (
+        "Heading vs GPS이동방향 차이 (도)",
+        # lat_speed/lon_speed로 실제 이동 방위각 추정 → heading과 비교
+        # G3-PhantomHDG 퇴보(-36pp) 복구 타겟
+        lambda seq, t: _ang_diff(
+            seq[t][_B["heading"]],
+            math.degrees(math.atan2(
+                seq[t][_B["lon_speed"]], seq[t][_B["lat_speed"]]
+            )) % 360,
+        ) if (abs(seq[t][_B["lat_speed"]]) + abs(seq[t][_B["lon_speed"]]) > 1e-6) else 0.0,
+    ),
+    "status_motion": (
+        "정박/계류 상태이동 (anchored×sog)",
+        # status 1(anchor)·5(moored)이면서 sog>0 → 충돌 신호
+        # 정박이동·D1-LowSlow 0% 탐지 타겟
+        lambda seq, t: float(int(round(seq[t][_B["status"]])) in (1, 5))
+        * seq[t][_B["sog"]],
+    ),
+    "sog_vec_kn": (
+        "GPS유도 속력 (노트)",
+        # lat_speed·lon_speed(deg/s) → km/s 변환 후 노트로
+        # 1 deg ≈ 111.32 km,  1 knot = 1.852 km/h
+        lambda seq, t: math.sqrt(
+            (seq[t][_B["lat_speed"]] * 111320.0) ** 2
+            + (seq[t][_B["lon_speed"]] * 111320.0) ** 2
+        ) / 1852.0 * 3600.0,
+    ),
+    "vec_sog_diff": (
+        "SOG vs GPS속력 절대차이 (노트)",
+        lambda seq, t: abs(
+            seq[t][_B["sog"]]
+            - math.sqrt(
+                (seq[t][_B["lat_speed"]] * 111320.0) ** 2
+                + (seq[t][_B["lon_speed"]] * 111320.0) ** 2
+            ) / 1852.0 * 3600.0
+        ),
+    ),
+    # ── Iteration 4 신규 후보 (0% 고착 시나리오 타겟, 노이즈 플로어/도메인 기반) ──
+    "anchored_excess_speed": (
+        "정박/계류 중 초과속력 (status∈{1,5,6} × max(0, sog-1.5kn))",
+        # 정박이동 타겟. 1.5kn = GPS 지터 허용 임계(해양 관행) → 정상 정박선은 0
+        lambda seq, t: float(int(round(seq[t][_B["status"]])) in (1, 5, 6))
+        * max(0.0, seq[t][_B["sog"]] - 1.5),
+    ),
+    "uncommon_status": (
+        "비통상 항행상태 (0=underway/1=anchored/5=moored 외 = 1)",
+        # FN4-status 타겟. 통상 3개 상태 외는 운용상 드묾(도메인 지식, 공격값 비하드코딩)
+        lambda seq, t: 0.0 if int(round(seq[t][_B["status"]])) in (0, 1, 5) else 1.0,
+    ),
+    "lowspeed_crab": (
+        "저속 crab각 (cog_hdg_diff × max(0, 1-sog/3kn))",
+        # D1-LowSlow 타겟. 저속일수록 heading-course 불일치 가중 (3kn 이하)
+        lambda seq, t: seq[t][_B["cog_hdg_diff"]]
+        * max(0.0, 1.0 - seq[t][_B["sog"]] / 3.0),
+    ),
+    # ── Iteration 7 신규 후보 (FN3 정조준) ────────────────────────────
+    "hdg_perp_score": (
+        "COG-Heading 직교성 (|sin(cog_hdg_diff)|, FN3 정조준)",
+        # FN3-COG경界: 헤딩이 진침로에 수직(91~99°) → sin값 ≈ 1.0 (최대)
+        # 정상선박: cog_hdg_diff < 30° → sin < 0.5  |  반대방향(180°): sin = 0
+        # cog_hdg_diff가 이미 있지만 선형 스케일에서 90° 구분력이 낮음 →
+        # sin 변환으로 90°에서 극대, 0°/180° 에서 0으로 비선형 강조
+        # cog_hdg_diff = -1.0 은 heading 불가(511) 센티넬 → 0.0 반환
+        lambda seq, t: 0.0 if seq[t][_B["cog_hdg_diff"]] < 0.0 else abs(math.sin(math.radians(seq[t][_B["cog_hdg_diff"]]))),
+    ),
+    "status_fn4_flag": (
+        "FN4 비통상 상태 누적 (시퀀스 내 uncommon_status 비율)",
+        # FN4-status: status∈{2,3,7,8,11,12} 가 SEQ_LEN 내내 지속 → 비율=1.0
+        # 정상: status=0/1/5만 → 비율=0.0
+        # uncommon_status(단일 타임스텝) 보다 시퀀스 맥락 반영
+        lambda seq, t: sum(
+            1.0 for row in seq if int(round(row[_B["status"]])) not in (0, 1, 5)
+        ) / len(seq),
+    ),
 }
+
+
+# ── 편향 제거용 스케일러 ─────────────────────────────────────────
+class ClippedMinMaxScaler:
+    """1~99 퍼센타일 클리핑 후 MinMaxScaling.
+
+    - 이상치가 전체 스케일을 왜곡하는 MinMaxScaler 단점 보완
+    - data_min_ / data_max_ 속성을 그대로 노출해 기존 코드 호환 유지
+    - 학습·평가 transform 모두 동일하게 클리핑(대칭) → 모델은 클리핑된
+      분포를 학습하고, 탐지는 클리핑 범위 내 패턴 재구성 오차로 이뤄짐.
+      (참고: 평가 시 이상치를 클리핑하지 않으면 범위 밖 값이 [0,1]을 초과해
+       재구성 오차를 키울 수 있으나, 현재는 학습/평가 일관성을 우선함)
+
+    희소 피처 보호:
+      status_motion 처럼 정상 데이터의 99%가 0인 희소 피처는
+      99퍼센타일(clip_hi)이 0이 되어 클리핑이 신호 전체를 죽인다.
+      clip_lo ≈ clip_hi(붕괴) 열은 클리핑을 끄고 실제 min/max를 사용해
+      희소 이상신호를 보존한다.
+    """
+    def __init__(self):
+        self._scaler  = MinMaxScaler()
+        self.clip_lo  = None   # 1 퍼센타일 (붕괴열은 실제 min)
+        self.clip_hi  = None   # 99 퍼센타일 (붕괴열은 실제 max)
+
+    def fit(self, X: np.ndarray):
+        X = np.asarray(X, dtype=float)
+        lo = np.percentile(X, 1,  axis=0)
+        hi = np.percentile(X, 99, axis=0)
+        # 붕괴 열(클리핑 구간이 0폭) → 실제 min/max로 대체해 클리핑 비활성화
+        degenerate = (hi - lo) <= 1e-9
+        if np.any(degenerate):
+            real_lo = X.min(axis=0)
+            real_hi = X.max(axis=0)
+            lo = np.where(degenerate, real_lo, lo)
+            hi = np.where(degenerate, real_hi, hi)
+        self.clip_lo = lo
+        self.clip_hi = hi
+        self._scaler.fit(np.clip(X, self.clip_lo, self.clip_hi))
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return self._scaler.transform(np.clip(np.asarray(X), self.clip_lo, self.clip_hi))
+
+    def fit_transform(self, X: np.ndarray) -> np.ndarray:
+        return self.fit(X).transform(X)
+
+    # ── MinMaxScaler 인터페이스 호환 ──
+    @property
+    def data_min_(self):  return self._scaler.data_min_
+    @property
+    def data_max_(self):  return self._scaler.data_max_
 
 
 # ── 시퀀스 파생 피처 보강 ─────────────────────────────────────────
@@ -182,11 +332,20 @@ def augment_seqs(seqs: list, extra_names: list) -> list:
     return [augment_seq(seq, extra_names) for seq in seqs]
 
 
-# ── 데이터 로드 ────────────────────────────────────────────────────
+# ── 데이터 로드 (편향 제거) ────────────────────────────────────────
 def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
-    """전처리 CSV → BASE_FEATURES 기준 raw 시퀀스 리스트"""
+    """전처리 CSV → BASE_FEATURES 기준 raw 시퀀스 리스트
+
+    편향 제거 3종:
+    1. 연·월별 균등 MMSI 샘플링 — 연도/계절/시간 편향 방지
+       (3년 통합 시 2025 전체가 2023·2024 하반기를 압도하지 않도록 YYYY-MM 버킷)
+    2. MMSI당 시퀀스 상한       — 고빈도 선박 지배 방지
+    (스케일러 편향은 ClippedMinMaxScaler 에서 처리)
+    """
     print(f"\n[데이터] {input_file} 로드 중...")
-    mmsi_data: dict = defaultdict(list)
+
+    mmsi_data:        dict = defaultdict(list)   # mmsi → [record, ...]
+    mmsi_period_cnt:  dict = defaultdict(lambda: defaultdict(int))  # mmsi → {"YYYY-MM": cnt}
 
     with open(input_file, encoding="utf-8") as f:
         reader = csv_mod.DictReader(f)
@@ -196,45 +355,101 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
                 continue
             try:
                 record = [float(row[col]) for col in BASE_FEATURES]
-                mmsi_data[mmsi].append(record)
             except (ValueError, KeyError):
                 continue
+            mmsi_data[mmsi].append(record)
+            # 연-월 추출 (base_date_time: "YYYY-MM-DD HH:MM:SS")
+            dt_str = row.get("base_date_time", "")
+            if len(dt_str) >= 7 and dt_str[4] == "-":
+                mmsi_period_cnt[mmsi][dt_str[0:7]] += 1   # "YYYY-MM"
 
-    print(f"  고유 MMSI: {len(mmsi_data):,}")
-    if max_mmsi and len(mmsi_data) > max_mmsi:
-        keys = random.sample(list(mmsi_data.keys()), max_mmsi)
-        mmsi_data = {k: mmsi_data[k] for k in keys}
-        print(f"  샘플링 후 MMSI: {len(mmsi_data):,}")
+    all_mmsis = list(mmsi_data.keys())
+    print(f"  고유 MMSI: {len(all_mmsis):,}")
 
-    dt_idx = _B["dt"]
-    sequences = []
+    # ── 1. 연·월별 균등 MMSI 샘플링 ───────────────────────────────
+    if max_mmsi and len(all_mmsis) > max_mmsi:
+        # MMSI별 주요 기간 결정 (최빈 YYYY-MM)
+        mmsi_main_period = {
+            m: max(cnt, key=cnt.get) if cnt else ""
+            for m, cnt in mmsi_period_cnt.items()
+        }
+        period_buckets: dict = defaultdict(list)
+        for mmsi in all_mmsis:
+            period_buckets[mmsi_main_period.get(mmsi, "")].append(mmsi)
+
+        active_periods = sorted(p for p in period_buckets if p)
+        if active_periods:
+            per_period = max(1, max_mmsi // len(active_periods))
+            selected: list = []
+            for p in active_periods:
+                pool = period_buckets[p]
+                selected.extend(random.sample(pool, min(per_period, len(pool))))
+            # 부족분 랜덤 보충
+            if len(selected) < max_mmsi:
+                leftover = [m for m in all_mmsis if m not in set(selected)]
+                extra    = min(max_mmsi - len(selected), len(leftover))
+                selected.extend(random.sample(leftover, extra))
+            selected = selected[:max_mmsi]
+            # 기간 분포 출력
+            dist = defaultdict(int)
+            for m in selected:
+                dist[mmsi_main_period.get(m, "")] += 1
+            dist_str = "  ".join(
+                f"{p}:{c}" for p, c in sorted(dist.items()) if p
+            )
+            print(f"  연·월별 균등 샘플: {len(selected):,}개 MMSI  "
+                  f"({len(active_periods)}개 기간)  [{dist_str}]")
+        else:
+            selected = random.sample(all_mmsis, max_mmsi)
+            print(f"  랜덤 샘플: {len(selected):,}개 MMSI")
+
+        mmsi_data = {k: mmsi_data[k] for k in selected}
+
+    # ── 2. 시퀀스 생성 + MMSI당 상한 적용 ────────────────────────
+    dt_idx   = _B["dt"]
+    sequences: list = []
+    capped   = 0
+
     for records in mmsi_data.values():
         seg, cur = [], [records[0]]
         for rec in records[1:]:
             if rec[dt_idx] >= SEQ_BREAK:
-                seg.append(cur)
-                cur = [rec]
+                seg.append(cur); cur = [rec]
             else:
                 cur.append(rec)
         seg.append(cur)
+
+        mmsi_seqs: list = []
         for s in seg:
             if len(s) < SEQ_LEN:
                 continue
             for i in range(len(s) - SEQ_LEN + 1):
-                sequences.append(s[i : i + SEQ_LEN])
+                mmsi_seqs.append(s[i: i + SEQ_LEN])
 
+        if len(mmsi_seqs) > MAX_SEQ_PER_MMSI:
+            mmsi_seqs = random.sample(mmsi_seqs, MAX_SEQ_PER_MMSI)
+            capped += 1
+
+        sequences.extend(mmsi_seqs)
+
+    if capped:
+        print(f"  MMSI당 상한({MAX_SEQ_PER_MMSI}) 적용: {capped:,}개 MMSI 절감")
     print(f"  총 시퀀스: {len(sequences):,}")
     return sequences
 
 
 # ── Tensor 준비 ────────────────────────────────────────────────────
 def prepare_tensor(raw_seqs: list, extra_names: list):
-    """파생 피처 추가 → MinMaxScaling → Tensor. (tensor, scaler) 반환."""
-    aug = augment_seqs(raw_seqs, extra_names)
-    flat = [row for seq in aug for row in seq]
-    scaler = MinMaxScaler()
+    """파생 피처 추가 → ClippedMinMaxScaling → Tensor. (tensor, scaler) 반환.
+
+    ClippedMinMaxScaler: 1~99 퍼센타일로 이상치 클리핑 후 MinMaxScale.
+    이상치 1개가 전체 스케일을 망치는 MinMaxScaler 단점 해결.
+    """
+    aug  = augment_seqs(raw_seqs, extra_names)
+    flat = np.array([row for seq in aug for row in seq])
+    scaler = ClippedMinMaxScaler()
     scaler.fit(flat)
-    scaled = [scaler.transform(seq).tolist() for seq in aug]
+    scaled = [scaler.transform(np.array(seq)).tolist() for seq in aug]
     tensor = torch.tensor(scaled, dtype=torch.float32)
     return tensor, scaler
 
@@ -247,10 +462,11 @@ def train_dcdetect(
     lr: float = 1e-3,
     batch_size: int = 256,
     patience: int = 5,
-    nhead_max: int = 4,
+    nhead_max: int = 8,
 ):
     """DCdetector 학습 후 (model, val_loader) 반환.
-    nhead 는 n_feat 의 약수 중 nhead_max 이하 최댓값으로 자동 조정."""
+    nhead 는 n_feat 의 약수 중 nhead_max 이하 최댓값으로 자동 조정.
+    16피처 → nhead=8, 14피처 → nhead=2, 12피처 → nhead=4 등."""
     device = torch.device("cpu")
     d_model = 64
     # n_feat % nhead == 0  AND  d_model % nhead == 0 을 동시에 만족하는 최대 nhead
@@ -280,27 +496,32 @@ def compute_threshold(model, val_loader) -> float:
 # ── 평가 ────────────────────────────────────────────────────────────
 def evaluate(
     model,
-    scaler: MinMaxScaler,
+    scaler,
     extra_names: list,
     n_anom: int = 200,
-    n_normal: int = 3000,
+    n_normal: int = 10000,
     raw_seqs: list = None,
 ):
     """
     FP ≈ 1% 기준 탐지율 계산.
-    반환: (train_avg, holdout_avg) — 학습 시나리오 / 홀드아웃 평균 탐지율(%)
+    반환: (avg_det, scenario_results)
+    n_normal=10000: 임계값 편향 줄이기 위해 기본값 상향
     """
     device = next(model.parameters()).device
     model.eval()
-    mins = scaler.data_min_
-    maxs = scaler.data_max_
+    mins        = scaler.data_min_
+    maxs        = scaler.data_max_
     scale_range = maxs - mins
+    # ClippedMinMaxScaler의 클리핑 범위 (없으면 무제한)
+    clip_lo = getattr(scaler, "clip_lo", None)
+    clip_hi = getattr(scaler, "clip_hi", None)
 
     def _scale_row(row):
-        return [
-            (v - mn) / (rng + 1e-9)
-            for v, mn, rng in zip(row, mins, scale_range)
-        ]
+        arr = np.asarray(row)
+        if clip_lo is not None:
+            arr = np.clip(arr, clip_lo, clip_hi)
+        return [(v - mn) / (rng + 1e-9)
+                for v, mn, rng in zip(arr.tolist(), mins, scale_range)]
 
     def _score(seq: list) -> float:
         """raw 시퀀스(base) → 파생 추가 → 스케일 → MSE 스코어"""
@@ -346,7 +567,7 @@ def permutation_importance(
     extra_names: list,
     raw_seqs: list,
     n_anom: int = 200,
-    n_normal: int = 3000,
+    n_normal: int = 10000,
     n_repeat: int = 3,
 ) -> list:
     """
@@ -356,14 +577,19 @@ def permutation_importance(
     """
     device = next(model.parameters()).device
     model.eval()
-    mins  = scaler.data_min_
-    maxs  = scaler.data_max_
+    mins        = scaler.data_min_
+    maxs        = scaler.data_max_
     scale_range = maxs - mins
+    clip_lo     = getattr(scaler, "clip_lo", None)
+    clip_hi     = getattr(scaler, "clip_hi", None)
     all_feat_names = BASE_FEATURES + extra_names
 
     def _scale_row(row):
+        arr = np.asarray(row)
+        if clip_lo is not None:
+            arr = np.clip(arr, clip_lo, clip_hi)
         return [(v - mn) / (rng + 1e-9)
-                for v, mn, rng in zip(row, mins, scale_range)]
+                for v, mn, rng in zip(arr.tolist(), mins, scale_range)]
 
     def _score(seq: list) -> float:
         aug = augment_seq(seq, extra_names)
@@ -447,42 +673,82 @@ def permutation_importance(
     return results
 
 
+# ── Greedy 목적 점수 (전체평균 + 약세 시나리오 가중) ────────────────
+def _objective(sc: list, weak_names: set, weak_weight: float) -> float:
+    """목적 점수 = 전체 시나리오 평균 + weak_weight × 약세 시나리오 평균.
+
+    sc: [(name, det, is_holdout), ...]
+    weak_names: 베이스라인에서 약세로 분류된 시나리오 이름 집합 (고정)
+    """
+    overall = float(np.mean([d for _, d, _ in sc])) if sc else 0.0
+    if not weak_names:
+        return overall
+    weak_dets = [d for n, d, _ in sc if n in weak_names]
+    weak_mean = float(np.mean(weak_dets)) if weak_dets else 0.0
+    return overall + weak_weight * weak_mean
+
+
 # ── Greedy Forward Selection 메인 루프 ────────────────────────────
 def greedy_forward_selection(raw_seqs: list, args) -> tuple:
-    current_extra: list = []
-    remaining: list = list(CANDIDATE_FEATURES.keys())
+    weak_floor  = getattr(args, "weak_floor",  WEAK_FLOOR_DEFAULT)
+    weak_weight = getattr(args, "weak_weight", WEAK_WEIGHT_DEFAULT)
+    min_gain    = getattr(args, "min_gain",    MIN_GAIN_DEFAULT)
+
+    # INITIAL_EXTRA: 이전 반복에서 이미 채택된 피처 → 탐색 시작점
+    current_extra: list = list(INITIAL_EXTRA)
+    # accel 등 INITIAL_EXTRA에 포함된 항목은 다시 탐색하지 않음
+    remaining: list = [k for k in CANDIDATE_FEATURES.keys() if k not in INITIAL_EXTRA]
     history: list = []
 
+    n_base_total = len(BASE_FEATURES) + len(current_extra)
     W = 65
     print("\n" + "=" * W)
     print("  피처 엔지니어링 자동화  (Greedy Forward Selection)")
-    print(f"  베이스 피처: {len(BASE_FEATURES)}개  |  후보: {len(remaining)}개")
+    print(f"  베이스 피처: {len(BASE_FEATURES)}개  +  기채택: {len(INITIAL_EXTRA)}개"
+          f"  →  시작 {n_base_total}개  |  후보: {len(remaining)}개")
     print(f"  epochs={args.epochs}  max_mmsi={args.max_mmsi}  n_anom={args.n_anom}")
+    print(f"  목적함수: 전체평균 + {weak_weight}×약세평균"
+          f"  (약세<{weak_floor}%, 채택임계 {min_gain}점)")
     print("=" * W)
 
-    # ── 베이스라인 ──────────────────────────────────────────────
+    # ── 베이스라인 (INITIAL_EXTRA 포함) ────────────────────────────
     print(f"\n{'─'*W}")
-    print(f"[베이스라인]  피처 {len(BASE_FEATURES)}개: {BASE_FEATURES}")
+    print(f"[베이스라인]  피처 {n_base_total}개: {BASE_FEATURES + current_extra}")
     print(f"{'─'*W}")
     t0 = time.time()
-    tensor, scaler = prepare_tensor(raw_seqs, [])
-    model, val_loader = train_dcdetect(tensor, len(BASE_FEATURES), args.epochs)
-    det0, sc0 = evaluate(model, scaler, [], args.n_anom, raw_seqs=raw_seqs)
+    tensor, scaler = prepare_tensor(raw_seqs, current_extra)
+    model, val_loader = train_dcdetect(tensor, n_base_total, args.epochs)
+    det0, sc0 = evaluate(model, scaler, current_extra, args.n_anom, raw_seqs=raw_seqs)
     elapsed = time.time() - t0
-    best_det = det0
-    print(f"  → 전체 평균 탐지율 {det0:.1f}%  [{elapsed/60:.1f}분]")
+
+    # 약세 시나리오 집합 = 베이스라인 탐지율 < weak_floor (전 과정 고정)
+    weak_names = {n for n, d, _ in sc0 if d < weak_floor}
+    best_score = _objective(sc0, weak_names, weak_weight)
+    best_det   = det0
+    print(f"  → 전체 평균 탐지율 {det0:.1f}%  (목적점수 {best_score:.1f})  [{elapsed/60:.1f}분]")
+    if weak_names:
+        weak_str = ", ".join(f"{n}({d:.0f}%)" for n, d, _ in sc0 if n in weak_names)
+        print(f"  약세 시나리오({len(weak_names)}개): {weak_str}")
     history.append(
-        dict(step=0, added="베이스라인", n_feat=len(BASE_FEATURES),
-             det=det0, extra=list(current_extra), scenarios=sc0)
+        dict(step=0, added="베이스라인", n_feat=n_base_total,
+             det=det0, score=best_score, extra=list(current_extra), scenarios=sc0)
     )
+
+    max_feat = getattr(args, "max_feat", None)
 
     step = 1
     while remaining:
+        # 피처 수 상한 도달 시 중단 (nhead=8 유지 목적: 16개 권장)
+        if max_feat is not None and (len(BASE_FEATURES) + len(current_extra)) >= max_feat:
+            print(f"\n  [상한] 피처 수 {max_feat}개 도달 → 탐색 종료")
+            break
         print(f"\n{'─'*W}")
         print(f"[Step {step}]  현재 {len(BASE_FEATURES)+len(current_extra)}개 피처  "
               f"| 후보 {len(remaining)}개")
         if current_extra:
-            print(f"  현재 추가됨: {current_extra}")
+            adopted_new = [f for f in current_extra if f not in INITIAL_EXTRA]
+            if adopted_new:
+                print(f"  이번 반복 채택: {adopted_new}")
         print(f"{'─'*W}")
 
         step_best_gain = -999.0
@@ -500,36 +766,39 @@ def greedy_forward_selection(raw_seqs: list, args) -> tuple:
             model, val_loader = train_dcdetect(tensor, n_feat, args.epochs)
             det, sc = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=raw_seqs)
             elapsed = time.time() - t0
-            gain = det - best_det
-            arrow = "▲" if gain > 0.5 else ("▼" if gain < -0.5 else "─")
+            score = _objective(sc, weak_names, weak_weight)
+            gain  = score - best_score          # 목적 점수 기준 향상
+            det_gain = det - best_det           # 참고용 전체평균 변화
+            arrow = "▲" if gain > min_gain else ("▼" if gain < -min_gain else "─")
             print(
-                f"  전체평균 {det:5.1f}%"
-                f"  {arrow}{abs(gain):4.1f}pp  [{elapsed/60:.1f}분]"
+                f"  전체평균 {det:5.1f}%({det_gain:+.1f})"
+                f"  점수 {score:6.1f} {arrow}{gain:+5.1f}  [{elapsed/60:.1f}분]"
             )
             if gain > step_best_gain:
                 step_best_gain = gain
                 step_best_feat = cand
-                step_best_result = (det, trial_extra, tensor, scaler, model, sc)
+                step_best_result = (det, trial_extra, tensor, scaler, model, sc, score)
 
-        # 0.5pp 이상 향상 시 채택
-        if step_best_gain > 0.5:
+        # 목적 점수 min_gain 이상 향상 시 채택
+        if step_best_gain > min_gain:
             current_extra = step_best_result[1]
-            best_det = step_best_result[0]
+            best_det   = step_best_result[0]
+            best_score = step_best_result[6]
             remaining.remove(step_best_feat)
             desc, _ = CANDIDATE_FEATURES[step_best_feat]
             print(f"\n  ✓ 채택: [{step_best_feat}] ({desc})")
-            print(f"    탐지율  {history[-1]['det']:.1f}%"
-                  f" → {best_det:.1f}%  (+{step_best_gain:.1f}pp)")
+            print(f"    전체평균 {history[-1]['det']:.1f}% → {best_det:.1f}%"
+                  f"  |  목적점수 +{step_best_gain:.1f}")
             history.append(
                 dict(step=step, added=step_best_feat,
                      n_feat=len(BASE_FEATURES) + len(current_extra),
-                     det=best_det,
+                     det=best_det, score=best_score,
                      extra=list(current_extra),
                      scenarios=step_best_result[5])
             )
         else:
             best_cand = step_best_feat
-            print(f"\n  ✗ 개선 없음 (최고 후보: {best_cand}  {step_best_gain:+.1f}pp)"
+            print(f"\n  ✗ 개선 없음 (최고 후보: {best_cand}  목적점수 {step_best_gain:+.1f})"
                   f" → 종료")
             break
 
@@ -541,7 +810,7 @@ def greedy_forward_selection(raw_seqs: list, args) -> tuple:
 # ── 보고서 출력 ───────────────────────────────────────────────────
 def print_report(history: list):
     W = 65
-    best = max(history, key=lambda x: x["det"])
+    best = max(history, key=lambda x: x.get("score", x["det"]))
     base = history[0]
     gain = best["det"] - base["det"]
 
@@ -597,13 +866,17 @@ def save_txt_report(history: list, args, txt_path: str, ts: str, perm_results: l
     for f in BASE_FEATURES:
         L(f"    {f}")
 
-    best = max(history, key=lambda x: x["det"])
-    added = best.get("extra", [])
+    best = max(history, key=lambda x: x.get("score", x["det"]))
+    added = best.get("extra", [])   # INITIAL_EXTRA + 이번 greedy 채택 모두 포함
     if added:
         L(f"  추가된 파생 피처 ({len(added)}개):")
         for f in added:
-            desc, _ = CANDIDATE_FEATURES[f]
-            L(f"    ★ {f:<22}  ({desc})")
+            if f in CANDIDATE_FEATURES:
+                desc, _ = CANDIDATE_FEATURES[f]
+            else:
+                desc = "(이전 반복 채택)"
+            prefix = "◆ 기채택" if f in INITIAL_EXTRA else "★ 신채택"
+            L(f"    {prefix}  {f:<22}  ({desc})")
     else:
         L("  추가된 파생 피처: 없음 (베이스라인이 최적)")
     L(f"  최종 피처 수: {best['n_feat']}개")
@@ -665,7 +938,17 @@ def save_txt_report(history: list, args, txt_path: str, ts: str, perm_results: l
     # ── 후보 피처 전체 목록 ──
     L()
     L("[ 후보 피처 목록 ]")
+    # INITIAL_EXTRA (이전 반복 채택) 먼저 표시
+    for name in INITIAL_EXTRA:
+        if name in CANDIDATE_FEATURES:
+            desc, _ = CANDIDATE_FEATURES[name]
+        else:
+            desc = "(이전 반복 채택)"
+        L(f"  ◆ 기채택  {name:<22}  {desc}")
+    # 이번 반복 후보들
     for name, (desc, _) in CANDIDATE_FEATURES.items():
+        if name in INITIAL_EXTRA:
+            continue
         adopted = "★ 채택" if name in added else "  미채택"
         L(f"  {adopted}  {name:<22}  {desc}")
 
@@ -697,7 +980,22 @@ def main():
                     help="시나리오당 이상 시퀀스 수 (기본: 200)")
     ap.add_argument("--out_json", default=None,
                     help="결과 JSON 저장 경로 (선택)")
+    ap.add_argument("--initial_extra", nargs="*", default=None,
+                    help="이전 반복 채택 피처 목록 (공백 구분). 미지정 시 코드 내 INITIAL_EXTRA 사용")
+    ap.add_argument("--weak_floor", type=float, default=WEAK_FLOOR_DEFAULT,
+                    help=f"약세 시나리오 분류 임계 %% (기본: {WEAK_FLOOR_DEFAULT})")
+    ap.add_argument("--weak_weight", type=float, default=WEAK_WEIGHT_DEFAULT,
+                    help=f"약세 시나리오 평균 가중치 (기본: {WEAK_WEIGHT_DEFAULT})")
+    ap.add_argument("--min_gain", type=float, default=MIN_GAIN_DEFAULT,
+                    help=f"목적점수 채택 임계 (기본: {MIN_GAIN_DEFAULT})")
+    ap.add_argument("--max_feat", type=int, default=None,
+                    help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
     args = ap.parse_args()
+
+    # 이전 반복 채택 피처를 CLI로 받았으면 전역 INITIAL_EXTRA 오버라이드
+    global INITIAL_EXTRA
+    if args.initial_extra is not None:
+        INITIAL_EXTRA = list(args.initial_extra)
 
     # 재현성 시드
     random.seed(SEED)
@@ -714,7 +1012,7 @@ def main():
     print_report(history)
 
     # ── 최적 피처셋으로 재학습 → Permutation Importance ──────────────
-    best = max(history, key=lambda x: x["det"])
+    best = max(history, key=lambda x: x.get("score", x["det"]))
     best_extra = best.get("extra", [])
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
     tensor_best, scaler_best = prepare_tensor(raw_seqs, best_extra)
@@ -739,6 +1037,10 @@ def main():
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
             {
+                "best_extra": best_extra,
+                "best_det": best["det"],
+                "baseline_det": history[0]["det"],
+                "initial_extra": INITIAL_EXTRA,
                 "history": [
                     {k: v for k, v in r.items() if k != "scenarios"}
                     | {"scenarios": [(n, d, h) for n, d, h in r.get("scenarios", [])]}
@@ -760,6 +1062,33 @@ def main():
     print(f"\n  최적 추가 피처: {best_extra}")
     print(f"  탐지율 향상: {history[0]['det']:.1f}% → {best['det']:.1f}%"
           f"  ({best['det']-history[0]['det']:+.1f}pp)")
+
+    # ── Discord / Notion 알림 ──────────────────────────────────────
+    try:
+        from notify import notify_iteration
+        gain = best["det"] - history[0]["det"]
+        new_adopted = [f for f in best_extra if f not in INITIAL_EXTRA]
+        # 상위 중요 피처 3개
+        top_imp = ", ".join(
+            f"{feat}({imp:+.1f})" for feat, _, imp in perm_results[:3]
+        )
+        summary = (
+            f"최종 피처 {best['n_feat']}개 | 탐지율 {history[0]['det']:.1f}% → "
+            f"{best['det']:.1f}% ({gain:+.1f}pp)\n"
+            f"신규 채택: {new_adopted or '없음'}\n"
+            f"기채택: {INITIAL_EXTRA}\n"
+            f"중요 피처 Top3: {top_imp}"
+        )
+        with open(txt_path, "r", encoding="utf-8") as _f:
+            report_text = _f.read()
+        notify_iteration(
+            title=f"DCdetect 피처 엔지니어링 (max_mmsi={args.max_mmsi})",
+            summary=summary,
+            report_text=report_text,
+            color=0x2ECC71 if gain >= 0 else 0xE74C3C,
+        )
+    except Exception as e:
+        print(f"  [알림] 전송 건너뜀: {e}")
 
 
 if __name__ == "__main__":

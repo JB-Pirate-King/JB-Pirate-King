@@ -139,14 +139,21 @@ elif _args_pre.model and "_seq10" in _args_pre.model:
 def load_scaler(path):
     with open(path) as f:
         j = json.load(f)
-    return j["min"], j["max"]
+    # clip_lo/hi: ClippedMinMaxScaler 버전 이상치 클리핑 범위
+    # 구버전 JSON(clip_lo 없음)은 None 반환 → 클리핑 스킵
+    return j["min"], j["max"], j.get("clip_lo"), j.get("clip_hi")
 
-def scale_val(val, mn, mx):
+def scale_val(val, mn, mx, lo=None, hi=None):
+    if lo is not None:
+        val = max(lo, min(hi, val))
     d = mx - mn
     return (val - mn) / d if d != 0 else 0.0
 
-def scale_seq(seq, mins, maxs):
-    return [[scale_val(v, mins[i], maxs[i]) for i, v in enumerate(row)]
+def scale_seq(seq, mins, maxs, clip_lo=None, clip_hi=None):
+    return [[scale_val(v, mins[i], maxs[i],
+                       clip_lo[i] if clip_lo else None,
+                       clip_hi[i] if clip_hi else None)
+             for i, v in enumerate(row)]
             for row in seq]
 
 
@@ -175,7 +182,7 @@ def infer_score(session, seq_scaled):
 
 
 # ── 실제 정상 시퀀스 로더 ─────────────────────────────────────────
-def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
+def load_real_normal_seqs(mins, maxs, clip_lo=None, clip_hi=None, n_seqs=3000, max_rows=300000) -> list:
     import csv, os
     if not os.path.exists(DATA_FILE):
         return None
@@ -214,7 +221,7 @@ def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
 
     random.shuffle(all_seqs)
     sampled = all_seqs if n_seqs is None else all_seqs[:n_seqs]
-    scaled  = [scale_seq(seq, mins, maxs) for seq in sampled]
+    scaled  = [scale_seq(seq, mins, maxs, clip_lo, clip_hi) for seq in sampled]
     print(f"  실제 정상 시퀀스 로드: {len(scaled):,}개 (전체 풀: {len(all_seqs):,})")
     return scaled, sampled   # scaled(ML용), raw(룰 평가용)
 
@@ -1136,6 +1143,7 @@ def infer_weighted_score(sessions, weights, seq_scaled):
     return score, mses
 
 def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
+                                 clip_lo=None, clip_hi=None,
                                  target_fp=5.0, real_seqs=None):
     print("\n" + "="*60)
     print(f"  [가중 앙상블] {' + '.join(model_names)}")
@@ -1150,7 +1158,7 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
         normal_scores = [infer_weighted_score(sessions, weights, seq)[0]
                          for seq in tqdm(real_seqs, desc="정상 시퀀스", leave=False)]
     else:
-        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(3000)]
+        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi) for _ in range(3000)]
         normal_scores = [infer_weighted_score(sessions, weights, seq)[0]
                          for seq in tqdm(normal_seqs, desc="정상 시퀀스", leave=False)]
 
@@ -1176,14 +1184,14 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
         if is_holdout != prev_holdout and prev_holdout is not None:
             print("  " + sep)
             print(f"  ── 홀드아웃 (학습 미포함) ──")
-        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        seqs = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(N_ANOM)]
         scores_and_mses = [infer_weighted_score(sessions, weights, seq) for seq in seqs]
         ens_rate = sum(1 for score, _ in scores_and_mses if score > thr) / N_ANOM * 100
 
         # 개별 단독 탐지율 (참고용 — 정상 스코어의 target_fp 퍼센타일 임계값 기준)
         indiv_normal_mses = [
             [infer_mse(sessions[i], seq) for seq in (real_seqs or
-             [scale_seq(make_normal_seq(), mins, maxs) for _ in range(500)])]
+             [scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi) for _ in range(500)])]
             for i in range(len(sessions))
         ]
         indiv_rates = []
@@ -1207,7 +1215,7 @@ def analysis_detection_weighted(sessions, model_names, weights, mins, maxs,
     sc_names = [n for n, _ in anom_scenarios]
     anom_seqs = {}
     for sc_name, maker in tqdm(anom_scenarios, desc="시퀀스 생성", leave=False):
-        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs) for _ in range(200)]
+        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(200)]
 
     # 시나리오별 스코어 미리 계산
     anom_scores = {}
@@ -1243,7 +1251,7 @@ def infer_mse_ensemble(sessions, thresholds, seq_scaled):
     detected = any(mse > thr for mse, thr in zip(mses, thresholds))
     return mses, detected
 
-def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, real_seqs=None):
+def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, clip_lo=None, clip_hi=None, real_seqs=None):
     print("\n" + "="*60)
     print(f"  [앙상블] {' + '.join(model_names)} OR 탐지율 테이블")
     print("="*60)
@@ -1255,7 +1263,7 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
     if real_seqs is not None:
         normal_results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in tqdm(real_seqs, desc="정상 시퀀스", leave=False)]
     else:
-        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(3000)]
+        normal_seqs = [scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi) for _ in range(3000)]
         normal_results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in tqdm(normal_seqs, desc="정상 시퀀스", leave=False)]
 
     fp_count  = sum(1 for _, det in normal_results if det)
@@ -1281,7 +1289,7 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
         if is_holdout != prev_holdout and prev_holdout is not None:
             print("  " + sep)
             print(f"  ── 홀드아웃 (학습 미포함) ──")
-        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        seqs = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(N_ANOM)]
         results = [infer_mse_ensemble(sessions, thresholds, seq) for seq in seqs]
         indiv_rates = []
         for i, thr in enumerate(thresholds):
@@ -1310,7 +1318,7 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
     # 시나리오별 시퀀스 미리 생성 (반복 방지)
     anom_seqs = {}
     for sc_name, maker in tqdm(anom_scenarios, desc="시나리오 시퀀스 생성", leave=False):
-        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs) for _ in range(200)]
+        anom_seqs[sc_name] = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(200)]
 
     # 헤더
     sc_names = [n for n, _ in anom_scenarios]
@@ -1340,7 +1348,7 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, r
 # ══════════════════════════════════════════════════════════════════
 # 분석 1: 탐지율/오탐율 테이블
 # ══════════════════════════════════════════════════════════════════
-def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
+def analysis_detection(session, mins, maxs, threshold, clip_lo=None, clip_hi=None, real_seqs=None, N=None):
     print("\n" + "="*60)
     print("  [분석 1] 탐지율 / 오탐율 테이블")
     print("="*60)
@@ -1357,7 +1365,7 @@ def analysis_detection(session, mins, maxs, threshold, real_seqs=None, N=None):
                              for seq in tqdm(seqs, desc=f"  {name}", leave=False, unit="seq")])
         else:
             n = N_ANOM if N is None else N
-            errs = np.array([infer_score(session, scale_seq(maker(), mins, maxs))
+            errs = np.array([infer_score(session, scale_seq(maker(), mins, maxs, clip_lo, clip_hi))
                              for _ in tqdm(range(n), desc=f"  {name}", leave=False, unit="seq")])
         all_errors.append((name, errs))
 
@@ -1476,7 +1484,7 @@ def analysis_correlation():
 # ══════════════════════════════════════════════════════════════════
 # 분석 3: 시나리오별 재구성 오차 분해 (피처별 MSE)
 # ══════════════════════════════════════════════════════════════════
-def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
+def analysis_reconstruction(session, mins, maxs, clip_lo=None, clip_hi=None, real_seqs=None, N=None):
     print("\n" + "="*60)
     print("  [분석 3] 시나리오별 재구성 오차 분해 (피처별 MSE)")
     print("="*60)
@@ -1498,7 +1506,7 @@ def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
         else:
             n = N_ANOM if N is None else N
             for _ in tqdm(range(n), desc=f"  {name}", leave=False, unit="seq"):
-                seq = scale_seq(maker(), mins, maxs)
+                seq = scale_seq(maker(), mins, maxs, clip_lo, clip_hi)
                 _, x, out = infer(session, seq)
                 feat_mse += ((out - x) ** 2).mean(axis=(0, 1))
             feat_mse /= n
@@ -1544,7 +1552,7 @@ def analysis_reconstruction(session, mins, maxs, real_seqs=None, N=None):
 # ══════════════════════════════════════════════════════════════════
 # 분석 4: Permutation Importance
 # ══════════════════════════════════════════════════════════════════
-def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
+def analysis_permutation(session, mins, maxs, clip_lo=None, clip_hi=None, real_seqs=None, N=3000, repeat=5):
     print("\n" + "="*60)
     print("  [분석 4] Permutation Importance")
     print("="*60)
@@ -1554,7 +1562,7 @@ def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
         print(f"  실제 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회")
     else:
         n = 5000 if N is None else N
-        seqs_scaled = [scale_seq(make_normal_seq(), mins, maxs) for _ in range(n)]
+        seqs_scaled = [scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi) for _ in range(n)]
         print(f"  합성 정상 시퀀스 {len(seqs_scaled):,}개 × 반복 {repeat}회 (CSV 없음)")
 
     N_ANOM = 500
@@ -1566,7 +1574,7 @@ def analysis_permutation(session, mins, maxs, real_seqs=None, N=3000, repeat=5):
 
     anom_arrays = {}
     for name, maker in tqdm(anom_scenarios, desc="이상 시퀀스 생성", unit="시나리오"):
-        seqs = [scale_seq(maker(), mins, maxs) for _ in range(N_ANOM)]
+        seqs = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(N_ANOM)]
         anom_arrays[name] = np.array(seqs, dtype=np.float32)
 
     def batch_score(x_arr, desc="추론"):
@@ -1740,7 +1748,7 @@ def main():
         for name in model_names:
             w_sessions.append(ort.InferenceSession(os.path.join(OUTPUT_DIR, name, f"model_{name}.onnx"), providers=["CPUExecutionProvider"]))
             w_scalers.append(load_scaler(os.path.join(OUTPUT_DIR, f"scaler_{name}.json")))
-        mins, maxs = w_scalers[0]
+        mins, maxs, clip_lo, clip_hi = w_scalers[0]
         n_models = len(model_names)
         weights = args.weights if args.weights and len(args.weights)==n_models                   else [1.0/n_models]*n_models
         wsum = sum(weights)
@@ -1753,11 +1761,11 @@ def main():
             with open(os.path.join(OUTPUT_DIR, name, f"threshold_{name}.txt")) as f:
                 thresholds.append(float(f.read()))
             scalers.append(load_scaler(os.path.join(OUTPUT_DIR, f"scaler_{name}.json")))
-        mins, maxs = scalers[0]
+        mins, maxs, clip_lo, clip_hi = scalers[0]
     elif RULE_ONLY:
-        mins, maxs = [0.0]*len(FEATURES), [1.0]*len(FEATURES)  # 스케일러 불필요
+        mins, maxs, clip_lo, clip_hi = [0.0]*len(FEATURES), [1.0]*len(FEATURES), None, None
     else:
-        mins, maxs = load_scaler(SCALER_FILE)
+        mins, maxs, clip_lo, clip_hi = load_scaler(SCALER_FILE)
         with open(THRESHOLD_FILE) as f:
             threshold = float(f.readline())
         session = ort.InferenceSession(MODEL_FILE, providers=["CPUExecutionProvider"])
@@ -1788,7 +1796,7 @@ def main():
 
         print("\n실제 정상 시퀀스 로드 중...")
         _n_normal = None if args.n_normal == 0 else args.n_normal
-        result = load_real_normal_seqs(mins, maxs, n_seqs=_n_normal)
+        result = load_real_normal_seqs(mins, maxs, clip_lo, clip_hi, n_seqs=_n_normal)
         if result is None:
             print(f"  ⚠ {DATA_FILE} 없음 - 합성 정상 시퀀스 사용")
             real_seqs, raw_seqs = None, None
@@ -1797,14 +1805,15 @@ def main():
 
         if IS_WEIGHTED:
             analysis_detection_weighted(w_sessions, model_names, weights, mins, maxs,
+                                        clip_lo, clip_hi,
                                         target_fp=args.target_fp, real_seqs=real_seqs)
         elif IS_ENSEMBLE:
-            analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, real_seqs=real_seqs)
+            analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, clip_lo, clip_hi, real_seqs=real_seqs)
         elif RULE_ONLY:
             analysis_rule_fp(raw_seqs)
         else:
             # 탐지율(분석1)은 항상 실행
-            all_errors = analysis_detection(session, mins, maxs, threshold, real_seqs=real_seqs)
+            all_errors = analysis_detection(session, mins, maxs, threshold, clip_lo, clip_hi, real_seqs=real_seqs)
             # ── CSV 구조화 ─────────────────────────────────────────
             if all_errors:
                 ne_errs = all_errors[0][1]
@@ -1829,8 +1838,8 @@ def main():
                     })
             if args.rule:  analysis_rule_fp(raw_seqs)
             if args.corr:  analysis_correlation()
-            if args.recon: analysis_reconstruction(session, mins, maxs, real_seqs=real_seqs)
-            if args.perm:  analysis_permutation(session, mins, maxs, real_seqs=real_seqs)
+            if args.recon: analysis_reconstruction(session, mins, maxs, clip_lo, clip_hi, real_seqs=real_seqs)
+            if args.perm:  analysis_permutation(session, mins, maxs, clip_lo, clip_hi, real_seqs=real_seqs)
 
         print("\n완료!")
         if HAS_MPL:

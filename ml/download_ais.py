@@ -19,7 +19,21 @@ import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
 
-BASE_URL = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/ais-{date}.csv.zst"
+# 2025~: ais-YYYY-MM-DD.csv.zst  (zstd)
+# ~2024: AIS_YYYY_MM_DD.zip       (zip 내부 CSV)
+BASE_URL_ZST = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/ais-{date}.csv.zst"
+BASE_URL_ZIP = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{date_us}.zip"
+
+def get_url_and_dest(year: int, d) -> tuple:
+    ds_dash  = d.strftime("%Y-%m-%d")
+    ds_us    = d.strftime("%Y_%m_%d")
+    if year >= 2025:
+        url  = BASE_URL_ZST.format(year=year, date=ds_dash)
+        name = f"ais-{ds_dash}.csv.zst"
+    else:
+        url  = BASE_URL_ZIP.format(year=year, date_us=ds_us)
+        name = f"AIS_{ds_us}.zip"
+    return url, name
 
 
 def get_dates(year: int, months: list[int] | None) -> list[date]:
@@ -105,9 +119,8 @@ def main():
     success = skip = fail = 0
 
     for d in dates:
-        ds   = d.strftime("%Y-%m-%d")
-        url  = BASE_URL.format(year=args.year, date=ds)
-        dest = out_dir / f"ais-{ds}.csv.zst"
+        url, fname = get_url_and_dest(args.year, d)
+        dest = out_dir / fname
 
         # 이미 존재하면 스킵
         if args.skip_existing and dest.exists() and dest.stat().st_size > 0:
