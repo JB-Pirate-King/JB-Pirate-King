@@ -104,6 +104,20 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
+# feature_engineer의 augment_seq 로드 (extra_features 지원)
+import sys as _sys, os as _os
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_ROOT = _os.path.dirname(_os.path.dirname(_HERE))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+try:
+    from ml.core.feature_engineer import CANDIDATE_FEATURES as _CAND_FEATURES, augment_seq as _augment_seq
+    _HAS_FE_AUGMENT = True
+except ImportError:
+    _HAS_FE_AUGMENT = False
+    _CAND_FEATURES = {}
+    def _augment_seq(seq, extra_names): return seq
+
 # ── 공통 설정 ─────────────────────────────────────────────────────
 FEATURES = [
     "sog", "cog", "heading", "status",
@@ -183,7 +197,7 @@ class MinMaxScaler:
 
 
 def load_and_prepare(input_file: str, scaler_path: str = "scaler.json",
-                     max_mmsi: int = None):
+                     max_mmsi: int = None, extra_features: list = None):
     """CSV 로드 → 시퀀스 생성 → 스케일러 fit → Tensor 반환
 
     편향 제거:
@@ -192,6 +206,9 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json",
     - MMSI당 시퀀스 상한 MAX_SEQ_PER_MMSI
     - ClippedMinMaxScaler (1~99 퍼센타일)
     """
+    extra_features = list(extra_features or [])
+    all_feat = FEATURES + extra_features
+
     print(f"[데이터] {input_file} 로드 중...")
     mmsi_data       = defaultdict(list)
     mmsi_period_cnt = defaultdict(lambda: defaultdict(int))  # mmsi → {"YYYY-MM": cnt}
@@ -281,6 +298,13 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json",
         print(f"  MMSI당 상한({MAX_SEQ_PER_MMSI}) 적용: {capped:,}개 MMSI 절감")
     print(f"  총 시퀀스: {len(sequences):,}")
 
+    if extra_features:
+        if _HAS_FE_AUGMENT:
+            sequences = [_augment_seq(seq, extra_features) for seq in sequences]
+            print(f"  extra 피처 {len(extra_features)}개 augment: {extra_features}")
+        else:
+            print(f"  [경고] feature_engineer import 실패 — extra_features 무시")
+
     flat   = [row for seq in sequences for row in seq]
     scaler = MinMaxScaler()
     scaler.fit(flat)
@@ -288,7 +312,7 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json",
 
     with open(scaler_path, "w") as f:
         json.dump({
-            "features": FEATURES,
+            "features": all_feat,
             "min":      scaler.min_,
             "max":      scaler.max_,
             "clip_lo":  scaler.clip_lo,   # 1 퍼센타일 (eval 시 클리핑용)
@@ -1243,7 +1267,15 @@ def main():
                         help="모델 파일 저장 디렉터리 (기본: 현재 폴더)")
     parser.add_argument("--max_mmsi",  type=int, default=None,
                         help=f"학습에 사용할 최대 MMSI 수 (기본: {SAMPLE_MMSI})")
+    parser.add_argument("--extra_features", nargs="*", default=[],
+                        help="추가 피처 목록 (feature_engineer.py CANDIDATE_FEATURES 키)")
     args = parser.parse_args()
+
+    extra_features = list(args.extra_features or [])
+    if extra_features:
+        global FEATURES, N_FEAT
+        FEATURES = FEATURES + extra_features
+        N_FEAT = len(FEATURES)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1257,7 +1289,7 @@ def main():
     # 데이터는 한 번만 로드 (스케일러는 모델별로 저장)
     first_scaler = os.path.join(args.output_dir, f"scaler_{models_to_run[0]}.json")
     tensor = load_and_prepare(args.input, scaler_path=first_scaler,
-                              max_mmsi=args.max_mmsi)
+                              max_mmsi=args.max_mmsi, extra_features=extra_features)
 
     for name in models_to_run:
         d = DEFAULTS[name]

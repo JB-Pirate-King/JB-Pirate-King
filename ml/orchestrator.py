@@ -341,15 +341,17 @@ def stage_preprocess(bot, sheet, branch, args, step_info: tuple):
 
 def stage_train(bot, sheet, branch, args, step_info: tuple):
     cur, total, next_name = step_info
+    current_extra = _load_fe_initial_extra()
+    all_feats = BASE_FEATURES + current_extra
     while True:
         feat_lines = "\n".join(
-            f"  • `{f}` — {FEATURE_DESCRIPTIONS.get(f, '')}" for f in BASE_FEATURES
+            f"  • `{f}` — {FEATURE_DESCRIPTIONS.get(f, '')}" for f in all_feats
         )
         bot.log_stage_start(
             "학습",
             f"{_step_header(cur, total, '베이스학습', next_name)}\n"
             f"【베이스 학습】 {args.model} / epochs={args.epochs} / max_mmsi={args.max_mmsi}\n"
-            f"사용 피처: {len(BASE_FEATURES)}개 (고정)\n"
+            f"사용 피처: {len(all_feats)}개 (베이스 {len(BASE_FEATURES)} + 기채택 {len(current_extra)})\n"
             f"{feat_lines}\n"
             f"목적: 기준 성능(baseline) 측정 — 이 모델은 배포용이 아님\n"
             f"배포용 모델은 피처 엔지니어링 학습 단계에서 생성됨"
@@ -372,15 +374,18 @@ def stage_train(bot, sheet, branch, args, step_info: tuple):
                         "학습"
                     )
 
-        ret, out = run_cmd(
-            ["python", "ml/core/pipeline.py", "--train",
-             "--models", args.model,
-             "--epochs", str(args.epochs),
-             "--max_mmsi", str(args.max_mmsi),
-             "--data_file", args.data_file,
-             "--base_dir", args.base_dir],
-            progress_cb=train_progress
-        )
+        train_cmd = [
+            "python", "ml/core/pipeline.py", "--train",
+            "--models", args.model,
+            "--epochs", str(args.epochs),
+            "--max_mmsi", str(args.max_mmsi),
+            "--data_file", args.data_file,
+            "--base_dir", args.base_dir,
+        ]
+        if current_extra:
+            train_cmd += ["--extra_features"] + current_extra
+
+        ret, out = run_cmd(train_cmd, progress_cb=train_progress)
         elapsed = time.time() - t0
         details  = _parse_train(out)
         analysis = claude_analyze("학습", out, ret == 0, elapsed, {
