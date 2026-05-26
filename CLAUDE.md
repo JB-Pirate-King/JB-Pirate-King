@@ -6,7 +6,7 @@ Whenever code or structure changes, keep ALL docs in sync. Before pushing code o
 
 1. **README.md / ml/README.md** — Verify that any changed features, paths, or options are reflected in the docs. Update outdated content before pushing.
 2. **CLAUDE.md (this file)** — Update so a fresh session can immediately understand the current state: new scripts/options, changed workflows, version history, feature count, paths.
-3. **Notion** — Update the methodology/results pages so external readers stay current. Use `python ml/notify.py` helpers (token in `ml/notify_config.json`, gitignored). Parent + results page IDs are in that config.
+3. **Notion** — Update the methodology/results pages so external readers stay current. Use `python ml/integrations/notify.py` helpers (token in `ml/notify_config.json`, gitignored). Parent + results page IDs are in that config.
 4. **Source code comments** — Verify that comments in modified functions/classes match current behavior. Remove or fix any stale comments.
 
 > Rule of thumb: a code/structure change is not "done" until README + CLAUDE.md + Notion reflect it.
@@ -23,20 +23,26 @@ AIS anomaly detection system for ships. Consists of an OpenCPN plugin (C++), ML 
 
 ```
 JB-Pirate-King/
-├── ml/                    # ML pipeline (training & evaluation)
-│   ├── pipeline.py        # Multi-model training/detection rate comparison ★
-│   ├── preprocess.py      # AIS preprocessing (.csv / .csv.zst / .zip; old & new column formats)
-│   ├── train_benchmark.py # Unsupervised model training (9 models)
-│   ├── eval_anomaly.py    # Detection rate / false positive evaluation
-│   ├── compare_models.py  # Model comparison tool
-│   ├── run_pipeline.py    # Pipeline runner script
-│   ├── download_ais.py    # AIS data downloader
-│   ├── eval_rule_gen.py   # Rule-based evaluation generator
-│   └── deploy/            # Deployment model/scaler/threshold files
-├── ais_ids_pi/            # OpenCPN plugin (C++)
-│   └── src/ais_ids.cpp    # Plugin main source
-├── s-c/                   # Local server + GUI
-└── aivdm_gen/             # AIVDM test signal generator
+├── ml/                         # ML pipeline (training & evaluation)
+│   ├── core/                   # Core ML logic
+│   │   ├── pipeline.py         # Multi-model training/detection rate comparison ★
+│   │   ├── preprocess.py       # AIS preprocessing (.csv / .csv.zst / .zip)
+│   │   ├── train_benchmark.py  # Unsupervised model training (9 models)
+│   │   ├── eval_anomaly.py     # Detection rate / false positive evaluation
+│   │   └── feature_engineer.py # DCdetect feature engineering (Greedy + ONNX export)
+│   ├── integrations/           # External integrations
+│   │   ├── slack_bot.py        # Slack bot (logs, button approval, Claude queries)
+│   │   ├── sheets.py           # Google Sheets logging
+│   │   ├── notify.py           # Discord webhook + Notion reports
+│   │   └── git_manager.py      # Auto branch creation / commit
+│   ├── orchestrator.py         # Full pipeline entry point (Slack gates + Sheets + git)
+│   ├── auto_feat_eng.py        # FE automation loop (dataset build → repeated FE)
+│   ├── build_3yr_dataset.py    # 2023–2025 balanced dataset builder
+│   └── download_ais.py         # AIS raw data downloader
+├── ais_ids_pi/                 # OpenCPN plugin (C++)
+│   └── src/ais_ids.cpp         # Plugin main source
+├── s-c/                        # Local server + GUI
+└── aivdm_gen/                  # AIVDM test signal generator
 ```
 
 ---
@@ -68,7 +74,7 @@ D:\
     └── feat_eng\ , feat_eng_iter\     # feature-engineering reports (JSON/txt)
 ```
 
-### Input Format Support (preprocess.py)
+### Input Format Support (core/preprocess.py)
 - Accepts `.csv`, `.csv.zst` (2025+), and `.zip` (Marine Cadastre ≤2024, one CSV inside; corrupt zips are skipped with a warning).
 - Normalizes old vs new column headers (case/underscore-insensitive): `MMSI/BaseDateTime/LAT/LON/VesselType/Status` ↔ `mmsi/base_date_time/latitude/longitude/vessel_type/status`.
 - Timestamps parsed with `datetime.fromisoformat` (handles both `YYYY-MM-DD HH:MM:SS` and ISO `...T...`).
@@ -77,10 +83,10 @@ D:\
 
 ```bash
 # Step 1: Per-day preprocessing (a dir mixes .csv/.csv.zst/.zip automatically)
-python ml/preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
+python ml/core/preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
 
 # Step 2: Yearly merge
-python ml/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
+python ml/core/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
     --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
 ```
 
@@ -117,53 +123,94 @@ SEQ_LEN = 10
 
 ---
 
+## Pipeline Architecture
+
+### 두 가지 실행 경로
+
+| 경로 | 파일 | 용도 |
+|---|---|---|
+| 단순 | `core/pipeline.py` | Slack/git 없이 학습+평가만. 빠른 실험용. |
+| 풀 오케스트레이터 | `orchestrator.py` | Slack 승인 게이트 + Sheets + git 자동화. 실제 운용. |
+
+### 풀 오케스트레이터 흐름
+
+```
+[전처리] → [베이스학습] → [평가] → [피처 엔지니어링 학습]
+  각 단계마다: 실행 → Claude 분석 → Slack 승인 (approve / retry / stop)
+```
+
+- **전처리** (`core/preprocess.py`): raw AIS → 파생 피처 12개 추가 → CSV. `--skip_preprocess`로 스킵 가능.
+- **베이스학습** (`core/pipeline.py --train`): dcdetect를 **12개 고정 피처**로 학습. baseline 측정용, **배포용 아님**.
+- **평가** (`core/pipeline.py --eval`): 32개 공격 시나리오 탐지율 측정 (FP≈1%/5%/10% 기준).
+- **피처 엔지니어링 학습** (`core/feature_engineer.py`): **배포용 모델 생성 단계.** Greedy Forward Selection으로 후보 피처 채택 후 `.onnx` / `scaler.json` / `threshold.txt` export.
+
+### 부가 시스템
+
+- **git**: run마다 `dcdetect_001`, `dcdetect_002`... 브랜치 자동 생성 → FE 완료 후 커밋 → develop 복귀
+- **Google Sheets**: `dcdetect` 모델탭 / `실행요약` / `상세로그` 3탭 자동 기록
+- **Slack**: 각 단계 결과 + Claude 분석 + 승인 버튼 (`integrations/slack_bot.py`)
+- **Claude 분석**: 각 단계 완료 후 `claude -p` CLI 호출 → 결과 평가 + continue/retry/stop 추천
+- **fe_state.json**: 이전 run 채택 피처 저장 → 다음 run `--initial_extra`로 자동 전달 (수렴까지 반복)
+
+---
+
 ## Key Pipeline Commands
 
 ```bash
-# Per-day preprocess then merge (see steps above)
+# 풀 오케스트레이터 (실제 운용) — 반드시 -m 플래그로 실행
+python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
+  --data_file "D:/ais_data/preprocessed/ais_preprocessed_3yr.csv" \
+  --base_dir "D:/" --skip_preprocess
 
-# Multi-model training + evaluation
-python ml/pipeline.py --train --eval --models conv1d tranad dcdetect --epochs 10 --n_anom 200 --fp_targets 1
+# 단순 학습+평가 (실험용)
+python ml/core/pipeline.py --train --eval --models conv1d tranad dcdetect --epochs 10 --n_anom 200 --fp_targets 1
 
-# Skip already-trained models
-python ml/pipeline.py --train --eval --models conv1d tranad dcdetect --skip_trained
+# 평가만
+python ml/core/pipeline.py --eval --models conv1d dcdetect
 
-# Evaluation only
-python ml/pipeline.py --eval --models conv1d dcdetect
-
-# Use a different base directory (default: D:\)
-python ml/pipeline.py --train --eval --models conv1d --base_dir E:\
+# 이미 학습된 모델 스킵
+python ml/core/pipeline.py --train --eval --models conv1d tranad dcdetect --skip_trained
 ```
 
-pipeline.py defaults:
+**Claude Code에서 orchestrator 실행 시**: `run_in_background`로 실행할 것. 각 단계 승인은 Slack 버튼이 처리하므로 출력을 스트리밍하지 않음. 에러 시에만 로그 파일 확인.
+
+orchestrator.py defaults:
+- `--model`: `dcdetect`
+- `--epochs`: `5`
+- `--max_mmsi`: `500` (3yr 캐시 재사용하려면 `3000` 명시)
+- `--data_file`: `D:/ais_data/preprocessed/2025/ais_preprocessed_2025.csv`
+- `--base_dir`: `D:/`
+
+core/pipeline.py defaults:
 - `--base_dir`: `D:\` — all model files and output go under this root
 - `--raw_data`: `D:\ais_data\raw\2025`
 - `--data_file`: `D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv`
 
 ---
 
-## Feature Engineering (`feature_engineer.py` + `auto_feat_eng.py`)
+## Feature Engineering (`core/feature_engineer.py` + `auto_feat_eng.py`)
 
 Goal: find derived features that raise DCdetect detection rate, then export a deployable model trained on that exact feature set.
 
 - **`feature_engineer.py`** — one FE pass: Greedy Forward Selection (add a candidate feature only if detection rate gains ≥ `--min_gain`, default 3.0pp) + Permutation Importance on the best set.
-  - `--export_dir DIR` — after selection, trains `model_best` on the best feature set and writes deployable **`model_dcdetect.onnx` / `scaler_dcdetect.json` (records `features`/`min`/`max`) / `threshold_dcdetect.txt`** to DIR. The scaler `features` array is the authoritative feature order — the C++ plugin must match it.
+  - `--export_dir DIR` — after selection, trains `model_best` on the best feature set and writes deployable **`model_dcdetect.onnx` / `scaler_dcdetect.json` (records `features`/`min`/`max`/`clip_lo`/`clip_hi`) / `threshold_dcdetect.txt`** to DIR. The scaler `features` array is the authoritative feature order — the C++ plugin must match it.
+  - `--holdout_file FILE` — separate preprocessed CSV used **only** for FP=1% threshold measurement. Must be disjoint from `--input` (different dates/vessels). If omitted, a warning is shown and synthetic normals are used (less accurate).
   - Other opts: `--max_mmsi`, `--epochs`, `--n_anom`, `--weak_floor`/`--weak_weight` (up-weight weak scenarios in the objective), `--max_feat` (cap; 16 keeps nhead=8), `--initial_extra` (start set), `--out_json`.
-  - **Sequence cache**: first load of the big CSV is pickled to `<input>.s<max_mmsi>_seed<SEED>_…seqs.pkl`; later runs/iterations reuse it instead of re-parsing. Deterministic (fixed SEED).
-- **`auto_feat_eng.py`** — automation loop: (optionally wait for downloads →) build 3yr dataset → run `feature_engineer.py` up to `--max_iter` times, chaining each iteration's best set as the next `--initial_extra`, stopping when no new feature is adopted. Sends Discord + Notion per-iteration reports. Defaults: `MAX_MMSI=3000, EPOCHS=5, N_ANOM=150, MAX_ITER=5, EXPORT_DIR=D:\ais_models\dcdetect`.
+  - **Sequence cache**: training data is pickled to `<input>.s<max_mmsi>_seed<SEED>_L{SEQ_LEN}_b{SEQ_BREAK}_c{MAX_SEQ_PER_MMSI}.train.pkl`; holdout is pickled to `<holdout_file>_L{SEQ_LEN}_b{SEQ_BREAK}.holdout.pkl`. Later runs reuse both. Deterministic (fixed SEED).
+- **`auto_feat_eng.py`** — automation loop: (optionally wait for downloads →) build 3yr dataset → run `feature_engineer.py` up to `--max_iter` times, chaining each iteration's best set as the next `--initial_extra`, stopping when no new feature is adopted. Defaults: `MAX_MMSI=3000, EPOCHS=5, N_ANOM=150, MAX_ITER=5, EXPORT_DIR=D:\ais_models\dcdetect`.
   - Run: `python ml/auto_feat_eng.py --no_wait --skip_build` (dataset already built). Use `PYTHONUNBUFFERED=1` for live logs.
 
-### Evaluation & Threshold (target FP = 1% on HELD-OUT real normal sequences)
+### Evaluation & Threshold (target FP = 1% on held-out real normal sequences)
 - Detection rate and the deployed threshold are BOTH pinned to a **1% false-positive rate on real normal AIS sequences**, NOT synthetic data.
-- **Held-out normal set (no leakage):** `load_raw_seqs(...)` returns `(train_seqs, eval_normal_seqs)`. It splits the month-balanced MMSIs at the **MMSI level** — `--eval_ratio` (default 0.2) of MMSIs per `YYYY-MM` bucket are reserved ONLY for FP measurement and never used in training. So eval-normal is itself month-balanced and disjoint from training vessels.
-- `evaluate()` scores `eval_normal_seqs` and sets `fp1_thr = np.percentile(normal_scores, 99)` (top 1% → FP 1%); detection rate = % of synthetic attack sequences scoring above it. Training uses `train_seqs` only.
-- `--export_dir` writes `threshold_dcdetect.txt` via `compute_fp_threshold(eval_normal_seqs, ..., fp_pct=1.0)` — the **same** 99th-percentile-of-held-out-normal value, so the deployed plugin threshold matches the reported FP=1% (the old 95th-percentile `compute_threshold` ≈ 5% FP was removed).
+- **Holdout architecture (no leakage):** `load_raw_seqs(input, max_mmsi)` returns 100% of sampled MMSIs as `train_seqs`. FP measurement uses a **completely separate** preprocessed file via `--holdout_file` → `load_holdout_seqs(holdout_file)` reads all MMSIs from that file (no sampling cap). The holdout file must cover dates/vessels not in the training data.
+- `evaluate()` scores `eval_normal_seqs` (from holdout) and sets `fp1_thr = np.percentile(normal_scores, 99)` (top 1% → FP 1%); detection rate = % of synthetic attack sequences scoring above it.
+- `--export_dir` writes `threshold_dcdetect.txt` via `compute_fp_threshold(eval_normal_seqs, ..., fp_pct=1.0)` — the same 99th-percentile-of-holdout-normal, so the deployed plugin threshold matches the reported FP=1%.
 - To change the target FP, pass a different `fp_pct` (threshold = `percentile(eval_normal_scores, 100 - fp_pct)`).
 
 ### 3-Year Balanced Dataset (`build_3yr_dataset.py`)
 - Output: `D:\ais_data\preprocessed\ais_preprocessed_3yr.csv` (~10.9 GB).
 - Purpose: avoid confirmation bias from a single day/season. Picks N days/month across 2023–2024–2025.
-- **MMSI sampling (in `load_raw_seqs`)**: each MMSI is bucketed by its dominant `YYYY-MM`; `max_mmsi` is split evenly across active months (random within bucket, fixed SEED), so no year/season dominates. The balanced MMSIs are then split into train vs held-out eval-normal (see "Evaluation & Threshold" above). Sequences: SEQ_LEN=10, split on `dt ≥ 600s`, capped at 500/MMSI.
+- **MMSI sampling (in `load_raw_seqs`)**: each MMSI is bucketed by its dominant `YYYY-MM`; `max_mmsi` is split evenly across active months (random within bucket, fixed SEED), so no year/season dominates. All sampled MMSIs go to training (100%). Sequences: SEQ_LEN=10, split on `dt ≥ 600s`, capped at 500/MMSI.
 
 ### Current feature status
 - Base = 12 features. FE validated 16 = 12 base + `accel, heading_rate, vec_sog_diff, heading_change` (~88.8%); adding more (e.g. `lowspeed_crab`) did not help.

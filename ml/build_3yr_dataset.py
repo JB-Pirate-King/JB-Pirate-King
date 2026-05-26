@@ -38,7 +38,7 @@ from collections import defaultdict
 sys.stdout.reconfigure(encoding="utf-8")
 
 _ML_DIR = os.path.dirname(os.path.abspath(__file__))
-_PREPROCESS = os.path.join(_ML_DIR, "preprocess.py")
+_PREPROCESS = os.path.join(_ML_DIR, "core", "preprocess.py")
 
 # 파일명에서 날짜 추출:  ais-2025-09-14.csv.zst  /  AIS_2024_06_15.zip
 _DATE_RE = re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})")
@@ -235,22 +235,6 @@ def main():
                                  args.mmsi_per_day)
     elapsed = _time.time() - t0
 
-    # Discord 완료 알림
-    try:
-        from notify import notify_iteration
-        notify_iteration(
-            title="📦 3년치 데이터셋 빌드 완료",
-            summary=(
-                f"연도: {args.years}\n"
-                f"선택 일자: {len(all_selected)}개 ({args.days_per_month}일/월)\n"
-                f"처리 일자: {n_done}개\n"
-                f"출력: {args.out}\n"
-                f"소요: {elapsed/60:.1f}분"
-            ),
-            color=0x2ECC71,
-        )
-    except Exception as e:
-        print(f"  [알림] 건너뜀: {e}")
 
 
 if __name__ == "__main__":

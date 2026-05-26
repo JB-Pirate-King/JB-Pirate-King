@@ -20,14 +20,16 @@
 비지도(오토인코더 계열) 9종 모델을 지원한다 (지도 학습 모델은 develop에서 제거됨).
 
 ```bash
-# 비지도 학습
-python ml/train_benchmark.py --model dcdetect
+# 풀 오케스트레이터 (Slack 승인 게이트 + MLflow + git 자동화)
+python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
+  --data_file "D:/ais_data/preprocessed/ais_preprocessed_3yr.csv" \
+  --base_dir "D:/" --skip_preprocess
 
-# 멀티모델 학습 + 탐지율 비교
-python ml/pipeline.py --train --eval --models dcdetect tranad conv1d
+# 단순 학습+평가 (실험용)
+python ml/core/pipeline.py --train --eval --models dcdetect tranad conv1d
 
 # 평가
-python ml/eval_anomaly.py --model dcdetect
+python ml/core/eval_anomaly.py --model dcdetect
 
 # 피처 엔지니어링 자동화 (3년 균형 데이터셋 → Greedy 선택 → 배포 모델 export)
 python ml/auto_feat_eng.py --no_wait --skip_build
