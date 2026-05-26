@@ -314,74 +314,7 @@ def make_loaders(tensor: torch.Tensor, batch_size: int):
     return train_loader, val_loader
 
 
-def _load_raw_seqs_for_threshold(data_file: str, n: int = 10000) -> list:
-    """threshold 계산용 raw 정상 시퀀스 로드 (스케일링 전)."""
-    mmsi_rows: dict = defaultdict(list)
-    dt_idx = FEATURES.index("dt")
-    with open(data_file, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            if i >= 600_000:
-                break
-            try:
-                record = [float(row[col]) for col in FEATURES]
-                mmsi_rows[row["mmsi"]].append(record)
-            except (ValueError, KeyError):
-                continue
-    all_seqs = []
-    for records in mmsi_rows.values():
-        seg, cur = [], [records[0]]
-        for rec in records[1:]:
-            if rec[dt_idx] >= SEQ_BREAK_DT:
-                seg.append(cur); cur = [rec]
-            else:
-                cur.append(rec)
-        seg.append(cur)
-        for s in seg:
-            if len(s) < SEQ_LEN:
-                continue
-            for i in range(len(s) - SEQ_LEN + 1):
-                all_seqs.append(s[i:i + SEQ_LEN])
-    random.shuffle(all_seqs)
-    return all_seqs[:n]
-
-
-def calc_threshold(model, val_loader, device, threshold_path: str = "threshold.txt",
-                   data_file: str = None, scaler_path: str = None) -> float:
-    """실제 정상 시퀀스 FP=1% 기준으로 threshold 저장.
-    data_file/scaler_path 없으면 학습 검증셋 95th percentile로 fallback."""
-    if data_file and scaler_path and os.path.exists(data_file) and os.path.exists(scaler_path):
-        with open(scaler_path) as f:
-            sc = json.load(f)
-        mins     = sc["min"];  maxs    = sc["max"]
-        clip_lo  = sc.get("clip_lo"); clip_hi = sc.get("clip_hi")
-
-        def _scale_and_score(seq):
-            scaled = []
-            for row in seq:
-                s_row = []
-                for i, val in enumerate(row):
-                    v = max(clip_lo[i], min(clip_hi[i], val)) if clip_lo else val
-                    denom = maxs[i] - mins[i]
-                    s_row.append((v - mins[i]) / denom if denom != 0 else 0.0)
-                scaled.append(s_row)
-            x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
-            with torch.no_grad():
-                out = model(x)
-                return float(((out - x) ** 2).mean())
-
-        raw_seqs = _load_raw_seqs_for_threshold(data_file)
-        if raw_seqs:
-            model.eval()
-            scores = [_scale_and_score(seq) for seq in raw_seqs]
-            thr = float(np.percentile(scores, 99))   # FP=1%
-            with open(threshold_path, "w") as f:
-                f.write(str(thr))
-            print(f"  임계값: {thr:.6f}  (실제 정상 {len(scores):,}개 FP=1% 기준)")
-            print(f"  임계값 저장: {threshold_path}")
-            return thr
-
-    # fallback: 학습 검증셋 95th percentile
+def calc_threshold(model, val_loader, device, threshold_path: str = "threshold.txt") -> float:
     model.eval()
     errors = []
     with torch.no_grad():
@@ -395,7 +328,7 @@ def calc_threshold(model, val_loader, device, threshold_path: str = "threshold.t
     thr = errors[min(idx, len(errors) - 1)]
     with open(threshold_path, "w") as f:
         f.write(str(thr))
-    print(f"  임계값: {thr:.6f}  (검증셋 {100 - THRESHOLD_PERCENTILE}th percentile fallback)")
+    print(f"  임계값: {thr:.6f}  (상위 {100 - THRESHOLD_PERCENTILE}%, 검증 데이터 기준)")
     print(f"  임계값 저장: {threshold_path}")
     return thr
 
@@ -1237,7 +1170,7 @@ def run_model(model_name: str, tensor: torch.Tensor,
               epochs: int, lr: float, batch_size: int,
               patience: int, device: torch.device,
               onnx_path: str, scaler_path: str, threshold_path: str,
-              full_tensor: torch.Tensor = None, data_file: str = None):
+              full_tensor: torch.Tensor = None):
     # full_tensor: sklearn 모델용 (train/val 분리 전 전체 텐서)
     if full_tensor is None:
         full_tensor = tensor
@@ -1291,8 +1224,7 @@ def run_model(model_name: str, tensor: torch.Tensor,
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    calc_threshold(model, val_loader, device, threshold_path,
-                   data_file=data_file, scaler_path=scaler_path)
+    calc_threshold(model, val_loader, device, threshold_path)
     export_onnx(model, device, onnx_path)
     return model
 
@@ -1344,8 +1276,7 @@ def main():
             print(f"  스케일러 복사: {first_scaler} → {scaler_path}")
 
         run_model(name, tensor, epochs, lr, batch_size, patience, device,
-                  onnx_path, scaler_path, threshold_path, full_tensor=tensor,
-                  data_file=args.input)
+                  onnx_path, scaler_path, threshold_path, full_tensor=tensor)
 
     print(f"\n완료! 전체 소요: {time.time() - t0:.1f}s")
     print(f"\n생성된 파일: ({args.output_dir})")

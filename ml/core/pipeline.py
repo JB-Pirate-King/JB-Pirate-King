@@ -160,7 +160,7 @@ def model_exists(name: str) -> bool:
 
 
 def load_model(name: str):
-    """ONNX 세션, 스케일러(mins/maxs/clip_lo/clip_hi), 저장 임계값 반환"""
+    """ONNX 세션, 스케일러(mins/maxs), 저장 임계값 반환"""
     model_f, scaler_f, threshold_f = _model_paths(name)
     for p in [model_f, scaler_f, threshold_f]:
         if not os.path.exists(p):
@@ -168,13 +168,10 @@ def load_model(name: str):
     session = ort.InferenceSession(model_f, providers=["CPUExecutionProvider"])
     with open(scaler_f) as f:
         j = json.load(f)
-    mins    = j["min"]
-    maxs    = j["max"]
-    clip_lo = j.get("clip_lo")
-    clip_hi = j.get("clip_hi")
+    mins, maxs = j["min"], j["max"]
     with open(threshold_f) as f:
         threshold = float(f.readline())
-    return session, mins, maxs, clip_lo, clip_hi, threshold
+    return session, mins, maxs, threshold
 
 
 # ── 추론 ──────────────────────────────────────────────────────────────
@@ -248,8 +245,7 @@ def load_raw_normal_seqs(data_file: str = _DEFAULT_DATA_FILE,
 
 # ── 단일 모델 전체 시나리오 스코어 계산 ──────────────────────────────
 def compute_scores(session, mins, maxs, is_supervised: bool,
-                   n_anom: int, raw_seqs=None, n_normal: int = 3000,
-                   clip_lo=None, clip_hi=None):
+                   n_anom: int, raw_seqs=None, n_normal: int = 3000):
     """모델 하나의 전체 시나리오 스코어를 수집.
 
     Returns
@@ -261,12 +257,12 @@ def compute_scores(session, mins, maxs, is_supervised: bool,
     if raw_seqs is not None:
         pool = raw_seqs[:n_normal] if n_normal and n_normal < len(raw_seqs) else raw_seqs
         normal_scores = [
-            infer_score(session, scale_seq(seq, mins, maxs, clip_lo, clip_hi), is_supervised)
+            infer_score(session, scale_seq(seq, mins, maxs), is_supervised)
             for seq in pool
         ]
     else:
         normal_scores = [
-            infer_score(session, scale_seq(make_normal_seq(), mins, maxs, clip_lo, clip_hi), is_supervised)
+            infer_score(session, scale_seq(make_normal_seq(), mins, maxs), is_supervised)
             for _ in range(n_normal or 3000)
         ]
 
@@ -274,7 +270,7 @@ def compute_scores(session, mins, maxs, is_supervised: bool,
     anom_makers = [(n, mk) for n, mk, ia, _ in SCENARIO_MAKERS if ia]
     scenario_scores = {}
     for sc_name, maker in tqdm(anom_makers, desc="  시나리오", leave=False, unit="개"):
-        seqs = [scale_seq(maker(), mins, maxs, clip_lo, clip_hi) for _ in range(n_anom)]
+        seqs = [scale_seq(maker(), mins, maxs) for _ in range(n_anom)]
         scenario_scores[sc_name] = [
             infer_score(session, seq, is_supervised) for seq in seqs
         ]
@@ -420,20 +416,28 @@ def format_comparison_table(model_names, fp_rates, det_by_threshold,
     lines.append("  " + fp_row)
     lines.append("  " + _sep())
 
-    all_sums = {m: [] for m in model_names}
-    for sc_name, _ in anom_rows:
-        row = rjust(sc_name, W_SC)
+    prev_h = None
+    t_sums = {m: [] for m in model_names}
+    h_sums = {m: [] for m in model_names}
+    for sc_name, is_holdout in anom_rows:
+        if prev_h is not None and is_holdout != prev_h:
+            lines.append("  " + _sep())
+            lines.append("  ── 홀드아웃 (학습 미포함) ──")
+        prefix = "[H] " if is_holdout else "    "
+        row = rjust(prefix + sc_name, W_SC)
         for m in model_names:
             v = det_by_threshold.get(m, {}).get(sc_name, float("nan"))
             row += _fmt(v, W_COL)
-            all_sums[m].append(v)
+            (h_sums if is_holdout else t_sums)[m].append(v)
         lines.append("  " + row)
+        prev_h = is_holdout
 
     lines.append("  " + _sep())
-    row = rjust("전체 평균", W_SC)
-    for m in model_names:
-        row += _fmt(_avg(all_sums[m]), W_COL)
-    lines.append("  " + row)
+    for label, sd in [("학습 평균", t_sums), ("홀드아웃 평균 ← 일반화", h_sums)]:
+        row = rjust(label, W_SC)
+        for m in model_names:
+            row += _fmt(_avg(sd[m]), W_COL)
+        lines.append("  " + row)
     lines.append("  " + _sep("═"))
 
     # ────────────────────────────────────────────────────────────
@@ -446,20 +450,28 @@ def format_comparison_table(model_names, fp_rates, det_by_threshold,
         lines.append("  " + _header())
         lines.append("  " + _sep())
 
-        all_fp = {m: [] for m in model_names}
-        for sc_name, _ in anom_rows:
-            row = rjust(sc_name, W_SC)
+        prev_h = None
+        t_fp = {m: [] for m in model_names}
+        h_fp = {m: [] for m in model_names}
+        for sc_name, is_holdout in anom_rows:
+            if prev_h is not None and is_holdout != prev_h:
+                lines.append("  " + _sep())
+                lines.append("  ── 홀드아웃 ──")
+            prefix = "[H] " if is_holdout else "    "
+            row = rjust(prefix + sc_name, W_SC)
             for m in model_names:
                 v = model_dr.get(m, {}).get(sc_name, float("nan"))
                 row += _fmt(v, W_COL)
-                all_fp[m].append(v)
+                (h_fp if is_holdout else t_fp)[m].append(v)
             lines.append("  " + row)
+            prev_h = is_holdout
 
         lines.append("  " + _sep())
-        row = rjust("전체 평균", W_SC)
-        for m in model_names:
-            row += _fmt(_avg(all_fp[m]), W_COL)
-        lines.append("  " + row)
+        for label, sd in [("학습 평균", t_fp), ("홀드아웃 평균 ← 일반화", h_fp)]:
+            row = rjust(label, W_SC)
+            for m in model_names:
+                row += _fmt(_avg(sd[m]), W_COL)
+            lines.append("  " + row)
         lines.append("  " + _sep("═"))
 
     # ────────────────────────────────────────────────────────────
@@ -471,10 +483,11 @@ def format_comparison_table(model_names, fp_rates, det_by_threshold,
     lines.append("\n  [모델별 종합 요약]")
     header_row = f"  {'모델':<22} {'오탐율':>7}"
     for fp_t in sorted(det_at_fp):
-        header_row += rjust(f"FP{fp_t:.0f}%평균", fp_col_w)
+        header_row += rjust(f"FP{fp_t:.0f}%학습평균", fp_col_w)
+    header_row += rjust("홀드아웃(최고FP)", fp_col_w + 2)
     header_row += rjust("학습시간", 10)
     lines.append(header_row)
-    lines.append("  " + "─" * (22 + 8 + fp_col_w * len(det_at_fp) + 10))
+    lines.append("  " + "─" * (22 + 8 + fp_col_w * len(det_at_fp) + fp_col_w + 12))
 
     for m in model_names:
         fp_str = f"{fp_rates[m]:.1f}%" if m in fp_rates else "-"
@@ -483,9 +496,21 @@ def format_comparison_table(model_names, fp_rates, det_by_threshold,
             vals = [v for v in det_at_fp[fp_t].get(m, {}).values()
                     if not math.isnan(v)]
             fp_avgs += rjust(f"{np.mean(vals):.1f}%" if vals else "-", fp_col_w)
+        if best_fp is not None:
+            ho_vals = [
+                v for sc, v in det_at_fp[best_fp].get(m, {}).items()
+                if any(sc == n and ih for n, _, _, ih in SCENARIO_MAKERS)
+                and not math.isnan(v)
+            ]
+            ho_str = f"{np.mean(ho_vals):.1f}%" if ho_vals else "-"
+        else:
+            ho_str = "-"
         t_sec = train_time.get(m, 0.0)
         t_str = f"{t_sec/60:.1f}분" if t_sec > 0 else "-"
-        lines.append(f"  {m:<22} {fp_str:>7}{fp_avgs}{rjust(t_str, 10)}")
+        lines.append(
+            f"  {m:<22} {fp_str:>7}{fp_avgs}"
+            f"{rjust(ho_str, fp_col_w + 2)}{rjust(t_str, 10)}"
+        )
 
     lines.append("")
     return "\n".join(lines)
@@ -611,8 +636,6 @@ def main():
     parser.add_argument("--fp_targets",    type=float, nargs="+",
                         default=[1.0, 5.0, 10.0],
                         help="비교 기준 오탐율 목표값 %% (기본: 1 5 10)")
-    parser.add_argument("--holdout_file",  default=None,
-                        help="FP 측정용 별도 전처리 파일 (미지정 시 data_file 사용)")
 
     # 출력
     parser.add_argument("--base_dir", type=str, default="D:\\",
@@ -755,11 +778,10 @@ def main():
 
     print(f"\n[평가 단계]  모델 {len(eval_models)}개: {', '.join(eval_models)}")
 
-    # 실제 정상 시퀀스 로드 (FP 측정용 홀드아웃)
+    # 실제 정상 시퀀스 로드 (raw)
     n_eval_normal = None if args.n_eval_normal == 0 else args.n_eval_normal
-    fp_source = args.holdout_file or args.data_file
-    print(f"\n정상 시퀀스 로드 중 ({'홀드아웃 파일' if args.holdout_file else '학습 데이터 파일'})...")
-    raw_seqs = load_raw_normal_seqs(data_file=fp_source, n_seqs=n_eval_normal)
+    print("\n정상 시퀀스 로드 중...")
+    raw_seqs = load_raw_normal_seqs(data_file=args.data_file, n_seqs=n_eval_normal)
     if raw_seqs is None:
         print(f"  ⚠ 전처리 CSV 없음 → 합성 정상 시퀀스 사용")
 
@@ -771,7 +793,7 @@ def main():
     for idx, name in enumerate(eval_models, 1):
         print(f"\n  ({idx}/{len(eval_models)}) {name} 스코어 계산 중...")
         try:
-            session, mins, maxs, clip_lo, clip_hi, threshold = load_model(name)
+            session, mins, maxs, threshold = load_model(name)
         except FileNotFoundError as e:
             print(f"    ✗ {e}")
             continue
@@ -782,8 +804,6 @@ def main():
             n_anom=args.n_anom,
             raw_seqs=raw_seqs,
             n_normal=n_eval_normal or 3000,
-            clip_lo=clip_lo,
-            clip_hi=clip_hi,
         )
         all_normal_scores[name]   = n_sc
         all_scenario_scores[name] = s_sc
