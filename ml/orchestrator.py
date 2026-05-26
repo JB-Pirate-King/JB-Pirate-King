@@ -73,7 +73,7 @@ def run_cmd(cmd: list[str], progress_cb=None, interactive=False) -> tuple[int, s
     for line in proc.stdout:
         line = line.rstrip()
         # tqdm progress bar lines are handled by progress_cb; skip printing to avoid flooding stdout
-        is_tqdm = bool(re.search(r"Epoch\s+\d+/\d+:\s+[\d.]+%\|", line))
+        is_tqdm = bool(re.search(r"Epoch\s+\d+/\s*\d+:\s+[\d.]+%\|", line))
         if not is_tqdm:
             print(line, flush=True)
         output_lines.append(line)
@@ -360,7 +360,7 @@ def stage_train(bot, sheet, branch, args, step_info: tuple):
         # 에폭 진행 → Slack 알림
         last_epoch_reported = [0]
         def train_progress(line, proc=None):
-            m = re.search(r"Epoch\s+(\d+)/(\d+)\s*\|.*train=", line)
+            m = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*train=", line)
             if m:
                 cur, total = int(m.group(1)), int(m.group(2))
                 pct = int(cur / total * 100)
@@ -586,6 +586,18 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
             else:
                 bot.log(f"✅ 채택! `{feat_name}` — {feat_desc}  {s}", "피처개선")
             return
+        # 에폭 진행 알림 (10% 단위)
+        me = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*train=", line)
+        if me:
+            ep, total_ep = int(me.group(1)), int(me.group(2))
+            pct = int(ep / total_ep * 100)
+            milestone = (pct // 25) * 25  # FE는 25% 단위 (후보 많아서)
+            if milestone > 0 and ep == round(total_ep * milestone / 100):
+                elapsed_now = time.time() - t0
+                bot.log(
+                    f"🧠 FE 학습 {milestone}% — Epoch {ep}/{total_ep}  (경과 {elapsed_now:.0f}s)",
+                    "피처개선"
+                )
         # 학습 시작 알림
         if s.startswith("+ ") and "학습 중" in s:
             fe_candidate_count[0] += 1
