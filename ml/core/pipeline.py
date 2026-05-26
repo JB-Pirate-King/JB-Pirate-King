@@ -627,6 +627,8 @@ def main():
     parser.add_argument("--max_mmsi",     type=int,   default=None)
     parser.add_argument("--skip_trained", action="store_true",
                         help="이미 학습된 모델은 재학습 건너뜀")
+    parser.add_argument("--extra_features", nargs="*", default=[],
+                        help="학습에 추가할 피처 목록 (train_benchmark --extra_features로 전달)")
 
     # 평가 옵션
     parser.add_argument("--n_anom",        type=int,   default=500,
@@ -737,6 +739,8 @@ def main():
         if args.max_mmsi:     extra += ["--max_mmsi",   str(args.max_mmsi)]
         if args.n_normal:     extra += ["--n_normal",   str(args.n_normal)]
         if args.n_anom_train: extra += ["--n_anom",     str(args.n_anom_train)]
+        if args.extra_features:
+            extra += ["--extra_features"] + args.extra_features
         # --output_dir 은 모델별로 다르므로 run_training 내부에서 처리
 
         print(f"[학습 단계]  모델 {len(model_names)}개\n")
