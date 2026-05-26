@@ -160,7 +160,7 @@ def _parse_eval_full(out: str) -> dict:
                "오탐율" not in name and "탐지율" not in name and \
                "평균" not in name and len(name) > 1:
                 sections[current]["scenarios"][name] = float(m.group(2))
-        if "전체 평균" in s:
+        if "전체 평균" in s or "학습 평균" in s:
             m2 = re.search(r"(\d+\.?\d*)%", s)
             if m2: sections[current]["avg"] = float(m2.group(1))
     return sections
