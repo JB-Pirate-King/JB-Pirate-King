@@ -305,6 +305,17 @@ def fe_adopted_analysis(out: str, adopted: list[str], det_rate,
 # 단계별 실행 함수
 # ─────────────────────────────────────────────
 
+_AUTO_APPROVE = False  # main()에서 --auto_approve 플래그로 설정
+
+
+def _wait(bot, stage: str, summary: list[str]) -> str:
+    """auto_approve 모드면 즉시 approve, 아니면 Slack 대기."""
+    if _AUTO_APPROVE:
+        bot.log(f"🤖 [auto_approve] {stage} → approve", stage)
+        return "approve"
+    return bot.wait_approval(stage, summary)
+
+
 def _step_header(cur: int, total: int, name: str, next_name: str) -> str:
     bar = "".join("■" if i <= cur else "□" for i in range(1, total + 1))
     return f"📍 [{cur}/{total}] {bar}  *{name}*  →  다음: {next_name}"
@@ -333,7 +344,7 @@ def stage_preprocess(bot, sheet, branch, args, step_info: tuple):
             bot.log_stage_result("전처리", summary, success=True)
             sheet.log(branch, "전처리", "완료", elapsed_sec=elapsed)
 
-        decision = bot.wait_approval("전처리", summary)
+        decision = _wait(bot,"전처리", summary)
         if decision == "approve":
             return True
         if decision == "stop":
@@ -405,7 +416,7 @@ def stage_train(bot, sheet, branch, args, step_info: tuple):
             sheet.log_train(branch, args.model, args.epochs, args.max_mmsi,
                             "완료", elapsed_sec=elapsed)
 
-        decision = bot.wait_approval("학습", summary)
+        decision = _wait(bot,"학습", summary)
         if decision == "approve":
             return True
         if decision == "stop":
@@ -513,7 +524,7 @@ def stage_eval(bot, sheet, branch, args, step_info: tuple):
             if fp1.get("scenarios"):
                 sheet.log_scenarios(branch, args.model, "FP1%", fp1["scenarios"])
 
-        decision = bot.wait_approval("평가", summary)
+        decision = _wait(bot,"평가", summary)
         if decision == "approve":
             return True
         if decision == "stop":
@@ -749,7 +760,8 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
          "--out_json", out_json,
          "--max_steps", "1",
          "--initial_extra"] + current_initial_extra + [
-         "--export_dir", str(Path(args.base_dir) / "ais_models" / args.model)]
+         "--export_dir", str(Path(args.base_dir) / "ais_models" / args.model),
+         "--min_gain", str(args.min_gain)]
         + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
         progress_cb=fe_progress
     )
@@ -762,7 +774,7 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
                    + fe_details + ["─"] + analysis)
         bot.log_stage_result("피처개선", summary, success=False)
         sheet.log_fe(branch, run_num, "실패", elapsed_sec=elapsed)
-        decision = bot.wait_approval(f"피처개선 Step {fe_step} 실패", summary)
+        decision = _wait(bot,f"피처개선 Step {fe_step} 실패", summary)
         return decision, None
 
     # 결과 파싱
@@ -898,7 +910,7 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
         return "approve", full_extra
     else:
         # 수렴 → 사용자 최종 확인
-        decision = bot.wait_approval(f"피처개선 Step {fe_step} — 수렴 완료 → 파이프라인 종료?", summary)
+        decision = _wait(bot,f"피처개선 Step {fe_step} — 수렴 완료 → 파이프라인 종료?", summary)
         return decision, None
 
 
@@ -959,7 +971,14 @@ def main():
     parser.add_argument("--skip_eval",       action="store_true")
     parser.add_argument("--holdout_file",    default=None,
                         help="FP=1%% 측정용 별도 전처리 파일 (학습 데이터와 완전 분리)")
+    parser.add_argument("--min_gain",        type=float, default=3.0,
+                        help="FE 채택 임계 목적점수 향상량 (기본: 3.0, 테스트 시 0.1)")
+    parser.add_argument("--auto_approve",    action="store_true",
+                        help="Slack 승인 대기 없이 모든 단계 자동 approve (테스트용)")
     args = parser.parse_args()
+
+    global _AUTO_APPROVE
+    _AUTO_APPROVE = args.auto_approve
 
     cfg = load_config()
 
