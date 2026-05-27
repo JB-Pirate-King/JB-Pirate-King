@@ -1,0 +1,9 @@
+{
+  "initial_extra": [
+    "accel",
+    "heading_rate",
+    "vec_sog_diff",
+    "heading_change",
+    "status_change"
+  ]
+}
