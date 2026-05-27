@@ -163,6 +163,7 @@ bool AIS_ML::LoadThreshold(const std::string &path, std::string &error_msg)
 
 // ── 피처 추가 (슬라이딩 윈도우) ──────────────────────────────────
 
+// [AUTO:push_impl_begin]
 void AIS_ML::PushFeature(int mmsi,
                           float sog, float cog, float heading,
                           float status, float dt, float dist_km,
@@ -184,6 +185,7 @@ void AIS_ML::PushFeature(int mmsi,
     if ((int)seq.size() > m_seq_len)
         seq.pop_front();
 }
+// [AUTO:push_impl_end]
 
 // ── 내부 헬퍼: 단일 세션 MSE 계산 ───────────────────────────────
 

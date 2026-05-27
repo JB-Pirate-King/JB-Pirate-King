@@ -178,6 +178,11 @@ void ais_ids::to_snapshot(AISTarget &target)
         float lat_speed = (dt > 0.0f) ? (float)((cur.lat - prev.lat) / dt) : 0.0f;
         float lon_speed = (dt > 0.0f) ? (float)((cur.lon - prev.lon) / dt) : 0.0f;
 
+        // [AUTO:extra_feats_begin]
+        // 추가 파생 피처 없음 (베이스 12개만 사용)
+        // [AUTO:extra_feats_end]
+
+        // [AUTO:push_calls_begin]
         // seq10 / seq5 모두 동일 피처 push (각자 deque 길이만 다름)
         if (ais_ml->IsLoaded())
             ais_ml->PushFeature(target.mmsi,
@@ -198,6 +203,7 @@ void ais_ids::to_snapshot(AISTarget &target)
                 cog_hdg_change,
                 speed_consistency,
                 lat_speed, lon_speed);
+        // [AUTO:push_calls_end]
     }
 }
 

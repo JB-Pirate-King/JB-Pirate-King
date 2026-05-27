@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -519,6 +520,128 @@ def stage_eval(bot, sheet, branch, args, step_info: tuple):
             return False
 
 
+# ─────────────────────────────────────────────
+# 플러그인 자동 빌드
+# ─────────────────────────────────────────────
+
+def _win_to_wsl(win_path: str) -> str:
+    """C:\\Users\\foo\\bar → /mnt/c/Users/foo/bar"""
+    p = win_path.replace("\\", "/")
+    if len(p) >= 2 and p[1] == ":":
+        drive = p[0].lower()
+        return f"/mnt/{drive}{p[2:]}"
+    return p
+
+
+def stage_build_plugin(bot, args, scaler_path: str) -> list[str]:
+    """FE 채택 후 플러그인 자동 빌드.
+
+    단계:
+      1. patch_plugin.py  → C++ 코드 자동 패치 (ML_FEATURE_COUNT / PushFeature)
+      2. 모델 파일        → ais_ids_pi/data/ 복사 (model.onnx / scaler.json / threshold.txt)
+      3. WSL cmake+make   → ais_ids_pi/*.tar.gz 생성
+
+    반환: git에 포함할 파일 경로 목록 (실패 단계까지 수집한 것 반환)
+    """
+    plugin_dir = Path("ais_ids_pi")
+    data_dir   = plugin_dir / "data"
+    data_dir.mkdir(exist_ok=True)
+    model_dir  = Path(args.base_dir) / "ais_models" / args.model
+
+    # ── 1. C++ 패치 ──────────────────────────────────────────────────
+    bot.log("🔧 플러그인 C++ 코드 패치 중...", "플러그인빌드")
+    ret, out = run_cmd([
+        sys.executable, "ml/core/patch_plugin.py",
+        "--scaler", scaler_path,
+        "--root", ".",
+    ])
+    if ret != 0:
+        bot.log(
+            f"❌ patch_plugin 실패 (플러그인 빌드 생략)\n{out[-300:]}",
+            "플러그인빌드",
+        )
+        return []
+    bot.log("✅ C++ 패치 완료", "플러그인빌드")
+
+    # ── 2. 모델 파일 복사 → ais_ids_pi/data/ ─────────────────────────
+    copy_ok = True
+    for src_name, dst_name in [
+        (f"model_{args.model}.onnx",    "model.onnx"),
+        (f"scaler_{args.model}.json",   "scaler.json"),
+        (f"threshold_{args.model}.txt", "threshold.txt"),
+    ]:
+        src = model_dir / src_name
+        dst = data_dir / dst_name
+        if src.exists():
+            shutil.copy2(src, dst)
+        else:
+            bot.log(f"⚠ 모델 파일 없음: {src}", "플러그인빌드")
+            copy_ok = False
+
+    cpp_files = [
+        "ais_ids_pi/include/ais_ml.h",
+        "ais_ids_pi/src/ais_ml.cpp",
+        "ais_ids_pi/src/ais_ids.cpp",
+    ]
+    data_files = [
+        str(data_dir / "model.onnx"),
+        str(data_dir / "scaler.json"),
+        str(data_dir / "threshold.txt"),
+    ]
+
+    if not copy_ok:
+        bot.log("❌ 모델 파일 복사 실패 (WSL 빌드 생략)", "플러그인빌드")
+        return [f for f in cpp_files + data_files if Path(f).exists()]
+    bot.log("✅ 모델 파일 복사 완료 → ais_ids_pi/data/", "플러그인빌드")
+
+    # ── 3. WSL 빌드 ──────────────────────────────────────────────────
+    bot.log("🔨 WSL 플러그인 빌드 시작 (cmake+make)...", "플러그인빌드")
+    repo_abs   = str(Path(".").resolve())
+    wsl_repo   = _win_to_wsl(repo_abs)
+    wsl_script = f"{wsl_repo}/ml/build_plugin_wsl.sh"
+
+    ret, out = run_cmd(["wsl", "-d", "Ubuntu-24.04", "bash", wsl_script, wsl_repo])
+    if ret != 0:
+        bot.log(
+            f"❌ WSL 빌드 실패 (tar.gz 없음, C++패치+모델만 커밋)\n{out[-400:]}",
+            "플러그인빌드",
+        )
+        return [f for f in cpp_files + data_files if Path(f).exists()]
+
+    # 마지막 ".tar.gz" 줄 캡처 → Windows 경로 변환
+    tarball_wsl = ""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.endswith(".tar.gz"):
+            tarball_wsl = line
+            break
+
+    tarball_win = None
+    if tarball_wsl.startswith("/mnt/"):
+        parts = tarball_wsl[5:].split("/", 1)
+        if len(parts) == 2:
+            drive, rest = parts[0].upper(), parts[1].replace("/", "\\")
+            tarball_win = f"{drive}:\\{rest}"
+
+    if not tarball_win or not Path(tarball_win).exists():
+        found = sorted(plugin_dir.glob("*.tar.gz"))
+        if found:
+            tarball_win = str(found[-1])
+
+    if tarball_win and Path(tarball_win).exists():
+        # tar.gz 는 *.tar.gz gitignore 규칙 적용 → 커밋 대상 아님
+        # 릴리스 시 `gh release create` 로 직접 첨부
+        bot.log(
+            f"✅ 플러그인 빌드 완료: {Path(tarball_win).name}\n"
+            f"  📦 릴리스 시 첨부: `gh release create vX.X.X {tarball_win} ...`",
+            "플러그인빌드",
+        )
+    else:
+        bot.log("⚠ tar.gz 위치 특정 불가 (빌드 성공했을 수 있음)", "플러그인빌드")
+
+    return [f for f in cpp_files + data_files if Path(f).exists()]
+
+
 FE_STATE_FILE = "ml/fe_state.json"
 
 
@@ -735,8 +858,12 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
     if importance:
         sheet.log_importance(branch, fe_step, importance, FEATURE_DESCRIPTIONS)
 
-    # 채택 있으면 모델 파일 커밋
+    # 채택 있으면 플러그인 빌드 + 커밋
     if newly_adopted:
+        det_str  = f"{det_rate:.1f}" if det_rate else "?"
+        n_feat_s = str(n_feat) if n_feat else "?"
+
+        # FE 결과 JSON + D:\ 모델 파일
         commit_files = []
         if Path(out_json).exists():
             commit_files.append(out_json)
@@ -747,11 +874,17 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
             p = model_dir / fname
             if p.exists():
                 commit_files.append(str(p))
+
+        # 플러그인 빌드: C++ 패치 + 모델 복사 + WSL cmake
+        scaler_path  = str(model_dir / f"scaler_{args.model}.json")
+        plugin_files = stage_build_plugin(bot, args, scaler_path)
+        commit_files += plugin_files
+
         if commit_files:
-            det_str = f"{det_rate:.1f}" if det_rate else "?"
             git.commit_results(
                 commit_files,
-                f"feat(fe): {args.model} iter{run_num:03d} step{fe_step:02d} det={det_str}% feat={n_feat}",
+                f"feat(fe): {args.model} iter{run_num:03d} step{fe_step:02d} "
+                f"det={det_str}% feat={n_feat_s}",
                 branch=branch
             )
 
