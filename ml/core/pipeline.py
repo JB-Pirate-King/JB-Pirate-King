@@ -97,6 +97,12 @@ try:
 finally:
     sys.argv = _saved_argv
 
+# ── feature_engineer에서 augment_seq 임포트 (없으면 no-op) ─────────
+try:
+    from feature_engineer import augment_seq as _augment_seq
+except ImportError:
+    _augment_seq = None
+
 # ── 기본 경로 설정 ────────────────────────────────────────────────────
 # 원본 AIS 데이터 다운로드 위치 (D:\ais_data\raw)
 _DEFAULT_RAW_DATA  = r"D:\ais_data\raw\2025"
@@ -245,7 +251,8 @@ def load_raw_normal_seqs(data_file: str = _DEFAULT_DATA_FILE,
 
 # ── 단일 모델 전체 시나리오 스코어 계산 ──────────────────────────────
 def compute_scores(session, mins, maxs, is_supervised: bool,
-                   n_anom: int, raw_seqs=None, n_normal: int = 3000):
+                   n_anom: int, raw_seqs=None, n_normal: int = 3000,
+                   extra_features=None):
     """모델 하나의 전체 시나리오 스코어를 수집.
 
     Returns
@@ -253,16 +260,21 @@ def compute_scores(session, mins, maxs, is_supervised: bool,
     normal_scores   : list[float]
     scenario_scores : dict[str, list[float]]   (is_anom=True 시나리오만)
     """
+    def _aug(seq):
+        if extra_features and _augment_seq is not None:
+            return _augment_seq(seq, extra_features)
+        return seq
+
     # 정상 스코어
     if raw_seqs is not None:
         pool = raw_seqs[:n_normal] if n_normal and n_normal < len(raw_seqs) else raw_seqs
         normal_scores = [
-            infer_score(session, scale_seq(seq, mins, maxs), is_supervised)
+            infer_score(session, scale_seq(_aug(seq), mins, maxs), is_supervised)
             for seq in pool
         ]
     else:
         normal_scores = [
-            infer_score(session, scale_seq(make_normal_seq(), mins, maxs), is_supervised)
+            infer_score(session, scale_seq(_aug(make_normal_seq()), mins, maxs), is_supervised)
             for _ in range(n_normal or 3000)
         ]
 
@@ -270,7 +282,7 @@ def compute_scores(session, mins, maxs, is_supervised: bool,
     anom_makers = [(n, mk) for n, mk, ia, _ in SCENARIO_MAKERS if ia]
     scenario_scores = {}
     for sc_name, maker in tqdm(anom_makers, desc="  시나리오", leave=False, unit="개"):
-        seqs = [scale_seq(maker(), mins, maxs) for _ in range(n_anom)]
+        seqs = [scale_seq(_aug(maker()), mins, maxs) for _ in range(n_anom)]
         scenario_scores[sc_name] = [
             infer_score(session, seq, is_supervised) for seq in seqs
         ]
@@ -808,6 +820,7 @@ def main():
             n_anom=args.n_anom,
             raw_seqs=raw_seqs,
             n_normal=n_eval_normal or 3000,
+            extra_features=list(args.extra_features) if args.extra_features else None,
         )
         all_normal_scores[name]   = n_sc
         all_scenario_scores[name] = s_sc
