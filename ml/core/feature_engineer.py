@@ -1206,7 +1206,7 @@ def main():
 
     # ── Discord / Notion 알림 ──────────────────────────────────────
     try:
-        from notify import notify_iteration
+        from ml.integrations.notify import notify_iteration
         gain = best["det"] - history[0]["det"]
         new_adopted = [f for f in best_extra if f not in INITIAL_EXTRA]
         # 상위 중요 피처 3개
