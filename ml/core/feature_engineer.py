@@ -797,7 +797,8 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
              det=det0, score=best_score, extra=list(current_extra), scenarios=sc0)
     )
 
-    max_feat = getattr(args, "max_feat", None)
+    max_feat  = getattr(args, "max_feat",  None)
+    max_steps = getattr(args, "max_steps", None)  # None = 수렴까지 전체 실행
 
     step = 1
     while remaining:
@@ -863,6 +864,10 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
             best_cand = step_best_feat
             print(f"\n  ✗ 개선 없음 (최고 후보: {best_cand}  목적점수 {step_best_gain:+.1f})"
                   f" → 종료")
+            break
+
+        if max_steps is not None and step >= max_steps:
+            print(f"\n  [max_steps={max_steps}] 스텝 제한 도달 → 종료")
             break
 
         step += 1
@@ -1053,6 +1058,8 @@ def main():
                     help=f"목적점수 채택 임계 (기본: {MIN_GAIN_DEFAULT})")
     ap.add_argument("--max_feat", type=int, default=None,
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
+    ap.add_argument("--max_steps", type=int, default=None,
+                    help="Greedy 최대 채택 스텝 수 (orchestrator에서 1로 지정해 1회 채택 후 종료)")
     ap.add_argument("--export_dir", default=None,
                     help="최적 피처셋 모델을 배포용 ONNX/scaler/threshold로 저장할 디렉터리 (선택)")
     ap.add_argument("--eval_ratio", type=float, default=EVAL_NORMAL_RATIO,
