@@ -12,6 +12,7 @@ ml/output/
 # (pipeline.py --base_dir 사용 시에는 D:\ais_models\ 로 저장)
 ml/*.onnx
 ml/*.json
+!ml/fe_state.json
 ml/threshold*.txt
 ml/eval_result_*.txt
 

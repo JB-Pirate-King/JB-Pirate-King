@@ -1273,9 +1273,8 @@ def main():
 
     extra_features = list(args.extra_features or [])
     if extra_features:
-        global FEATURES, N_FEAT
-        FEATURES = FEATURES + extra_features
-        N_FEAT = len(FEATURES)
+        global N_FEAT
+        N_FEAT = len(FEATURES) + len(extra_features)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
