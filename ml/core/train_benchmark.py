@@ -1059,9 +1059,10 @@ class DCdetector(nn.Module):
         self.n_feat     = n_feat
         self.patch_size = patch_size
         self.n_patches  = seq_len // patch_size
-        # Channel-wise attention
+        # Channel-wise attention — nhead는 n_feat의 약수여야 함
+        ch_nhead = next(n for n in range(min(nhead, n_feat), 0, -1) if n_feat % n == 0)
         self.ch_attn  = nn.MultiheadAttention(
-            n_feat, num_heads=min(nhead, n_feat), dropout=dropout, batch_first=True)
+            n_feat, num_heads=ch_nhead, dropout=dropout, batch_first=True)
         self.ch_norm  = nn.LayerNorm(n_feat)
         # Patch embedding + attention
         self.patch_embed = nn.Linear(patch_size * n_feat, d_model)
