@@ -9,20 +9,22 @@
 #include <fstream>
 #include <algorithm>
 
+// [AUTO:feat_block_begin]
 // 피처 순서 (12개):
-//   0  sog               속력 (knots)
-//   1  cog               진행 방향 (도)
-//   2  heading           선수 방향 (도)
-//   3  status            항행 상태
-//   4  dt                이전 신호와 시간 차이 (초)
-//   5  dist_km           실제 이동 거리 (km)
-//   6  cog_hdg_diff      COG vs HDG 차이 (도, -1=미정의)
-//   7  sog_change        이전 대비 SOG 변화량 (knots)
-//   8  cog_hdg_change    이전 대비 cog_hdg_diff 변화량
-//   9  speed_consistency 실제 이동거리 / SOG 기반 예상 거리
-//  10  lat_speed         위도 방향 변화율 (도/초)
-//  11  lon_speed         경도 방향 변화율 (도/초)
+//   0  sog                     속력 (knots)
+//   1  cog                     진행 방향 (도)
+//   2  heading                 선수 방향 (도)
+//   3  status                  항행 상태
+//   4  dt                      이전 신호와 시간 차이 (초)
+//   5  dist_km                 실제 이동 거리 (km)
+//   6  cog_hdg_diff            COG vs HDG 차이 (도, -1=미정의)
+//   7  sog_change              이전 대비 SOG 변화량 (knots)
+//   8  cog_hdg_change          이전 대비 cog_hdg_diff 변화량
+//   9  speed_consistency       실제 이동거리 / SOG 기반 예상 거리
+//  10  lat_speed               위도 방향 변화율 (도/초)
+//  11  lon_speed               경도 방향 변화율 (도/초)
 #define ML_FEATURE_COUNT 12
+// [AUTO:feat_block_end]
 #define ML_SEQ_LEN       10
 #define ML_SEQ_LEN_SHORT  5
 
@@ -68,6 +70,7 @@ public:
                               std::string &error_msg);
 
     // ── 피처 추가 (단일/앙상블 공통) ────────────────────────────
+    // [AUTO:push_decl_begin]
     void PushFeature(int mmsi,
                      float sog, float cog, float heading,
                      float status, float dt, float dist_km,
@@ -75,6 +78,7 @@ public:
                      float cog_hdg_change,
                      float speed_consistency,
                      float lat_speed, float lon_speed);
+    // [AUTO:push_decl_end]
 
     // ── 이상 탐지 (단일/앙상블 자동 분기) ───────────────────────
     // out_error: 단일=MSE, 앙상블=가중 평균 MSE
