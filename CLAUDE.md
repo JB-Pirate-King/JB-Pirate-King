@@ -29,18 +29,22 @@ JB-Pirate-King/
 │   │   ├── preprocess.py       # AIS preprocessing (.csv / .csv.zst / .zip)
 │   │   ├── train_benchmark.py  # Unsupervised model training (9 models)
 │   │   ├── eval_anomaly.py     # Detection rate / false positive evaluation
-│   │   └── feature_engineer.py # DCdetect feature engineering (Greedy + ONNX export)
+│   │   ├── feature_engineer.py # DCdetect feature engineering (Greedy + ONNX export)
+│   │   └── patch_plugin.py     # C++ 플러그인 자동 패치 (scaler features → codegen) ★
 │   ├── integrations/           # External integrations
 │   │   ├── slack_bot.py        # Slack bot (logs, button approval, Claude queries)
 │   │   ├── sheets.py           # Google Sheets logging
 │   │   ├── notify.py           # Discord webhook + Notion reports
 │   │   └── git_manager.py      # Auto branch creation / commit
 │   ├── orchestrator.py         # Full pipeline entry point (Slack gates + Sheets + git)
+│   ├── build_plugin_wsl.sh     # WSL(Ubuntu-24.04) cmake+make package 자동 빌드 ★
 │   ├── auto_feat_eng.py        # FE automation loop (dataset build → repeated FE)
 │   ├── build_3yr_dataset.py    # 2023–2025 balanced dataset builder
 │   └── download_ais.py         # AIS raw data downloader
 ├── ais_ids_pi/                 # OpenCPN plugin (C++)
-│   └── src/ais_ids.cpp         # Plugin main source
+│   ├── src/ais_ids.cpp         # Plugin main source
+│   ├── include/ais_ml.h        # ML 인터페이스 (AUTO: codegen 마커 포함)
+│   └── src/ais_ml.cpp          # ML 추론 구현 (AUTO: codegen 마커 포함)
 ├── s-c/                        # Local server + GUI
 └── aivdm_gen/                  # AIVDM test signal generator
 ```
@@ -143,6 +147,11 @@ SEQ_LEN = 10
 - **베이스학습** (`core/pipeline.py --train`): dcdetect를 **12개 고정 피처**로 학습. baseline 측정용, **배포용 아님**.
 - **평가** (`core/pipeline.py --eval`): 32개 공격 시나리오 탐지율 측정 (FP≈1%/5%/10% 기준).
 - **피처 엔지니어링 학습** (`core/feature_engineer.py`): **배포용 모델 생성 단계.** Greedy Forward Selection으로 후보 피처 채택 후 `.onnx` / `scaler.json` / `threshold.txt` export.
+- **플러그인 자동 빌드** (`core/patch_plugin.py` + `build_plugin_wsl.sh`): FE 채택 시 자동 실행.
+  1. `patch_plugin.py --scaler scaler_dcdetect.json` → C++ 3파일 자동 패치 (`AUTO:` 마커 구간 교체)
+  2. `ais_ids_pi/data/` ← `model.onnx` / `scaler.json` / `threshold.txt` 복사
+  3. `wsl -d Ubuntu-24.04 bash ml/build_plugin_wsl.sh` → cmake+make package → `ais_ids_pi/*.tar.gz`
+  4. git commit: C++ 패치 3파일 + 모델 파일 3파일 (tar.gz는 gitignore 대상, 릴리스 시 수동 첨부)
 
 ### 부가 시스템
 
@@ -237,6 +246,31 @@ Goal: find derived features that raise DCdetect detection rate, then export a de
 - Trained (per model): `D:\ais_models\{name}\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
 - Deploy: `ml/deploy/model.onnx`, `ml/deploy/scaler.json`, `ml/deploy/threshold.txt`
 - Plugin: `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
+
+---
+
+## Plugin Auto-Patch & Build
+
+FE 피처 채택 시 orchestrator가 자동 실행. 수동 실행 시:
+
+```bash
+# 1. C++ 코드 패치 (dry_run으로 먼저 확인)
+python ml/core/patch_plugin.py --scaler D:/ais_models/dcdetect/scaler_dcdetect.json --dry_run
+python ml/core/patch_plugin.py --scaler D:/ais_models/dcdetect/scaler_dcdetect.json
+
+# 2. WSL 빌드
+wsl -d Ubuntu-24.04 bash ml/build_plugin_wsl.sh /mnt/c/Users/imcas/JB-Pirate-King
+# 결과: ais_ids_pi/ais_ids_pi-*.tar.gz
+```
+
+**AUTO: 마커 위치** (C++ 자동 패치 구간):
+- `ais_ml.h`: `[AUTO:feat_block]` (ML_FEATURE_COUNT + 피처 주석), `[AUTO:push_decl]` (PushFeature 선언)
+- `ais_ml.cpp`: `[AUTO:push_impl]` (PushFeature 구현)
+- `ais_ids.cpp`: `[AUTO:extra_feats]` (파생 피처 계산), `[AUTO:push_calls]` (양 모델 PushFeature 호출)
+
+**지원 추가 피처** (`EXTRA_FEAT_CPP` in patch_plugin.py):
+`accel`, `heading_change`, `heading_rate`, `vec_sog_diff`, `cog_change`, `turn_rate`,
+`dist_speed_err`, `lowspeed_crab`, `cog_sin_hdg`, `status_fn4_flag`, `hdg_perp_score`, `status_motion_flag`
 
 ---
 
