@@ -6,6 +6,8 @@ Before pushing code or when asked to push, always check the following first:
 
 1. **README.md / ml/README.md** — Verify that any changed features, paths, or options are reflected in the docs. Update outdated content before pushing.
 2. **Source code comments** — Verify that comments in modified functions/classes match current behavior. Remove or fix any stale comments.
+3. **automation/** — If pipeline paths, model names, or env vars changed, update `automation/config.py` and `automation/README.md` accordingly.
+4. **Secrets hygiene** — Never commit real tokens/keys. `.env.example` must only contain placeholder values (e.g. `xoxb-your-token-here`), not real credentials.
 
 ---
 
@@ -29,6 +31,17 @@ JB-Pirate-King/
 │   ├── download_ais.py    # AIS data downloader
 │   ├── eval_rule_gen.py   # Rule-based evaluation generator
 │   └── deploy/            # Deployment model/scaler/threshold files
+├── automation/            # 자동화 파이프라인 레이어 ★ (신규)
+│   ├── pipeline_runner.py # 메인 오케스트레이터 (ml/pipeline.py 래핑)
+│   ├── mlflow_tracker.py  # MLflow 실험 추적
+│   ├── notify.py          # Slack + Discord 알림
+│   ├── sheets_tracker.py  # Google Sheets 결과 기록
+│   ├── notion_reporter.py # Notion 자동 문서화
+│   ├── github_release.py  # GitHub Release 자동화
+│   ├── config.py          # 환경변수 중앙 관리
+│   ├── requirements.txt   # automation 의존성
+│   ├── .env.example       # 토큰/키 예시 (실제값 절대 커밋 금지)
+│   └── README.md          # 상세 설정 가이드
 ├── ais_ids_pi/            # OpenCPN plugin (C++)
 │   └── src/ais_ids.cpp    # Plugin main source
 ├── s-c/                   # Local server + GUI
@@ -259,6 +272,75 @@ Copy model.onnx / scaler.json / threshold.txt to ais_ids_pi/data/
 | Version | Date | Models | Notes |
 |---|---|---|---|
 | v0.1.0 | — | conv1d, tranad, dcdetect | Initial release (1-day training data) |
+
+---
+
+## Automation Pipeline
+
+전체 ML 파이프라인을 자동화하는 레이어. `ml/pipeline.py`를 수정하지 않고 래핑하는 방식.
+
+### 아키텍처 다이어그램
+FigJam: https://www.figma.com/board/cyTCcQ6zhHlVIrcjSBufli
+
+### 빠른 사용법
+
+```bash
+# 의존성 설치
+pip install -r automation/requirements.txt
+
+# MLflow 서버 (로컬)
+mlflow server --host 0.0.0.0 --port 5000   # UI: http://localhost:5000
+
+# 학습 + 평가 + 전체 알림/리포팅
+python automation/pipeline_runner.py --models conv1d tranad dcdetect --epochs 10
+
+# 학습 + 릴리즈 생성
+python automation/pipeline_runner.py --models conv1d tranad --epochs 10 --release --tag v0.2.0
+
+# 평가만 (이미 학습된 모델)
+python automation/pipeline_runner.py --eval-only --models conv1d
+```
+
+### 통합 서비스 및 설정 위치
+
+| 서비스 | 모듈 | 설정 키 (.env) |
+|--------|------|---------------|
+| MLflow | `mlflow_tracker.py` | `MLFLOW_TRACKING_URI` |
+| Slack | `notify.py` | `SLACK_BOT_TOKEN`, `SLACK_CHANNEL` |
+| Discord | `notify.py` | `DISCORD_WEBHOOK_URL` |
+| Notion | `notion_reporter.py` | `NOTION_API_KEY`, `NOTION_DATABASE_ID` |
+| Google Sheets | `sheets_tracker.py` | `GSHEETS_SPREADSHEET_ID`, `GSHEETS_CREDS_FILE` |
+| GitHub Release | `github_release.py` | `GITHUB_TOKEN`, `GITHUB_REPO` |
+
+환경변수는 `automation/.env` (git 제외) 또는 GitHub Secrets에 저장.
+설정 가이드: `automation/README.md`
+
+### GitHub Actions 워크플로
+
+| 파일 | 트리거 | Runner | 역할 |
+|------|--------|--------|------|
+| `ci.yml` | Push/PR → main, develop | ubuntu-latest | 문법검사 + smoke test |
+| `daily_pipeline.yml` | 매일 02:00 KST, 수동 | self-hosted (로컬 Windows) | 학습 + 평가 + 알림 |
+| `release.yml` | `v*` 태그 Push, 수동 | self-hosted | 릴리즈 생성 + 파일 첨부 |
+
+> `daily_pipeline.yml`과 `release.yml`은 `D:\ais_data` 데이터가 있는 로컬 머신에 self-hosted runner 등록 필요.
+
+---
+
+## Available MCP Tools (Claude Code 세션 내)
+
+이 프로젝트에서 Claude Code가 사용할 수 있는 MCP 연동 서비스:
+
+| MCP | 주요 기능 | 언제 사용 |
+|-----|-----------|-----------|
+| **GitHub** | PR/이슈 생성, 파일 read/write, 릴리즈 | 브랜치 관리, PR 생성, 코드 리뷰 |
+| **Notion** | 페이지 생성/수정, DB 쿼리 | 실험 결과 문서화, 작업 로그 |
+| **Google Sheets** | 시트 생성/수정, 데이터 조회 | 성능 비교표, 데이터 트래킹 |
+| **Slack** | 메시지 전송, 채널 검색 | 팀 알림, 진행 상황 공유 |
+| **Figma** | FigJam 다이어그램, 디자인 생성 | 아키텍처 다이어그램 |
+| **Context7** | 라이브러리 최신 문서 조회 | MLflow/PyTorch API 확인 |
+
+> Python 자동화 스크립트(`automation/*.py`)는 MCP가 아니라 각 서비스의 Python SDK를 직접 사용함.
 
 ---
 
