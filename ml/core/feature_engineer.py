@@ -564,18 +564,18 @@ def evaluate(
     n_anom: int = 200,
     n_normal: int = 10000,
     raw_seqs: list = None,
+    extra_fp: tuple = (),   # 추가로 계산할 FP% 목록 ex) (5.0, 10.0)
 ):
     """
     FP ≈ 1% 기준 탐지율 계산.
-    반환: (avg_det, scenario_results)
-    n_normal=10000: 임계값 편향 줄이기 위해 기본값 상향
+    반환: (avg_det_fp1, scenario_results)
+    extra_fp 지정 시: 해당 FP 기준 탐지율도 출력 (참고용, 반환값 변경 없음)
     """
     device = next(model.parameters()).device
     model.eval()
     mins        = scaler.data_min_
     maxs        = scaler.data_max_
     scale_range = maxs - mins
-    # ClippedMinMaxScaler의 클리핑 범위 (없으면 무제한)
     clip_lo = getattr(scaler, "clip_lo", None)
     clip_hi = getattr(scaler, "clip_hi", None)
 
@@ -587,7 +587,6 @@ def evaluate(
                 for v, mn, rng in zip(arr.tolist(), mins, scale_range)]
 
     def _score(seq: list) -> float:
-        """raw 시퀀스(base) → 파생 추가 → 스케일 → MSE 스코어"""
         aug = augment_seq(seq, extra_names)
         scaled = [_scale_row(row) for row in aug]
         x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
@@ -595,16 +594,17 @@ def evaluate(
             out = model(x)
             return float(((out - x) ** 2).mean())
 
-    # 정상 시퀀스 점수 → FP 1% 임계값
     if raw_seqs:
         normal_raw = random.sample(raw_seqs, min(n_normal, len(raw_seqs)))
     else:
         normal_raw = [make_normal_seq() for _ in range(n_normal)]
 
     normal_scores = [_score(seq) for seq in normal_raw]
-    fp1_thr = float(np.percentile(normal_scores, 99))  # 상위 1% = FP 1% 임계
+    fp1_thr = float(np.percentile(normal_scores, 99))
 
-    # 시나리오별 탐지율
+    # extra_fp 임계값 사전 계산
+    extra_thrs = {fp: float(np.percentile(normal_scores, 100 - fp)) for fp in extra_fp}
+
     anom_scenarios = [
         (name, maker, is_holdout)
         for name, maker, is_anom, is_holdout in SCENARIO_MAKERS
@@ -612,13 +612,31 @@ def evaluate(
     ]
 
     all_dets = []
-    scenario_results = []   # [(name, det), ...]
+    scenario_results = []
+    # extra_fp별 결과 수집 {fp: {sc_name: det}}
+    extra_results: dict = {fp: {} for fp in extra_fp}
+
     for sc_name, maker, is_holdout in tqdm(anom_scenarios, desc="  시나리오 평가", leave=False):
-        anom_seqs = [maker() for _ in range(n_anom)]
+        anom_seqs   = [maker() for _ in range(n_anom)]
         anom_scores = [_score(seq) for seq in anom_seqs]
         det = sum(1 for s in anom_scores if s > fp1_thr) / len(anom_scores) * 100.0
         all_dets.append(det)
         scenario_results.append((sc_name, det, is_holdout))
+        for fp, thr in extra_thrs.items():
+            extra_results[fp][sc_name] = (
+                sum(1 for s in anom_scores if s > thr) / len(anom_scores) * 100.0
+            )
+
+    # extra_fp 출력
+    if extra_fp:
+        W = 52
+        for fp in sorted(extra_fp):
+            sc_dets = extra_results[fp]
+            avg = float(np.mean(list(sc_dets.values())))
+            print(f"\n  [FP≈{fp:.0f}%] 평균 탐지율 {avg:.1f}%")
+            for sc_name, det in sorted(sc_dets.items(), key=lambda x: x[1]):
+                mark = "❌" if det < 50 else "✅"
+                print(f"  {mark} {sc_name:<28} {det:>6.1f}%")
 
     return float(np.mean(all_dets)), scenario_results
 
@@ -781,7 +799,8 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     t0 = time.time()
     tensor, scaler = prepare_tensor(train_seqs, current_extra)
     model, val_loader = train_dcdetect(tensor, n_base_total, args.epochs)
-    det0, sc0 = evaluate(model, scaler, current_extra, args.n_anom, raw_seqs=eval_seqs)
+    det0, sc0 = evaluate(model, scaler, current_extra, args.n_anom,
+                         raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
     elapsed = time.time() - t0
 
     # 약세 시나리오 집합 = 베이스라인 탐지율 < weak_floor (전 과정 고정)
