@@ -1,0 +1,49 @@
+name: Release
+
+# v* 태그 푸시 시 자동 릴리즈 (self-hosted runner 필요)
+# 사용: git tag v1.0.0 && git push origin v1.0.0
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "릴리즈 태그 (예: v1.0.0)"
+        required: true
+      models:
+        description: "포함할 모델 (공백 구분)"
+        required: false
+        default: "conv1d tranad dcdetect"
+
+jobs:
+  create-release:
+    name: GitHub 릴리즈 생성
+    runs-on: self-hosted
+
+    env:
+      SLACK_BOT_TOKEN:        ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL:          ${{ secrets.SLACK_CHANNEL }}
+      DISCORD_WEBHOOK_URL:    ${{ secrets.DISCORD_WEBHOOK_URL }}
+      NOTION_API_KEY:         ${{ secrets.NOTION_API_KEY }}
+      NOTION_DATABASE_ID:     ${{ secrets.NOTION_DATABASE_ID }}
+      GSHEETS_SPREADSHEET_ID: ${{ secrets.GSHEETS_SPREADSHEET_ID }}
+      GITHUB_TOKEN:           ${{ secrets.GH_PAT }}
+      GITHUB_REPO:            ${{ github.repository }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 의존성 설치
+        run: pip install -r automation/requirements.txt
+
+      - name: 릴리즈 생성
+        run: |
+          $tag    = "${{ github.ref_name || github.event.inputs.tag }}"
+          $models = "${{ github.event.inputs.models || 'conv1d tranad dcdetect' }}"
+          python automation/pipeline_runner.py `
+            --models $models `
+            --eval-only `
+            --release `
+            --tag $tag

@@ -1,0 +1,24 @@
+# automation/ 의존성
+# pip install -r automation/requirements.txt
+
+# MLflow — 실험 추적 및 모델 레지스트리
+mlflow>=2.14.0
+
+# Slack 알림
+slack-sdk>=3.27.0
+
+# Discord는 requests로 처리 (별도 SDK 불필요)
+requests>=2.31.0
+
+# Google Sheets
+gspread>=6.1.0
+google-auth>=2.29.0
+
+# Notion
+notion-client>=2.2.1
+
+# GitHub API
+PyGithub>=2.3.0
+
+# 환경변수 로딩
+python-dotenv>=1.0.1

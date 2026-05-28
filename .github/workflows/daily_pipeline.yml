@@ -1,0 +1,77 @@
+name: Daily Pipeline (Self-Hosted)
+
+# 매일 02:00 KST (전날 17:00 UTC) 자동 실행
+# 자신의 Windows 머신에 self-hosted runner를 등록해야 함
+# 등록 방법: GitHub 레포 → Settings → Actions → Runners → New self-hosted runner
+
+on:
+  schedule:
+    - cron: "0 17 * * *"   # UTC 17:00 = KST 02:00
+  workflow_dispatch:        # 수동 실행
+    inputs:
+      models:
+        description: "학습할 모델 (공백 구분, 예: conv1d tranad dcdetect)"
+        required: false
+        default: "conv1d tranad dcdetect"
+      epochs:
+        description: "에포크 수"
+        required: false
+        default: "10"
+      release:
+        description: "릴리즈 생성 여부 (true/false)"
+        required: false
+        default: "false"
+      tag:
+        description: "릴리즈 태그 (release=true 일 때)"
+        required: false
+        default: ""
+
+jobs:
+  run-pipeline:
+    name: AIS 학습 파이프라인
+    runs-on: self-hosted        # ← Windows 로컬 머신에 등록된 runner
+
+    env:
+      MLFLOW_TRACKING_URI:      ${{ secrets.MLFLOW_TRACKING_URI }}
+      SLACK_BOT_TOKEN:          ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL:            ${{ secrets.SLACK_CHANNEL }}
+      DISCORD_WEBHOOK_URL:      ${{ secrets.DISCORD_WEBHOOK_URL }}
+      NOTION_API_KEY:           ${{ secrets.NOTION_API_KEY }}
+      NOTION_DATABASE_ID:       ${{ secrets.NOTION_DATABASE_ID }}
+      GSHEETS_SPREADSHEET_ID:   ${{ secrets.GSHEETS_SPREADSHEET_ID }}
+      GITHUB_TOKEN:             ${{ secrets.GH_PAT }}
+      GITHUB_REPO:              ${{ github.repository }}
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 의존성 설치
+        run: |
+          pip install -r automation/requirements.txt
+
+      - name: 파이프라인 실행
+        run: |
+          $models  = "${{ github.event.inputs.models || 'conv1d tranad dcdetect' }}"
+          $epochs  = "${{ github.event.inputs.epochs || '10' }}"
+          $release = "${{ github.event.inputs.release || 'false' }}"
+          $tag     = "${{ github.event.inputs.tag || '' }}"
+
+          $cmd = "python automation/pipeline_runner.py --models $models --epochs $epochs"
+          if ($release -eq "true" -and $tag -ne "") {
+            $cmd += " --release --tag $tag"
+          }
+          Invoke-Expression $cmd
+
+      - name: 실패 시 GitHub Issue 생성
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[자동] Daily Pipeline 실패 — ${new Date().toISOString().slice(0,10)}`,
+              body: `## 실패 정보\n- 워크플로: daily_pipeline.yml\n- Run ID: ${context.runId}\n- [로그 보기](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n\n자동 생성된 이슈입니다.`,
+              labels: ["bug", "automation"]
+            });
