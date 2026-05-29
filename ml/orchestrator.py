@@ -694,6 +694,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
          "--initial_extra"] + current_initial_extra + [
          "--export_dir", str(WORK_DIR / "model"),
          "--min_gain", str(args.min_gain)]
+        + (["--max_candidates", str(args.max_candidates)] if args.max_candidates else [])
         + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
         progress_cb=fe_progress
     )
@@ -734,10 +735,6 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
         if m:
             weak_names = [s.strip() for s in m.group(1).split(",")]
 
-    analysis       = claude_analyze("피처개선", out, bool(newly_adopted), elapsed, {
-        "newly_adopted": newly_adopted,
-        "det_rate": det_rate, "baseline_det": baseline_det, "n_feat": n_feat
-    })
     adopted_detail = fe_adopted_analysis(out, newly_adopted, det_rate, baseline_det, weak_names)
     candidates     = _parse_greedy_candidates(out)
     importance     = _parse_permutation_importance(out)
@@ -751,13 +748,18 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
             result_title,
             f"FP=1% 탐지율: {baseline_det:.1f}% → {det_rate:.1f}%  ({gain_pp:+.1f}pp)" if det_rate else "탐지율: -",
             f"총 피처 수: {n_feat}개  |  소요: {elapsed:.0f}s",
-            "─",
         ]
         + adopted_detail
-        + ["─"]
-        + analysis
     )
     bot.log_stage_result("피처개선", summary, success=True)
+
+    # ── Claude 분석 → 별도 메시지로 명확히 표시 ──
+    bot.log("🤖 Claude가 FE 결과 분석 중... (최대 2분)", "피처개선")
+    analysis = claude_analyze("피처개선", out, bool(newly_adopted), elapsed, {
+        "newly_adopted": newly_adopted,
+        "det_rate": det_rate, "baseline_det": baseline_det, "n_feat": n_feat
+    })
+    bot.log("\n".join(analysis), "피처개선")
 
     if candidates:
         baseline_info = ""
@@ -905,6 +907,8 @@ def main():
                         help="FP=1%% 측정용 별도 전처리 파일 (학습 데이터와 완전 분리)")
     parser.add_argument("--min_gain",        type=float, default=3.0,
                         help="FE 채택 임계 목적점수 향상량 (기본: 3.0, 테스트 시 0.1)")
+    parser.add_argument("--max_candidates",  type=int, default=None,
+                        help="Greedy 후보 수 제한 (앞 N개만 탐색, 속도용)")
     parser.add_argument("--auto_approve",    action="store_true",
                         help="Slack 승인 대기 없이 모든 단계 자동 approve (테스트용)")
     args = parser.parse_args()

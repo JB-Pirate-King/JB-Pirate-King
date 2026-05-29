@@ -780,6 +780,10 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     current_extra: list = list(INITIAL_EXTRA)
     # accel 등 INITIAL_EXTRA에 포함된 항목은 다시 탐색하지 않음
     remaining: list = [k for k in CANDIDATE_FEATURES.keys() if k not in INITIAL_EXTRA]
+    # 후보 수 제한 (--max_candidates): 정의 순서대로 앞 N개만 탐색 (속도)
+    max_cand = getattr(args, "max_candidates", None)
+    if max_cand is not None and max_cand > 0:
+        remaining = remaining[:max_cand]
     history: list = []
 
     n_base_total = len(BASE_FEATURES) + len(current_extra)
@@ -1078,6 +1082,8 @@ def main():
                     help=f"목적점수 채택 임계 (기본: {MIN_GAIN_DEFAULT})")
     ap.add_argument("--max_feat", type=int, default=None,
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
+    ap.add_argument("--max_candidates", type=int, default=None,
+                    help="Greedy 후보 수 제한 (정의 순서 앞 N개만, 속도용)")
     ap.add_argument("--max_steps", type=int, default=None,
                     help="Greedy 최대 채택 스텝 수 (orchestrator에서 1로 지정해 1회 채택 후 종료)")
     ap.add_argument("--export_dir", default=None,
