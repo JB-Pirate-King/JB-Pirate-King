@@ -772,54 +772,110 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
     out_json = str(fe_dir / f"feat_eng_iter{run_num:02d}.json")
 
     fe_candidate_count = [0]
-    fe_baseline_det = [None]
+    fe_total_cand      = [0]
+    fe_baseline_det    = [None]
+    fe_baseline_done   = [False]
+    fe_cur_cand: list  = [None]   # 현재 평가 중인 후보 (feat, desc)
     fe_pending_adoption: list = []
+
     def fe_progress(line, proc=None):
         s = line.strip()
+
+        # 후보 총 개수 (헤더 "후보: 20개")
+        mt = re.search(r"후보:\s*(\d+)개", s)
+        if mt:
+            fe_total_cand[0] = int(mt.group(1))
+
+        # 베이스라인 결과: "→ 전체 평균 탐지율 40.6%  (목적점수 77.2)"
         if "전체 평균 탐지율" in s and "목적점수" in s:
-            m = re.search(r"탐지율\s+([\d.]+)%", s)
+            m = re.search(r"탐지율\s+([\d.]+)%.*목적점수\s+([\d.]+)", s)
             if m:
-                fe_baseline_det[0] = float(m.group(1))
+                fe_baseline_det[0]  = float(m.group(1))
+                fe_baseline_done[0] = True
+                bot.log(
+                    f"📊 *베이스라인* ({fe_start_total}피처): "
+                    f"FP=1% 탐지율 *{m.group(1)}%*  ·  목적점수 {m.group(2)}\n"
+                    f"  이제 후보 {fe_total_cand[0] or '?'}개를 하나씩 추가해 평가합니다 "
+                    f"(채택 기준: 목적점수 +{args.min_gain} 이상)",
+                    "피처개선"
+                )
+            return
+
+        # 약세 시나리오 목록
+        mw = re.search(r"약세 시나리오\((\d+)개\):\s*(.+)", s)
+        if mw:
+            bot.log(f"⚠️ 약세 시나리오 {mw.group(1)}개 (베이스 탐지율<50%): {mw.group(2)[:250]}", "피처개선")
+            return
+
+        # 채택 확정 follow-up: "전체평균 X% → Y%  |  목적점수 +g"
         if fe_pending_adoption and "전체평균" in s and "→" in s:
             feat_name, feat_desc = fe_pending_adoption.pop()
             m = re.search(r"([\d.]+)%\s*→\s*([\d.]+)%.*목적점수\s*([+-][\d.]+)", s)
             if m:
-                before, after, obj_gain = m.group(1), m.group(2), m.group(3)
                 bot.log(
-                    f"✅ 채택! `{feat_name}` — {feat_desc}\n"
-                    f"  FP=1% 탐지율: {before}% → *{after}%*  |  목적점수 {obj_gain}",
+                    f"🏆 *채택 확정!* `{feat_name}` — {feat_desc}\n"
+                    f"  FP=1% 탐지율 {m.group(1)}% → *{m.group(2)}%*  |  목적점수 {m.group(3)}",
                     "피처개선"
                 )
             else:
-                bot.log(f"✅ 채택! `{feat_name}` — {feat_desc}  {s}", "피처개선")
+                bot.log(f"🏆 *채택 확정!* `{feat_name}` — {feat_desc}", "피처개선")
             return
-        me = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*train=", line)
-        if me:
-            ep, total_ep = int(me.group(1)), int(me.group(2))
-            pct = int(ep / total_ep * 100)
-            milestone = (pct // 25) * 25
-            if milestone > 0 and ep == round(total_ep * milestone / 100):
-                elapsed_now = time.time() - t0
-                bot.log(
-                    f"🧠 FE 학습 {milestone}% — Epoch {ep}/{total_ep}  (경과 {elapsed_now:.0f}s)",
-                    "피처개선"
-                )
+
+        # 후보 평가 시작: "+ turn_rate (설명) → 16개 학습 중..."
         if s.startswith("+ ") and "학습 중" in s:
             fe_candidate_count[0] += 1
-            elapsed_now = time.time() - t0
             m = re.search(r"\+\s+(\w+)\s+\(", s)
             feat_name = m.group(1) if m else "?"
             feat_desc = FEATURE_DESCRIPTIONS.get(feat_name, "")
+            fe_cur_cand[0] = (feat_name, feat_desc)
+            tot = f"/{fe_total_cand[0]}" if fe_total_cand[0] else ""
             bot.log(
-                f"🔬 후보 #{fe_candidate_count[0]} 학습 중: "
-                f"`{feat_name}` ({feat_desc})  (경과 {elapsed_now:.0f}s)",
+                f"🔬 후보 #{fe_candidate_count[0]}{tot} `{feat_name}` 평가 중 — {feat_desc}",
                 "피처개선"
             )
-        elif "✓ 채택" in s:
+            return
+
+        # 후보 결과: "전체평균  33.6%(-6.7)  점수   62.0 ▼-11.9  [0.3분]"
+        mr = re.search(
+            r"전체평균\s+([\d.]+)%\(([+-][\d.]+)\)\s+점수\s+([\d.]+)\s+[▲▼─]\s*([+-]?[\d.]+)", s)
+        if mr and fe_cur_cand[0]:
+            det, det_g, score, obj_g = mr.group(1), mr.group(2), mr.group(3), mr.group(4)
+            feat_name, _ = fe_cur_cand[0]
+            try:
+                passed = float(obj_g) >= args.min_gain
+            except ValueError:
+                passed = False
+            verdict = f"✅ 기준충족(≥+{args.min_gain})" if passed else "⬜ 미달"
+            bot.log(
+                f"   └ `{feat_name}`: 탐지율 {det}% ({det_g}pp)  ·  "
+                f"목적점수 {score} ({obj_g})  →  {verdict}",
+                "피처개선"
+            )
+            fe_cur_cand[0] = None
+            return
+
+        # 채택 마커
+        if "✓ 채택" in s:
             m = re.search(r"✓ 채택: \[?(\w+)\]?", s)
             feat_name = m.group(1) if m else "?"
             feat_desc = FEATURE_DESCRIPTIONS.get(feat_name, "")
             fe_pending_adoption.append((feat_name, feat_desc))
+            return
+
+        # 베이스라인 학습 중 epoch 진행 (후보 스캔 시작 전까지만 — 스팸 방지)
+        if not fe_baseline_done[0]:
+            me = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*train=", line)
+            if me:
+                ep, total_ep = int(me.group(1)), int(me.group(2))
+                pct = int(ep / total_ep * 100)
+                milestone = (pct // 25) * 25
+                if milestone > 0 and ep == round(total_ep * milestone / 100):
+                    elapsed_now = time.time() - t0
+                    bot.log(
+                        f"🧠 베이스라인 학습 {milestone}% — Epoch {ep}/{total_ep}  "
+                        f"(경과 {elapsed_now:.0f}s)",
+                        "피처개선"
+                    )
 
     ret, out = run_cmd(
         ["python", "ml/core/feature_engineer.py",
