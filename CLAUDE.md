@@ -159,28 +159,35 @@ SEQ_LEN = 10
 | 단순 | `core/pipeline.py` | Slack/git 없이 학습+평가만. 빠른 실험용. |
 | 풀 오케스트레이터 | `orchestrator.py` | Slack 게이트 + Sheets + git 자동화. 실제 운용. |
 
-### 풀 오케스트레이터 흐름
+### 풀 오케스트레이터 흐름 (FE-only 브랜치 체이닝)
 
 ```
-[전처리] → [피처 엔지니어링 (Greedy 수렴까지)]
-  FE 단계: 실행 → Claude 분석 → Slack 결과 보고 → 채택 시 플러그인 빌드+커밋+릴리즈
+[전처리(첫 브랜치 1회, --skip_preprocess면 생략)]
+   ↓
+dcdetect_001: FE(Greedy 1피처 채택) → 채택셋 재학습/평가 → export → 빌드·커밋·릴리즈
+   ↓ fe_state 저장, 자동 체이닝
+dcdetect_002: 이전 피처 + Greedy 1피처 채택 → ...
+   ↓
+... 더 이상 목적점수 +3.0pp 채택 없으면 수렴 → 종료
 ```
 
-- **전처리** (`core/preprocess.py`): raw AIS → 파생 피처 추가 → CSV. `--skip_preprocess`로 스킵 가능.
-- **피처 엔지니어링** (`core/feature_engineer.py`): Greedy Forward Selection이 **수렴까지 자동 실행**.
-  - 베이스라인 학습 → 후보 피처 전체 탐색 → 목적점수 +3.0pp 이상이면 채택 → 반복 → 수렴
-  - 채택 후 배포용 `.onnx` / `scaler.json` / `threshold.txt` export
-  - 이후 **플러그인 빌드 → git 커밋 → GitHub 릴리즈** 자동 실행
-- **Stage Train / Stage Eval 없음**: FE 베이스라인 학습이 동일 역할을 포함
+- **베이스 Train/Eval 단계 없음**: 베이스라인 학습+평가는 **FE 내부(`feature_engineer.py`)에서 수행**.
+  별도 `stage_train`/`stage_eval`은 제거됨 (중복 + `pipeline.py`의 11GB 중복 스캔 회피).
+- **전처리** (`core/preprocess.py`): raw AIS → 파생 피처 → CSV. **첫 브랜치에서만** 1회 (`--skip_preprocess`로 생략).
+- **피처 엔지니어링** (`core/feature_engineer.py`, `--max_steps 1`): run당 **Greedy 1피처 채택**.
+  - 베이스라인 학습+평가(FP=1/5/10) → 후보 전체 탐색 → 목적점수 +3.0pp 이상 best 1개 채택
+  - 채택 시: 그 피처셋으로 **재학습(model_best)** → 순열중요도 + 최종 FP1/5/10 + threshold → 배포 export
+  - 이후 플러그인 빌드 → git 커밋 → GitHub 릴리즈 → fe_state 저장 → 새 브랜치 체이닝
 
 ### 부가 시스템
 
-- **git**: run마다 `dcdetect_001`, `dcdetect_002`... 브랜치 자동 생성 → FE 완료 후 커밋
-- **GitHub 릴리즈**: 태그 `run/dcdetect_NNN` (prerelease) — commit SHA 기준으로 자동 생성
+- **git**: run(브랜치)마다 `dcdetect_001`, `dcdetect_002`... 자동 생성 → 채택 시 커밋 → **project(upstream) push**
+- **GitHub 릴리즈**: 태그 `run/dcdetect_NNN` (prerelease) — commit SHA 기준
 - **Google Sheets**: 5개 탭 자동 기록 (아래 섹션 참고)
-- **Slack**: 각 단계 결과 + Claude 분석 + 진행 상황 실시간 보고
+- **Slack**: 베이스라인 결과 → 후보별 탐지율·목적점수·채택여부 → 재학습/최종평가/threshold 실시간 보고 (`--auto_approve`로 무인)
 - **Claude 분석**: FE 완료 후 `claude -p` CLI 호출 → 결과 평가
-- **fe_state.json**: 다음 run의 Greedy 시작점 피처 저장 (`initial_extra`). 수동으로 관리.
+- **fe_state.json**: 다음 브랜치의 Greedy 시작 피처 저장 (`initial_extra`). 채택 시 자동 갱신.
+- **출력**: 지표→Sheets, 모델→브랜치 `ais_ids_pi/data`+릴리즈. FE 중간물은 `ml/.pipeline_tmp/`(gitignore). D드라이브엔 입력/캐시만.
 
 ---
 
@@ -226,12 +233,15 @@ Goal: find derived features that raise DCdetect detection rate, then export a de
 ### 알고리즘
 
 **Greedy Forward Selection**:
-1. 베이스라인 학습 (현재 피처셋)
+1. 베이스라인 학습 (현재 피처셋) + 평가(FP=1/5/10)
 2. 후보 피처 각각 추가 → 학습 → 목적점수 계산 (`전체평균 + 1.0 × 약세평균`)
 3. 최고 목적점수 향상이 `--min_gain`(기본 3.0pp) 이상이면 채택
-4. 채택된 피처를 포함해 다음 스텝 반복
-5. 더 이상 기준 충족 후보 없으면 수렴 종료
-6. 최종 피처셋으로 배포용 모델 export
+4. 채택된 피처셋으로 **재학습(model_best)** → 순열중요도 + 최종 FP1/5/10 + threshold → 배포 export
+5. `--max_steps`로 한 호출당 채택 횟수 제한 (오케스트레이터는 `1` → run당 1피처, 브랜치 체이닝).
+   미지정 시 수렴까지 반복.
+
+> 오케스트레이터는 `--max_steps 1`로 호출 → run(브랜치)당 1피처만 채택하고, 채택 시 새 브랜치로
+> 체이닝(dcdetect_001→002→...). 단독 실행(`feature_engineer.py` 직접)은 미지정 시 수렴까지 한 번에.
 
 ### 평가 기준 (FP = 1%)
 
