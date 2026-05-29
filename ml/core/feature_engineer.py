@@ -1136,7 +1136,12 @@ def main():
     print(f"  threshold (FP=1% 기준): {threshold:.8f}")
 
     # 저장 경로 준비
-    out_dir = os.path.join(args.base_dir, "ais_output", "feat_eng")
+    #   --out_json 지정 시 그 위치(오케스트레이터의 repo-local 임시 디렉터리)에 보고서 생성.
+    #   미지정(단독 실행) 시에만 base_dir/ais_output/feat_eng 사용.
+    if args.out_json:
+        out_dir = os.path.dirname(os.path.abspath(args.out_json)) or "."
+    else:
+        out_dir = os.path.join(args.base_dir, "ais_output", "feat_eng")
     os.makedirs(out_dir, exist_ok=True)
 
     # JSON 저장
