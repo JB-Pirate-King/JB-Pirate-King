@@ -31,7 +31,8 @@ MODEL_HEADERS = [
 
 SUMMARY_HEADERS = [
     "timestamp", "branch", "model", "epochs", "max_mmsi", "data_file",
-    "fe_steps", "fe_baseline", "fe_det", "fe_gain_pp",
+    "fe_steps", "fe_baseline",
+    "fe_det_fp1", "fe_det_fp5", "fe_det_fp10",
     "fe_n_feat", "fe_features", "fe_threshold",
     "notes"
 ]
@@ -262,11 +263,11 @@ class PipelineSheets:
             "", "", "", "", notes
         ])
 
-    def update_run_summary(self, train_ok: bool = None,
-                           det_fp1: float = None,
-                           fe_steps: int = None,
+    def update_run_summary(self, fe_steps: int = None,
                            fe_baseline: float = None,
                            fe_det: float = None,
+                           fe_det_fp5: float = None,
+                           fe_det_fp10: float = None,
                            fe_n_feat: int = None,
                            adopted: list = None,
                            threshold: float = None,
@@ -278,16 +279,17 @@ class PipelineSheets:
         if row > ws.row_count:
             ws.add_rows(row - ws.row_count + 50)
 
-        fe_gain = (fe_det - fe_baseline) if (fe_det and fe_baseline) else None
         updates = {}
         if fe_steps is not None:
             updates["fe_steps"] = str(fe_steps)
         if fe_baseline is not None:
             updates["fe_baseline"] = f"{fe_baseline:.1f}"
         if fe_det is not None:
-            updates["fe_det"] = f"{fe_det:.1f}"
-        if fe_gain is not None:
-            updates["fe_gain_pp"] = f"{fe_gain:+.1f}"
+            updates["fe_det_fp1"] = f"{fe_det:.1f}"
+        if fe_det_fp5 is not None:
+            updates["fe_det_fp5"] = f"{fe_det_fp5:.1f}"
+        if fe_det_fp10 is not None:
+            updates["fe_det_fp10"] = f"{fe_det_fp10:.1f}"
         if fe_n_feat is not None:
             updates["fe_n_feat"] = str(fe_n_feat)
         if adopted is not None:
