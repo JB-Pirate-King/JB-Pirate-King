@@ -1,0 +1,14 @@
+{
+  "_comment": "ml/pipeline_config.json 템플릿. 실제 파일은 gitignore됨 — 이 파일을 복사해 값 채우고 .example 제거.",
+  "slack": {
+    "_comment": "Slack 앱(Socket Mode). bot_token=xoxb-, app_token=xapp-, channel=채널 ID(C로 시작)",
+    "bot_token": "xoxb-여기에-봇-토큰",
+    "app_token": "xapp-여기에-앱-토큰",
+    "channel": "C0XXXXXXXXX"
+  },
+  "google_sheets": {
+    "_comment": "Google Cloud 서비스계정 JSON 경로 + 대상 시트 ID. 서비스계정 이메일을 해당 시트에 편집자로 공유할 것.",
+    "credentials_file": "ml/google_credentials.json",
+    "sheet_id": "구글시트-URL-가운데-ID"
+  }
+}
