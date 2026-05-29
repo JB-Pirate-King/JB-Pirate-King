@@ -45,6 +45,9 @@ mlruns/
 # 모델 디렉토리 (실제 경로: D:\ais_models\)
 ais_models/
 
+# 파이프라인 작업용 임시 출력 (FE JSON/txt 리포트, 모델 export) — repo-local, 커밋 제외
+ml/.pipeline_tmp/
+
 # 빌드 아티팩트
 *.tar.gz
 
