@@ -159,8 +159,11 @@ try:
         report("Google Sheets", True, "스킵 (SPREADSHEET_ID 미설정)")
     else:
         s = SheetsTracker()
-        s.log_result(TEST_MODEL, TEST_EPOCHS, 74.8, 71.2, 1.0, run_id)
-        report("Google Sheets", True, "기록 완료 → 🤖 ML 모델 성능 시트")
+        if s._disabled:
+            report("Google Sheets", False, "연결 실패 (credentials.json 없음 또는 권한 오류)")
+        else:
+            s.log_result(TEST_MODEL, TEST_EPOCHS, 74.8, 71.2, 1.0, run_id)
+            report("Google Sheets", True, "기록 완료 → 🤖 ML 모델 성능 시트")
 except Exception as e:
     report("Google Sheets", False, str(e))
 
