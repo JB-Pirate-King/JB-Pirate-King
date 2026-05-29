@@ -106,10 +106,14 @@ from tqdm import tqdm
 
 # feature_engineer의 augment_seq 로드 (extra_features 지원)
 import sys as _sys, os as _os
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
-_ROOT = _os.path.dirname(_os.path.dirname(_HERE))
-if _ROOT not in _sys.path:
-    _sys.path.insert(0, _ROOT)
+# __file__ 미정의 환경(CI 스모크 테스트의 exec 실행 등) 대비 가드
+try:
+    _HERE = _os.path.dirname(_os.path.abspath(__file__))
+    _ROOT = _os.path.dirname(_os.path.dirname(_HERE))
+    if _ROOT not in _sys.path:
+        _sys.path.insert(0, _ROOT)
+except NameError:
+    pass
 try:
     from ml.core.feature_engineer import CANDIDATE_FEATURES as _CAND_FEATURES, augment_seq as _augment_seq
     _HAS_FE_AUGMENT = True
