@@ -160,7 +160,7 @@ try:
     else:
         s = SheetsTracker()
         s.log_result(TEST_MODEL, TEST_EPOCHS, 74.8, 71.2, 1.0, run_id)
-        report("Google Sheets", True, "기록 완료")
+        report("Google Sheets", True, "기록 완료 → 🤖 ML 모델 성능 시트")
 except Exception as e:
     report("Google Sheets", False, str(e))
 

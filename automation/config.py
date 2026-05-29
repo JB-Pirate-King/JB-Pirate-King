@@ -23,9 +23,9 @@ NOTION_API_KEY        = os.getenv("NOTION_API_KEY", "")
 NOTION_DATABASE_ID    = os.getenv("NOTION_DATABASE_ID", "")
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
-GSHEETS_CREDS_FILE    = os.getenv("GSHEETS_CREDS_FILE", "automation/credentials.json")
+GSHEETS_CREDS_FILE     = os.getenv("GSHEETS_CREDS_FILE", "automation/credentials.json")
 GSHEETS_SPREADSHEET_ID = os.getenv("GSHEETS_SPREADSHEET_ID", "")
-GSHEETS_SHEET_NAME    = os.getenv("GSHEETS_SHEET_NAME", "pipeline_results")
+# 시트명은 sheets_tracker.py에서 상수로 관리 (🤖 ML 모델 성능 / 🔄 실행 로그)
 
 # ─── GitHub ───────────────────────────────────────────────────────────────────
 GITHUB_TOKEN          = os.getenv("GITHUB_TOKEN", "")

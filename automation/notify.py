@@ -20,6 +20,10 @@ from automation.config import (
     DISCORD_WEBHOOK_URL,
 )
 
+# Discord Docker MCP 로컬 엔드포인트 (port 8085)
+# 웹훅 URL이 없을 때 fallback으로 사용
+DISCORD_LOCAL_MCP_URL = "http://localhost:8085/send"
+
 
 # ─── Slack ────────────────────────────────────────────────────────────────────
 
@@ -46,25 +50,34 @@ def _slack_post(text: str, blocks: list | None = None) -> bool:
 
 
 # ─── Discord ─────────────────────────────────────────────────────────────────
+# 우선순위: 1) 표준 웹훅 URL  2) Docker MCP (localhost:8085)
 
 def _discord_post(content: str, embeds: list | None = None) -> bool:
-    if not DISCORD_WEBHOOK_URL:
-        print("[notify] DISCORD_WEBHOOK_URL 미설정 — Discord 알림 스킵")
-        return False
-
     payload: dict = {"content": content}
     if embeds:
         payload["embeds"] = embeds
 
-    resp = requests.post(
-        DISCORD_WEBHOOK_URL,
-        json=payload,
-        timeout=10,
-    )
-    if resp.status_code not in (200, 204):
-        print(f"[notify] Discord 오류: {resp.status_code} {resp.text}")
+    # 1) 표준 Discord 웹훅
+    if DISCORD_WEBHOOK_URL:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code in (200, 204):
+            return True
+        print(f"[notify] Discord 웹훅 오류: {resp.status_code} — Docker MCP 시도")
+
+    # 2) Docker MCP fallback (localhost:8085)
+    try:
+        resp = requests.post(
+            DISCORD_LOCAL_MCP_URL,
+            json={"message": content},
+            timeout=5,
+        )
+        if resp.status_code in (200, 204):
+            return True
+        print(f"[notify] Discord Docker MCP 오류: {resp.status_code} {resp.text}")
         return False
-    return True
+    except requests.ConnectionError:
+        print("[notify] Discord 웹훅/Docker MCP 모두 미설정 또는 미실행 — 스킵")
+        return False
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
