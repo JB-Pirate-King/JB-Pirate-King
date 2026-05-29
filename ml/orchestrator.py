@@ -661,13 +661,17 @@ def stage_release(bot, args, branch: str, run_num: int,
                   full_extra: list, det_rate) -> None:
     """FE 채택 커밋 후 GitHub 릴리스 자동 생성.
 
-    버전: v0.{run_num}.0 형식.
+    태그: run/{model}_{NNN} (브랜치명 기반, prerelease).
     첨부: tar.gz (존재하면) + 모델 3파일.
     """
     plugin_dir = Path("ais_ids_pi")
     model_dir  = Path(args.base_dir) / "ais_models" / args.model
 
-    tag = f"v0.{run_num}.0"
+    tag = f"run/{args.model}_{run_num:03d}"
+
+    # commit SHA를 target으로 사용 (브랜치명은 422 오류 발생)
+    sha_ret, sha_out = run_cmd(["git", "rev-parse", "HEAD"])
+    commit_sha = sha_out.strip() if sha_ret == 0 else branch
 
     tarballs = sorted(plugin_dir.glob("*.tar.gz"))
     tarball  = str(tarballs[-1]) if tarballs else None
@@ -698,7 +702,8 @@ def stage_release(bot, args, branch: str, run_num: int,
     cmd = ["gh", "release", "create", tag,
            "--title", f"{tag} — {args.model} iter{run_num:03d}",
            "--notes", notes,
-           "--target", branch]
+           "--target", commit_sha,
+           "--prerelease"]
     cmd += assets
 
     bot.log(f"📦 GitHub 릴리스 생성 중: {tag}  ({len(assets)}개 파일 첨부)", "릴리스")
