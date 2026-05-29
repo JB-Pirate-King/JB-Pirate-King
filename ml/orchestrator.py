@@ -742,6 +742,12 @@ def _load_fe_initial_extra() -> list[str]:
         return FE_INITIAL_EXTRA
 
 
+def _save_fe_initial_extra(adopted: list[str]):
+    """이번 run 채택 피처를 다음 run(다음 브랜치)을 위해 저장."""
+    with open(FE_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"initial_extra": adopted}, f, ensure_ascii=False, indent=2)
+
+
 def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, step_info):
     """Greedy FE 수렴까지 전체 실행 + Slack 보고.
     반환: ('approve' | 'retry' | 'stop', full_extra | None, fe_stats)
@@ -822,6 +828,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
          "--epochs", str(args.epochs),
          "--max_mmsi", str(args.max_mmsi),
          "--out_json", out_json,
+         "--max_steps", "1",
          "--initial_extra"] + current_initial_extra + [
          "--export_dir", str(WORK_DIR / "model"),
          "--min_gain", str(args.min_gain)]
@@ -1034,73 +1041,84 @@ def main():
         cfg["google_sheets"]["sheet_id"]
     )
 
-    run_num = git.get_next_run_num(args.model)
-    branch  = git.create_branch(args.model, run_num)
+    # 자던 run 구조: 브랜치마다 1피처 채택 → fe_state 갱신 → 새 브랜치(dcdetect_001→002→...)로
+    # 자동 체이닝, 수렴(채택 없음)하면 종료. Train/Eval 은 --skip_* 로 끄면 FE만 (자던 run 동일).
+    while True:
+        run_num = git.get_next_run_num(args.model)
+        branch  = git.create_branch(args.model, run_num)
 
-    sheet.log_run_start(branch, args.model, args.epochs, args.max_mmsi,
-                        data_file=args.data_file)
-    bot.log_run_start(branch, {
-        "모델": args.model,
-        "epochs": args.epochs,
-        "max_mmsi": args.max_mmsi,
-        "데이터": args.data_file,
-        "base_dir": args.base_dir,
-        "베이스 피처": f"{len(BASE_FEATURES)}개",
-        "출발 피처": f"{len(_load_fe_initial_extra())}개 (기채택)",
-    })
+        sheet.log_run_start(branch, args.model, args.epochs, args.max_mmsi,
+                            data_file=args.data_file)
+        bot.log_run_start(branch, {
+            "모델": args.model,
+            "epochs": args.epochs,
+            "max_mmsi": args.max_mmsi,
+            "데이터": args.data_file,
+            "base_dir": args.base_dir,
+            "베이스 피처": f"{len(BASE_FEATURES)}개",
+            "출발 피처": f"{len(_load_fe_initial_extra())}개 (기채택)",
+        })
 
-    stages = []
-    if not args.skip_preprocess: stages.append("전처리")
-    if not args.skip_train:      stages.append("베이스학습")
-    if not args.skip_eval:       stages.append("평가")
-    stages.append("피처 엔지니어링 학습")
-    total_steps = len(stages)
+        stages = []
+        if not args.skip_preprocess: stages.append("전처리")
+        if not args.skip_train:      stages.append("베이스학습")
+        if not args.skip_eval:       stages.append("평가")
+        stages.append("피처 엔지니어링 학습")
+        total_steps = len(stages)
 
-    def make_step_info(name: str) -> tuple:
-        idx = stages.index(name)
-        nxt = stages[idx + 1] if idx + 1 < total_steps else "파이프라인 종료"
-        return (idx + 1, total_steps, nxt)
+        def make_step_info(name: str) -> tuple:
+            idx = stages.index(name)
+            nxt = stages[idx + 1] if idx + 1 < total_steps else "파이프라인 종료"
+            return (idx + 1, total_steps, nxt)
 
-    if not args.skip_preprocess:
-        if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
+        if not args.skip_preprocess:
+            if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
+                bot.log("파이프라인 중단", "warning")
+                git.checkout("develop")
+                return
+
+        if not args.skip_train:
+            if not stage_train(bot, sheet, branch, args, make_step_info("베이스학습")):
+                bot.log("파이프라인 중단", "warning")
+                git.checkout("develop")
+                return
+
+        if not args.skip_eval:
+            if not stage_eval(bot, sheet, branch, args, make_step_info("평가")):
+                bot.log("파이프라인 중단", "warning")
+                git.checkout("develop")
+                return
+
+        fe_result = stage_fe(bot, sheet, branch, args, run_num,
+                             make_step_info("피처 엔지니어링 학습"))
+
+        sheet.log_run_done(branch, args.model, success=(fe_result is not None))
+
+        if fe_result is None:
+            # 사용자 중단
             bot.log("파이프라인 중단", "warning")
             git.checkout("develop")
             return
-
-    if not args.skip_train:
-        if not stage_train(bot, sheet, branch, args, make_step_info("베이스학습")):
-            bot.log("파이프라인 중단", "warning")
+        elif fe_result:
+            # 채택 발생 → fe_state 저장 후 새 브랜치로 재시작
+            _save_fe_initial_extra(fe_result)
+            next_run = git.get_next_run_num(args.model)
+            bot.log(
+                f"🔁 채택 완료 ({', '.join(fe_result)}) → "
+                f"{args.model}_{next_run:03d} 브랜치로 자동 재시작",
+                "피처개선"
+            )
+            git.checkout("develop")
+            continue
+        else:
+            # 수렴 — 더 이상 채택 피처 없음 → 종료
+            bot.log_stage_result(
+                "파이프라인 완료 — 수렴",
+                [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
+                success=True
+            )
             git.checkout("develop")
             return
-
-    if not args.skip_eval:
-        if not stage_eval(bot, sheet, branch, args, make_step_info("평가")):
-            bot.log("파이프라인 중단", "warning")
-            git.checkout("develop")
-            return
-
-    fe_result = stage_fe(bot, sheet, branch, args, run_num,
-                         make_step_info("피처 엔지니어링 학습"))
-
-    sheet.log_run_done(branch, args.model, success=(fe_result is not None))
-
-    if fe_result is None:
-        bot.log("파이프라인 중단", "warning")
-    elif fe_result:
-        bot.log_stage_result(
-            "파이프라인 완료",
-            [f"브랜치: {branch}",
-             f"채택 피처 {len(fe_result)}개: {', '.join(fe_result)}"],
-            success=True
-        )
-    else:
-        bot.log_stage_result(
-            "파이프라인 완료 — 수렴",
-            [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
-            success=True
-        )
-
-    git.checkout("develop")
 
 
 if __name__ == "__main__":

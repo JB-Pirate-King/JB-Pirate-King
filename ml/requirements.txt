@@ -1,0 +1,22 @@
+# ML 파이프라인 의존성 (Python 3.11+ 권장)
+#   설치: pip install -r ml/requirements.txt
+#   GPU 없이 CPU로 동작 (torch CPU 빌드 권장: --index-url https://download.pytorch.org/whl/cpu)
+
+# ── 핵심 ML ──
+numpy
+torch
+scikit-learn
+tqdm
+
+# ── 외부 연동 (orchestrator 풀 실행 시 필요) ──
+gspread                 # Google Sheets 기록
+google-auth             # 서비스계정 인증 (google.oauth2)
+slack_bolt              # Slack 봇 (로그/승인/Claude 질의)
+
+# ── 모델 export ──
+onnx                    # ONNX 변환 검증 (torch.onnx.export 사용)
+
+# 참고:
+#  - 플러그인 빌드는 native Linux에서 별도 (CLAUDE.md 참고). 위 패키지는 ML 학습용.
+#  - 릴리즈 자동화에는 `gh` CLI(별도 설치), git 필요.
+#  - Windows 플러그인 빌드 시 WSL(Ubuntu-24.04) 필요.
