@@ -1,11 +1,16 @@
 """
 파이프라인 Git 브랜치 관리 — iter마다 dcdetect_001, dcdetect_002 ... 생성
+
+브랜치/커밋은 project 저장소(upstream remote = JB-Pirate-King/JB-Pirate-King)로 push.
 """
 import subprocess
 import sys
 import re
 
 sys.stdout.reconfigure(encoding="utf-8")
+
+# 모델별 브랜치를 push 할 대상 remote (project 저장소)
+PUSH_REMOTE = "upstream"
 
 
 def _run(cmd: list[str]) -> str:
@@ -16,7 +21,7 @@ def _run(cmd: list[str]) -> str:
 def get_next_run_num(model: str) -> int:
     """기존 브랜치에서 다음 번호 계산. dcdetect_001 → 다음은 002"""
     branches = _run(["git", "branch", "-a"]).splitlines()
-    pattern = re.compile(rf"^\s*(?:remotes/origin/)?{re.escape(model)}_(\d+)$")
+    pattern = re.compile(rf"^\s*(?:remotes/(?:origin|upstream)/)?{re.escape(model)}_(\d+)$")
     nums = []
     for b in branches:
         m = pattern.match(b)
@@ -26,7 +31,7 @@ def get_next_run_num(model: str) -> int:
 
 
 def create_branch(model: str, run_num: int) -> str:
-    """브랜치 생성, 체크아웃, origin 푸시. 반환값: 브랜치명"""
+    """브랜치 생성, 체크아웃, project(upstream) 푸시. 반환값: 브랜치명"""
     branch = f"{model}_{run_num:03d}"
     current = _run(["git", "branch", "--show-current"])
 
@@ -34,7 +39,7 @@ def create_branch(model: str, run_num: int) -> str:
     _run(["git", "checkout", "-b", branch, base])
 
     result = subprocess.run(
-        ["git", "push", "-u", "origin", branch],
+        ["git", "push", "-u", PUSH_REMOTE, branch],
         capture_output=True, text=True
     )
     if result.returncode == 0:
@@ -45,7 +50,7 @@ def create_branch(model: str, run_num: int) -> str:
 
 
 def commit_results(files: list[str], message: str, branch: str = None):
-    """결과 파일 커밋 후 origin 푸시"""
+    """결과 파일 커밋 후 project(upstream) 푸시 (-u 로 설정된 추적 브랜치)"""
     if branch:
         current = _run(["git", "branch", "--show-current"])
         if current != branch:
