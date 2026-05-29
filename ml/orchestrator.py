@@ -804,11 +804,36 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
         det_str  = f"{det_rate:.1f}" if det_rate else "?"
         n_feat_s = str(n_feat) if n_feat else "?"
 
-        # 모델/JSON은 WORK_DIR(gitignore, 임시)에만 존재 → 커밋 대상 아님.
-        # 영구 보존: 지표→Sheets, 모델→ais_ids_pi/data (plugin_files)로 커밋.
+        # ── 게이트 ①: FE 평가 결과 → 배포(빌드·커밋·릴리즈) 진행 여부 ──
+        #   summary 에 Claude 분석이 포함되어 있어, 승인 버튼과 함께 표시됨.
+        gate1 = _wait(
+            bot,
+            f"FE 평가 — `{', '.join(newly_adopted)}` 채택 (탐지율 {det_str}%) → 배포 진행?",
+            summary,
+        )
+        if gate1 == "retry":
+            return "retry", None, fe_stats
+        if gate1 == "stop":
+            bot.log("⏹ 채택했으나 배포 중단 (사용자 stop) — 모델 미커밋", "피처개선")
+            return "stop", None, fe_stats
+
+        # ── 배포 단계: 플러그인 빌드 ──
+        #   모델/JSON은 WORK_DIR(gitignore, 임시). 영구 보존: 모델→ais_ids_pi/data 커밋.
         model_dir    = WORK_DIR / "model"
         scaler_path  = str(model_dir / f"scaler_{args.model}.json")
         commit_files = stage_build_plugin(bot, args, scaler_path)
+
+        # ── 게이트 ②: 빌드 결과 → 커밋 + GitHub 릴리즈 진행 여부 ──
+        build_summary = [
+            "✅ 플러그인 빌드 완료" if commit_files else "⚠️ 빌드 산출 없음(부분 실패 가능)",
+            f"커밋 대상 파일 {len(commit_files)}개 (C++ 패치 + 모델)",
+            f"채택 피처셋 {n_feat_s}개 · 탐지율 {det_str}%",
+        ]
+        bot.log_stage_result("플러그인빌드", build_summary, success=bool(commit_files))
+        gate2 = _wait(bot, "배포 — git 커밋 + GitHub 릴리즈 진행?", build_summary)
+        if gate2 == "stop":
+            bot.log("⏹ 빌드까지 완료, 커밋/릴리즈 중단 (사용자 stop)", "피처개선")
+            return "stop", None, fe_stats
 
         if commit_files:
             git.commit_results(
