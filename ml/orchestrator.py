@@ -181,32 +181,58 @@ def _parse_fe(out: str) -> list[str]:
 
 def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
                    extra: dict = None) -> list[str]:
-    """claude -p 로 단계 결과 분석 → Slack 메시지 라인 목록 반환"""
-    last_lines = "\n".join(out.splitlines()[-60:])
-    extra_str  = json.dumps(extra or {}, ensure_ascii=False)
+    """claude -p 로 단계 결과 분석 → Slack 메시지 라인 목록 반환.
+    [피처개선] 단계는 매우 상세한 다중 섹션 분석, 그 외는 간결 분석."""
+    extra_str = json.dumps(extra or {}, ensure_ascii=False)
 
-    prompt = (
-        f"AIS 이상탐지 ML 파이프라인 [{stage}] 단계 결과를 분석해줘.\n\n"
-        f"성공 여부: {'성공' if success else '실패'} | 소요: {elapsed:.0f}초\n"
-        f"추가 정보: {extra_str}\n\n"
-        f"실행 출력 (마지막 60줄):\n{last_lines}\n\n"
-        f"아래 3가지를 한국어로, 항목별 1~2문장씩, 전체 200자 이내로 답해:\n"
-        f"1. 결과 평가: 정상인지 문제가 있는지, 핵심 수치 해석\n"
-        f"2. 원인/근거: 왜 이 결과가 나왔는지 (피처, 데이터 양, 수렴 여부 등)\n"
-        f"3. 다음 행동 추천: continue / retry / stop 중 하나 + 이유\n"
-    )
+    if stage == "피처개선":
+        # FE 결과: 후보 평가표·시나리오·중요도가 출력 뒤쪽에 있어 충분히 길게 전달
+        last_lines = "\n".join(out.splitlines()[-150:])
+        prompt = (
+            "당신은 AIS 선박 이상탐지(비지도 재구성 오토인코더 DCdetect) ML 파이프라인의 "
+            "수석 분석가입니다. 방금 끝난 [피처 엔지니어링] 단계 결과를 **매우 상세히** 분석하세요.\n\n"
+            f"성공: {'예' if success else '아니오'} | 소요: {elapsed:.0f}초\n"
+            f"핵심 지표(JSON): {extra_str}\n\n"
+            f"=== 실행 출력 (마지막 150줄: 베이스라인·후보별 탐지율/목적점수·채택·재학습·최종 FP1/5/10·순열중요도) ===\n"
+            f"{last_lines}\n\n"
+            "아래 5개 항목을 한국어로, 각 항목 3~5문장씩 **구체적 수치를 인용**하며 상세히 작성하세요 "
+            "(전체 1500자 내외, 항목 번호와 제목 유지):\n"
+            "1. 📊 결과 평가: 베이스라인→최종 탐지율 변화(pp), 채택 피처 수, FP=1/5/10 비교. "
+            "이번 iter이 성공적인지/미미한지 판단.\n"
+            "2. 🧬 채택 피처 분석: 어떤 피처가 채택됐고 목적점수가 왜 올랐는지, "
+            "그 피처가 물리적으로 어떤 이상 패턴(예: 정박이동·저속crab·급가속)을 포착하는지 해석.\n"
+            "3. ⚠️ 약세 시나리오 진단: 여전히 탐지율이 낮은(<50%) 시나리오와 그 원인 가설. "
+            "재구성 오차 관점에서 왜 안 잡히는지.\n"
+            "4. 🎯 다음 단계 전략: 다음 브랜치에서 어떤 '종류'의 파생 피처를 추가하면 약세를 줄일지 "
+            "구체적으로 1~2개 제안(이름이 아니라 아이디어).\n"
+            "5. ✅ 권고: continue / retry / stop 중 하나 + 명확한 근거(수치 기반).\n"
+        )
+        timeout = 180
+    else:
+        last_lines = "\n".join(out.splitlines()[-60:])
+        prompt = (
+            f"AIS 이상탐지 ML 파이프라인 [{stage}] 단계 결과를 분석해줘.\n\n"
+            f"성공 여부: {'성공' if success else '실패'} | 소요: {elapsed:.0f}초\n"
+            f"추가 정보: {extra_str}\n\n"
+            f"실행 출력 (마지막 60줄):\n{last_lines}\n\n"
+            f"아래 3가지를 한국어로 항목별 2~3문장씩 상세히 답해:\n"
+            f"1. 결과 평가: 정상인지 문제가 있는지, 핵심 수치 해석\n"
+            f"2. 원인/근거: 왜 이 결과가 나왔는지\n"
+            f"3. 다음 행동 추천: continue / retry / stop 중 하나 + 이유\n"
+        )
+        timeout = 120
 
     try:
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "text"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=120
+            timeout=timeout
         )
         if result.returncode == 0 and result.stdout.strip():
-            lines = ["🤖 *Claude 분석*"]
+            lines = ["🤖 *Claude 상세 분석*"]
             for l in result.stdout.strip().splitlines():
                 if l.strip():
-                    lines.append(f"  {l.strip()}")
+                    lines.append(l.rstrip())
             return lines
     except FileNotFoundError:
         pass
