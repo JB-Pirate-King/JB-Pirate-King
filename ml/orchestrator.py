@@ -23,6 +23,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 import ml.integrations.slack_bot as _sb
 import ml.integrations.sheets as _sh
 import ml.integrations.git_manager as git
+import ml.integrations.mlflow_tracker as _mlf
 
 CONFIG_PATH = "ml/pipeline_config.json"
 
@@ -930,6 +931,40 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
     }
     if scenario_fp1:
         sheet.log_scenarios(branch, args.model, "FP=1%", scenario_fp1)
+
+    # ── MLflow 실험 기록 (graceful: 실패해도 파이프라인 진행) ──
+    try:
+        tracker = _mlf.MLflowTracker()
+        _rid = {}
+        with tracker.start_run(
+            run_name=f"{branch}_iter{run_num:03d}",
+            params={
+                "model": args.model, "epochs": args.epochs,
+                "max_mmsi": args.max_mmsi, "data_file": args.data_file,
+                "min_gain": args.min_gain,
+                "n_initial_extra": len(current_initial_extra),
+            },
+            tags={"branch": branch, "run_num": f"{run_num:03d}",
+                  "stage": "feature_engineering"},
+        ):
+            tracker.log_fe_result(
+                baseline_det=baseline_det, best_det=det_rate,
+                det_fp5=det_fp5, det_fp10=det_fp10,
+                threshold=threshold, n_features=n_feat,
+                n_adopted=len(newly_adopted),
+            )
+            tracker.log_scenarios(scenario_fp1)
+            _md = WORK_DIR / "model"
+            tracker.log_artifacts(
+                str(_md / f"model_{args.model}.onnx"),
+                str(_md / f"scaler_{args.model}.json"),
+                str(_md / f"threshold_{args.model}.txt"),
+            )
+            _rid["id"] = tracker.get_run_id()
+        if _rid.get("id"):
+            bot.log(f"📈 MLflow 기록 완료 — run_id={_rid['id'][:8]}", "피처개선")
+    except Exception as e:
+        print(f"[mlflow] 기록 중 오류(무시): {e}")
 
     if newly_adopted:
         det_str  = f"{det_rate:.1f}" if det_rate else "?"

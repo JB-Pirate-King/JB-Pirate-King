@@ -41,6 +41,10 @@ preprocess_meta.json
 
 # MLflow 로컬 실행 데이터
 mlruns/
+mlflow.db
+mlflow.db-journal
+mlflow.db-wal
+mlartifacts/
 
 # 모델 디렉토리 (실제 경로: D:\ais_models\)
 ais_models/

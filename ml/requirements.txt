@@ -1,0 +1,27 @@
+# ML 파이프라인 의존성 (Windows 학습 머신, Python 3.11)
+# 검증 환경: 2026-05-29.  자세한 셋업/주의사항은 ml/SETUP.md 참고.
+#
+# 설치:  python -m pip install -r ml/requirements.txt
+#
+# ⚠️ onnx 는 여기서 빼두었다. Store Python + 긴 경로 환경에서 일반 설치가
+#    WinError 206 으로 깨진다. 별도로 설치할 것 (ml/SETUP.md 3절):
+#       $env:PIP_USER=0; python -m pip install --no-cache-dir --target=C:\pylibs onnx
+#    그리고 실행 시 PYTHONPATH=C:\pylibs 주입.
+#    (관리자 권한으로 LongPathsEnabled=1 을 켰다면 onnx>=1.21 를 직접 추가해도 됨.)
+
+# ── 코어 ML ───────────────────────────────────────────────
+torch>=2.4.1
+onnxruntime>=1.26.0
+numpy>=2.0
+pandas>=2.2
+scikit-learn>=1.5
+scipy>=1.13
+tqdm>=4.66
+
+# ── 외부 연동 (orchestrator) ──────────────────────────────
+slack_bolt>=1.21
+slack_sdk>=3.27
+gspread>=6.0
+google-auth>=2.30
+google-auth-oauthlib>=1.2
+mlflow>=2.14

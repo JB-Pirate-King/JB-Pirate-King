@@ -129,22 +129,46 @@ class SlackPipelineBot:
         )
 
     def _start_socket(self):
+        # Socket Mode 는 버튼 승인/원격 질의(!?)에만 필요.
+        # app_token(xapp-)이 없으면 메시지 전송(chat_postMessage)만으로 동작.
+        # --auto_approve 모드에서는 승인 대기가 없으므로 socket 없이 완전 동작.
+        self._socket_ok = False
+        tok = (self.app_token or "").strip()
+        if not tok or not tok.startswith("xapp-") or "REPLACE" in tok:
+            print("[SlackBot] app_token(xapp-) 없음 → Socket Mode 비활성화. "
+                  "메시지 전송만 동작(버튼 승인 불가). --auto_approve 사용 권장.")
+            return
+
         import signal as _signal
-        self._handler = SocketModeHandler(self.app, self.app_token)
-        self._connected = threading.Event()
+        try:
+            self._handler = SocketModeHandler(self.app, self.app_token)
+            self._connected = threading.Event()
 
-        def _run():
-            orig = _signal.signal
-            _signal.signal = lambda *a, **kw: None
-            try:
-                self._handler.start()
-            finally:
-                _signal.signal = orig
+            def _run():
+                orig = _signal.signal
+                _signal.signal = lambda *a, **kw: None
+                try:
+                    self._handler.start()
+                finally:
+                    _signal.signal = orig
 
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        time.sleep(3)  # 소켓 연결 대기
-        print("[SlackBot] Socket Mode 연결 완료")
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            time.sleep(3)  # 소켓 연결 대기
+            self._socket_ok = True
+            print("[SlackBot] Socket Mode 연결 완료")
+        except Exception as e:
+            print(f"[SlackBot] Socket Mode 연결 실패 → 메시지 전송만 동작: {e}")
+
+    def _post(self, **kwargs):
+        """chat_postMessage 안전 래퍼 — Slack 전송 실패가 파이프라인을 막지 않음.
+        (예: 봇이 채널에 미초대(not_in_channel), 네트워크 오류 등)"""
+        kwargs.setdefault("channel", self.channel)
+        try:
+            return self.app.client.chat_postMessage(**kwargs)
+        except Exception as e:
+            print(f"[SlackBot] 전송 실패(무시): {e}")
+            return None
 
     STAGE_EMOJI = {
         "전처리": "🔄", "학습": "🧠", "평가": "📊", "피처개선": "🔬",
@@ -153,7 +177,7 @@ class SlackPipelineBot:
 
     def log(self, message: str, level: str = "info"):
         emoji = self.STAGE_EMOJI.get(level, "ℹ️")
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"{emoji} {message}"
         )
@@ -161,7 +185,7 @@ class SlackPipelineBot:
     def log_run_start(self, branch: str, params: dict):
         """파이프라인 시작 — 굵은 헤더로 구분"""
         lines = "\n".join(f">  • *{k}*: {v}" for k, v in params.items())
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"🚀 파이프라인 시작: {branch}",
             blocks=[
@@ -180,7 +204,7 @@ class SlackPipelineBot:
 
     def log_stage_start(self, stage: str, detail: str = ""):
         emoji = self.STAGE_EMOJI.get(stage, "▶️")
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"{emoji} [{stage}] 시작",
             blocks=[
@@ -195,7 +219,7 @@ class SlackPipelineBot:
         emoji = self.STAGE_EMOJI.get(stage, "▶️")
         status = "✅ 완료" if success else "❌ 실패"
         body = "\n".join(f">  • {l}" for l in lines)
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"{status} [{stage}]",
             blocks=[
@@ -212,7 +236,7 @@ class SlackPipelineBot:
         # Slack 코드블록 3000자 제한 안전 처리
         if len(body) > 2800:
             body = body[:2800] + "\n... (생략)"
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=title,
             blocks=[{
@@ -224,11 +248,17 @@ class SlackPipelineBot:
 
     def wait_approval(self, stage: str, summary_lines: list[str]) -> str:
         """승인 버튼 메시지 전송 후 클릭 대기. 반환값: 'approve' | 'retry' | 'stop'"""
+        if not getattr(self, "_socket_ok", False):
+            # Socket Mode 미연결 → 버튼 클릭을 받을 수 없음. 무한 대기 방지를 위해
+            # 결과만 게시하고 자동 승인 처리. (대화형 승인을 원하면 app_token 설정)
+            self.log(f"[{stage}] Socket Mode 미연결 → 자동 진행(approve). "
+                     f"대화형 승인하려면 app_token(xapp-) 설정 필요.", "warning")
+            return "approve"
         self._decision = None
         self._event.clear()
 
         body = "\n".join(f">  • {l}" for l in summary_lines)
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"[{stage}] 승인 대기 중",
             blocks=[
@@ -279,7 +309,7 @@ class SlackPipelineBot:
         arrow = "▲" if obj_gain > 0 else ("▼" if obj_gain < 0 else "─")
         status_emoji = "✅" if obj_gain >= 3.0 else ("⚠️" if obj_gain > 0 else "❌")
         baseline_obj = obj_score - obj_gain
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"후보 #{candidate_num}: {feat}",
             blocks=[
