@@ -4,10 +4,10 @@
 
 Whenever code or structure changes, keep ALL docs in sync. Before pushing code or when asked to push, always check and update the following first:
 
-1. **README.md / ml/README.md** — Verify that any changed features, paths, or options are reflected in the docs. Update outdated content before pushing.
-2. **CLAUDE.md (this file)** — Update so a fresh session can immediately understand the current state: new scripts/options, changed workflows, version history, feature count, paths.
-3. **Notion** — Update the methodology/results pages so external readers stay current. Use `python ml/integrations/notify.py` helpers (token in `ml/notify_config.json`, gitignored). Parent + results page IDs are in that config.
-4. **Source code comments** — Verify that comments in modified functions/classes match current behavior. Remove or fix any stale comments.
+1. **README.md / ml/README.md** — Verify that any changed features, paths, or options are reflected in the docs.
+2. **CLAUDE.md (this file)** — Update so a fresh session can immediately understand the current state.
+3. **Notion** — Update the methodology/results pages. Use `python ml/integrations/notify.py` helpers (token in `ml/notify_config.json`, gitignored).
+4. **Source code comments** — Verify that comments in modified functions/classes match current behavior.
 
 > Rule of thumb: a code/structure change is not "done" until README + CLAUDE.md + Notion reflect it.
 
@@ -36,9 +36,10 @@ JB-Pirate-King/
 │   │   ├── sheets.py           # Google Sheets logging
 │   │   ├── notify.py           # Discord webhook + Notion reports
 │   │   └── git_manager.py      # Auto branch creation / commit
-│   ├── orchestrator.py         # Full pipeline entry point (Slack gates + Sheets + git)
+│   ├── orchestrator.py         # Full pipeline entry point (Slack + Sheets + git)
+│   ├── fe_state.json           # FE 시작점 피처 저장 (initial_extra)
 │   ├── build_plugin_wsl.sh     # WSL(Ubuntu-24.04) cmake+make package 자동 빌드 ★
-│   ├── auto_feat_eng.py        # FE automation loop (dataset build → repeated FE)
+│   ├── auto_feat_eng.py        # FE automation loop (dataset build → FE)
 │   ├── build_3yr_dataset.py    # 2023–2025 balanced dataset builder
 │   └── download_ais.py         # AIS raw data downloader
 ├── ais_ids_pi/                 # OpenCPN plugin (C++)
@@ -80,21 +81,19 @@ D:\
 
 ### Input Format Support (core/preprocess.py)
 - Accepts `.csv`, `.csv.zst` (2025+), and `.zip` (Marine Cadastre ≤2024, one CSV inside; corrupt zips are skipped with a warning).
-- Normalizes old vs new column headers (case/underscore-insensitive): `MMSI/BaseDateTime/LAT/LON/VesselType/Status` ↔ `mmsi/base_date_time/latitude/longitude/vessel_type/status`.
-- Timestamps parsed with `datetime.fromisoformat` (handles both `YYYY-MM-DD HH:MM:SS` and ISO `...T...`).
+- Normalizes old vs new column headers: `MMSI/BaseDateTime/LAT/LON` ↔ `mmsi/base_date_time/latitude/longitude`.
+- Timestamps parsed with `datetime.fromisoformat`.
 
 ### Preprocessing Steps
 
 ```bash
-# Step 1: Per-day preprocessing (a dir mixes .csv/.csv.zst/.zip automatically)
+# Step 1: Per-day preprocessing
 python ml/core/preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
 
 # Step 2: Yearly merge
 python ml/core/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
     --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
 ```
-
-For the 3-year balanced dataset use `build_3yr_dataset.py` (see Feature Engineering section), which calls preprocess.py per selected day across 2023–2025.
 
 ---
 
@@ -104,26 +103,50 @@ For the 3-year balanced dataset use `build_3yr_dataset.py` (see Feature Engineer
 
 | Model | Description |
 |---|---|
+| `dcdetect` | Dual channel/patch attention contrastive learning ← **메인** |
 | `usad` | Dual-decoder adversarial autoencoder |
 | `tranad` | Transformer self-conditioning reconstruction |
 | `conv1d` | 1D Conv Autoencoder |
 | `lstm` | LSTM Seq2Seq Autoencoder |
 | `tcn` | Dilated Causal Conv Autoencoder |
 | `anomtrans` | Anomaly Transformer (association discrepancy) |
-| `dcdetect` | Dual channel/patch attention contrastive learning |
 | `iforest` | Isolation Forest |
 | `ocsvm` | One-Class SVM |
 
-### Supervised (train_supervised.py — removed from develop)
-patchtst, itrans, tsmixer, moderntcn, mamba
-
 ---
 
-## Input Features (12)
+## Input Features
+
+### 베이스 피처 (12개, 고정)
 
 `sog, cog, heading, status, dt, dist_km, cog_hdg_diff, sog_change, cog_hdg_change, speed_consistency, lat_speed, lon_speed`
 
 SEQ_LEN = 10
+
+### FE 후보 피처 (CANDIDATE_FEATURES in feature_engineer.py)
+
+| 피처 | 계산 방법 |
+|---|---|
+| `sog_vec_kn` | GPS유도 속력 — lat/lon_speed → km/s → knots |
+| `lowspeed_crab` | 저속 crab각 — cog_hdg_diff × max(0, 1-sog/3kn) |
+| `cog_change` | COG 변화량 — \|COG(t) - COG(t-1)\| (도) |
+| `cog_move_diff` | COG vs 실이동방향 차이 — AIS COG와 lat/lon 기반 실이동각 오차 |
+| `dist_speed_err` | 거리/속도 불일치 — \|dist_km/dt×3600 - sog×1.852\| |
+| `dist_speed_ratio` | 거리/속도 비율 — dist_km / (sog×dt 환산값) |
+| `anchor_suspicion` | 정박의심 — 저속+Heading변화 복합 지표 |
+| `speed_ratio` | 상대 속도 변화율 — \|sog_change\| / max(sog, 0.5) |
+| `anchored_excess_speed` | 정박 중 초과속력 — status∈{1,5,6} × max(0, sog-1.5kn) |
+| `accel` | 가속도 — Δsog/dt (knots/s) |
+| `heading_rate` | 선수변화율 — Δheading/dt (°/s) |
+| `heading_change` | 선수각변화 — \|heading(t) - heading(t-1)\| |
+| `vec_sog_diff` | 벡터SOG차이 — 벡터분해 후 크기 차이 |
+| `cog_move_diff` | 실이동방향과 COG 차이 |
+
+### 현재 채택 현황 (as of dcdetect_012)
+
+베이스 12개 + 추가 12개 = **24피처**
+추가 피처: `sog_vec_kn, lowspeed_crab, cog_change, cog_move_diff, dist_speed_err, dist_speed_ratio, accel, anchor_suspicion, heading_rate, heading_change, speed_ratio, anchored_excess_speed`
+최고 탐지율: dcdetect_011 → **83.5% (FP=1%, 23피처)**
 
 ---
 
@@ -134,32 +157,30 @@ SEQ_LEN = 10
 | 경로 | 파일 | 용도 |
 |---|---|---|
 | 단순 | `core/pipeline.py` | Slack/git 없이 학습+평가만. 빠른 실험용. |
-| 풀 오케스트레이터 | `orchestrator.py` | Slack 승인 게이트 + Sheets + git 자동화. 실제 운용. |
+| 풀 오케스트레이터 | `orchestrator.py` | Slack 게이트 + Sheets + git 자동화. 실제 운용. |
 
 ### 풀 오케스트레이터 흐름
 
 ```
-[전처리] → [베이스학습] → [평가] → [피처 엔지니어링 학습]
-  각 단계마다: 실행 → Claude 분석 → Slack 승인 (approve / retry / stop)
+[전처리] → [피처 엔지니어링 (Greedy 수렴까지)]
+  FE 단계: 실행 → Claude 분석 → Slack 결과 보고 → 채택 시 플러그인 빌드+커밋+릴리즈
 ```
 
-- **전처리** (`core/preprocess.py`): raw AIS → 파생 피처 12개 추가 → CSV. `--skip_preprocess`로 스킵 가능.
-- **베이스학습** (`core/pipeline.py --train`): dcdetect를 **12개 고정 피처**로 학습. baseline 측정용, **배포용 아님**.
-- **평가** (`core/pipeline.py --eval`): 32개 공격 시나리오 탐지율 측정 (FP≈1%/5%/10% 기준).
-- **피처 엔지니어링 학습** (`core/feature_engineer.py`): **배포용 모델 생성 단계.** Greedy Forward Selection으로 후보 피처 채택 후 `.onnx` / `scaler.json` / `threshold.txt` export.
-- **플러그인 자동 빌드** (`core/patch_plugin.py` + `build_plugin_wsl.sh`): FE 채택 시 자동 실행.
-  1. `patch_plugin.py --scaler scaler_dcdetect.json` → C++ 3파일 자동 패치 (`AUTO:` 마커 구간 교체)
-  2. `ais_ids_pi/data/` ← `model.onnx` / `scaler.json` / `threshold.txt` 복사
-  3. `wsl -d Ubuntu-24.04 bash ml/build_plugin_wsl.sh` → cmake+make package → `ais_ids_pi/*.tar.gz`
-  4. git commit: C++ 패치 3파일 + 모델 파일 3파일 (tar.gz는 gitignore 대상, 릴리스 시 수동 첨부)
+- **전처리** (`core/preprocess.py`): raw AIS → 파생 피처 추가 → CSV. `--skip_preprocess`로 스킵 가능.
+- **피처 엔지니어링** (`core/feature_engineer.py`): Greedy Forward Selection이 **수렴까지 자동 실행**.
+  - 베이스라인 학습 → 후보 피처 전체 탐색 → 목적점수 +3.0pp 이상이면 채택 → 반복 → 수렴
+  - 채택 후 배포용 `.onnx` / `scaler.json` / `threshold.txt` export
+  - 이후 **플러그인 빌드 → git 커밋 → GitHub 릴리즈** 자동 실행
+- **Stage Train / Stage Eval 없음**: FE 베이스라인 학습이 동일 역할을 포함
 
 ### 부가 시스템
 
-- **git**: run마다 `dcdetect_001`, `dcdetect_002`... 브랜치 자동 생성 → FE 완료 후 커밋 → develop 복귀
-- **Google Sheets**: `dcdetect` 모델탭 / `실행요약` / `상세로그` 3탭 자동 기록
-- **Slack**: 각 단계 결과 + Claude 분석 + 승인 버튼 (`integrations/slack_bot.py`)
-- **Claude 분석**: 각 단계 완료 후 `claude -p` CLI 호출 → 결과 평가 + continue/retry/stop 추천
-- **fe_state.json**: 이전 run 채택 피처 저장 → 다음 run `--initial_extra`로 자동 전달 (수렴까지 반복)
+- **git**: run마다 `dcdetect_001`, `dcdetect_002`... 브랜치 자동 생성 → FE 완료 후 커밋
+- **GitHub 릴리즈**: 태그 `run/dcdetect_NNN` (prerelease) — commit SHA 기준으로 자동 생성
+- **Google Sheets**: 5개 탭 자동 기록 (아래 섹션 참고)
+- **Slack**: 각 단계 결과 + Claude 분석 + 진행 상황 실시간 보고
+- **Claude 분석**: FE 완료 후 `claude -p` CLI 호출 → 결과 평가
+- **fe_state.json**: 다음 run의 Greedy 시작점 피처 저장 (`initial_extra`). 수동으로 관리.
 
 ---
 
@@ -171,17 +192,22 @@ python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
   --data_file "D:/ais_data/preprocessed/ais_preprocessed_3yr.csv" \
   --base_dir "D:/" --skip_preprocess
 
+# 자동 승인 (잠자는 동안 실행)
+python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
+  --data_file "D:/ais_data/preprocessed/ais_preprocessed_3yr.csv" \
+  --base_dir "D:/" --skip_preprocess --auto_approve
+
 # 단순 학습+평가 (실험용)
-python ml/core/pipeline.py --train --eval --models conv1d tranad dcdetect --epochs 10 --n_anom 200 --fp_targets 1
+python ml/core/pipeline.py --train --eval --models dcdetect --epochs 10
 
-# 평가만
-python ml/core/pipeline.py --eval --models conv1d dcdetect
-
-# 이미 학습된 모델 스킵
-python ml/core/pipeline.py --train --eval --models conv1d tranad dcdetect --skip_trained
+# FE 단독 실행
+python ml/core/feature_engineer.py \
+  --input D:\ais_data\preprocessed\ais_preprocessed_3yr.csv \
+  --base_dir D:\ --max_mmsi 3000 --epochs 5 \
+  --export_dir D:\ais_models\dcdetect
 ```
 
-**Claude Code에서 orchestrator 실행 시**: `run_in_background`로 실행할 것. 각 단계 승인은 Slack 버튼이 처리하므로 출력을 스트리밍하지 않음. 에러 시에만 로그 파일 확인.
+**Claude Code에서 orchestrator 실행 시**: `run_in_background`로 실행. Slack이 보고/승인 처리. 에러 시에만 로그 확인.
 
 orchestrator.py defaults:
 - `--model`: `dcdetect`
@@ -189,41 +215,133 @@ orchestrator.py defaults:
 - `--max_mmsi`: `500` (3yr 캐시 재사용하려면 `3000` 명시)
 - `--data_file`: `D:/ais_data/preprocessed/2025/ais_preprocessed_2025.csv`
 - `--base_dir`: `D:/`
-
-core/pipeline.py defaults:
-- `--base_dir`: `D:\` — all model files and output go under this root
-- `--raw_data`: `D:\ais_data\raw\2025`
-- `--data_file`: `D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv`
+- `--min_gain`: `3.0` (Greedy 채택 임계 목적점수 향상량)
 
 ---
 
-## Feature Engineering (`core/feature_engineer.py` + `auto_feat_eng.py`)
+## Feature Engineering (`core/feature_engineer.py`)
 
-Goal: find derived features that raise DCdetect detection rate, then export a deployable model trained on that exact feature set.
+Goal: find derived features that raise DCdetect detection rate, then export a deployable model.
 
-- **`feature_engineer.py`** — one FE pass: Greedy Forward Selection (add a candidate feature only if detection rate gains ≥ `--min_gain`, default 3.0pp) + Permutation Importance on the best set.
-  - `--export_dir DIR` — after selection, trains `model_best` on the best feature set and writes deployable **`model_dcdetect.onnx` / `scaler_dcdetect.json` (records `features`/`min`/`max`/`clip_lo`/`clip_hi`) / `threshold_dcdetect.txt`** to DIR. The scaler `features` array is the authoritative feature order — the C++ plugin must match it.
-  - `--holdout_file FILE` — separate preprocessed CSV used **only** for FP=1% threshold measurement. Must be disjoint from `--input` (different dates/vessels). If omitted, a warning is shown and synthetic normals are used (less accurate).
-  - Other opts: `--max_mmsi`, `--epochs`, `--n_anom`, `--weak_floor`/`--weak_weight` (up-weight weak scenarios in the objective), `--max_feat` (cap; 16 keeps nhead=8), `--initial_extra` (start set), `--out_json`.
-  - **Sequence cache**: training data is pickled to `<input>.s<max_mmsi>_seed<SEED>_L{SEQ_LEN}_b{SEQ_BREAK}_c{MAX_SEQ_PER_MMSI}.train.pkl`; holdout is pickled to `<holdout_file>_L{SEQ_LEN}_b{SEQ_BREAK}.holdout.pkl`. Later runs reuse both. Deterministic (fixed SEED).
-- **`auto_feat_eng.py`** — automation loop: (optionally wait for downloads →) build 3yr dataset → run `feature_engineer.py` up to `--max_iter` times, chaining each iteration's best set as the next `--initial_extra`, stopping when no new feature is adopted. Defaults: `MAX_MMSI=3000, EPOCHS=5, N_ANOM=150, MAX_ITER=5, EXPORT_DIR=D:\ais_models\dcdetect`.
-  - Run: `python ml/auto_feat_eng.py --no_wait --skip_build` (dataset already built). Use `PYTHONUNBUFFERED=1` for live logs.
+### 알고리즘
 
-### Evaluation & Threshold (target FP = 1% on held-out real normal sequences)
-- Detection rate and the deployed threshold are BOTH pinned to a **1% false-positive rate on real normal AIS sequences**, NOT synthetic data.
-- **Holdout architecture (no leakage):** `load_raw_seqs(input, max_mmsi)` returns 100% of sampled MMSIs as `train_seqs`. FP measurement uses a **completely separate** preprocessed file via `--holdout_file` → `load_holdout_seqs(holdout_file)` reads all MMSIs from that file (no sampling cap). The holdout file must cover dates/vessels not in the training data.
-- `evaluate()` scores `eval_normal_seqs` (from holdout) and sets `fp1_thr = np.percentile(normal_scores, 99)` (top 1% → FP 1%); detection rate = % of synthetic attack sequences scoring above it.
-- `--export_dir` writes `threshold_dcdetect.txt` via `compute_fp_threshold(eval_normal_seqs, ..., fp_pct=1.0)` — the same 99th-percentile-of-holdout-normal, so the deployed plugin threshold matches the reported FP=1%.
-- To change the target FP, pass a different `fp_pct` (threshold = `percentile(eval_normal_scores, 100 - fp_pct)`).
+**Greedy Forward Selection**:
+1. 베이스라인 학습 (현재 피처셋)
+2. 후보 피처 각각 추가 → 학습 → 목적점수 계산 (`전체평균 + 1.0 × 약세평균`)
+3. 최고 목적점수 향상이 `--min_gain`(기본 3.0pp) 이상이면 채택
+4. 채택된 피처를 포함해 다음 스텝 반복
+5. 더 이상 기준 충족 후보 없으면 수렴 종료
+6. 최종 피처셋으로 배포용 모델 export
 
-### 3-Year Balanced Dataset (`build_3yr_dataset.py`)
-- Output: `D:\ais_data\preprocessed\ais_preprocessed_3yr.csv` (~10.9 GB).
-- Purpose: avoid confirmation bias from a single day/season. Picks N days/month across 2023–2024–2025.
-- **MMSI sampling (in `load_raw_seqs`)**: each MMSI is bucketed by its dominant `YYYY-MM`; `max_mmsi` is split evenly across active months (random within bucket, fixed SEED), so no year/season dominates. All sampled MMSIs go to training (100%). Sequences: SEQ_LEN=10, split on `dt ≥ 600s`, capped at 500/MMSI.
+### 평가 기준 (FP = 1%)
 
-### Current feature status
-- Base = 12 features. FE validated 16 = 12 base + `accel, heading_rate, vec_sog_diff, heading_change` (~88.8%); adding more (e.g. `lowspeed_crab`) did not help.
-- **Deployed plugin model is still 12-feature.** To ship the 16-feature model: take `--export_dir` output → update C++ `ML_FEATURE_COUNT`/`PushFeature`/`ais_ids.cpp` compute to match the scaler `features` order → build → release.
+- 임계값 = 홀드아웃 정상 시퀀스 점수의 **99퍼센타일** (상위 1%가 오탐됨)
+- 탐지율 = 공격 시나리오 시퀀스 중 임계값 초과 비율
+- FP=5%, FP=10% 기준도 동시 계산 (95/90퍼센타일 임계값)
+- 배포 threshold = 이 FP=1% 임계값과 동일 → 현장에서도 동일한 오탐율 보장
+
+### 출력 JSON 키
+
+| 키 | 설명 |
+|---|---|
+| `best_extra` | 최종 채택된 추가 피처 목록 |
+| `best_det` | FP=1% 최종 탐지율 (%) |
+| `det_fp5` | FP=5% 최종 탐지율 (%) |
+| `det_fp10` | FP=10% 최종 탐지율 (%) |
+| `threshold` | 배포 임계값 (정상 점수 99퍼센타일) |
+| `baseline_det` | FE 시작 전 탐지율 (%) |
+| `scenario_fp1` | 시나리오별 FP=1% 탐지율 dict |
+| `scenario_fp5/fp10` | 시나리오별 FP=5%/10% 탐지율 dict |
+| `permutation_importance` | 피처 제거 시 탐지율 하락량 (음수 클수록 중요) |
+
+### 주요 옵션
+
+| 옵션 | 기본값 | 설명 |
+|---|---|---|
+| `--input` | (필수) | 전처리 CSV |
+| `--max_mmsi` | 500 | 학습 MMSI 수 상한 |
+| `--epochs` | 5 | 에포크 수 |
+| `--n_anom` | 200 | 시나리오당 이상 시퀀스 수 |
+| `--min_gain` | 3.0 | 채택 최소 목적점수 향상(pp) |
+| `--initial_extra` | [] | Greedy 시작 추가 피처 (fe_state.json에서 자동 로드) |
+| `--export_dir` | — | 배포용 ONNX/scaler/threshold 저장 경로 |
+| `--holdout_file` | — | FP 측정 전용 별도 파일 (학습 데이터와 완전 분리) |
+
+---
+
+## Google Sheets 탭 구조
+
+Google Sheets에 5개 탭 자동 기록. 설정은 `ml/pipeline_config.json` (gitignored).
+
+### 1. `dcdetect` 탭 — run별 상세 로그
+
+| 컬럼 | 의미 |
+|---|---|
+| `branch` | 브랜치명 (▶ dcdetect_001 형식으로 run 구분) |
+| `timestamp` | 기록 시각 |
+| `stage` | 단계명 (RUN START / 피처 엔지니어링 학습 / RUN DONE) |
+| `status` | 완료/실패/진행 중 |
+| `det_change` | 탐지율 변화 (베이스라인→최종, 예: `56.6%→81.8%(+25.3pp)`) |
+| `n_features` | 이번 run 최종 총 피처 수 |
+| `adopted` | 이번 run에서 신규 채택된 피처명 |
+| `threshold` | FP=1% 배포 임계값 |
+| `elapsed_s` | 소요 시간 (초) |
+
+### 2. `실행요약` 탭 — run 1줄 요약
+
+| 컬럼 | 의미 |
+|---|---|
+| `timestamp` | run 시작 시각 |
+| `branch` | 브랜치명 |
+| `model` | 모델명 (dcdetect) |
+| `epochs` | 학습 에포크 수 |
+| `max_mmsi` | 학습에 사용한 선박 수 상한 |
+| `data_file` | 학습 데이터 파일 경로 |
+| `fe_steps` | 이번 run에서 새로 채택된 피처 수 |
+| `fe_baseline` | FE 시작 전 탐지율 FP=1% (%) |
+| `fe_det_fp1` | FE 최종 탐지율 FP=1% (%) |
+| `fe_det_fp5` | FE 최종 탐지율 FP=5% (%) |
+| `fe_det_fp10` | FE 최종 탐지율 FP=10% (%) |
+| `fe_n_feat` | 최종 총 피처 수 |
+| `fe_features` | 이번 run 누적 채택 피처 전체 목록 |
+| `fe_threshold` | 배포 임계값 (FP=1% 정상 점수 99퍼센타일) |
+| `notes` | 상태 (완료 / 수렴 완료) |
+
+### 3. `상세로그` 탭 — 모든 단계 raw 로그
+
+| 컬럼 | 의미 |
+|---|---|
+| `timestamp` | 기록 시각 |
+| `branch` | 브랜치명 |
+| `stage` | 단계명 |
+| `status` | 완료/실패 |
+| `det_rate` | FP=1% 탐지율 |
+| `n_features` | 피처 수 |
+| `threshold` | 임계값 |
+| `elapsed_sec` | 소요 시간 (초) |
+| `notes` | 채택 피처 등 메모 |
+
+### 4. `시나리오결과` 탭 — 시나리오별 탐지율
+
+| 컬럼 | 의미 |
+|---|---|
+| `timestamp` | 기록 시각 |
+| `branch` | 브랜치명 |
+| `model` | 모델명 |
+| `fp_target` | FP 기준 (`FP=1%`) |
+| `scenario` | 시나리오명 (Basic1, D2, FN3, F1, G2 ...) |
+| `det_rate` | 해당 시나리오 탐지율 (%) |
+
+### 5. `피처중요도` 탭 — 순열 중요도
+
+| 컬럼 | 의미 |
+|---|---|
+| `timestamp` | 기록 시각 |
+| `branch` | 브랜치명 |
+| `fe_step` | FE 단계 (Step 1) |
+| `feature` | 피처명 |
+| `importance_pp` | 해당 피처 제거 시 탐지율 하락량 (pp). **음수가 클수록 중요.** 예: -20.9 = 제거 시 탐지율 20.9%p 하락 |
+| `description` | 피처 설명 |
 
 ---
 
@@ -235,16 +353,14 @@ Goal: find derived features that raise DCdetect detection rate, then export a de
 | FN (4) | Designed to evade rule-based detectors |
 | D (4) | ML model evasion attempt 1st gen |
 | E (5) | ML model evasion attempt 2nd gen |
-| F (7, holdout) | Advanced attacks — excluded from training |
-| G (7, holdout) | Novel holdout scenarios |
+| F (7) | Advanced attacks |
+| G (7) | Novel scenarios |
 
 ---
 
 ## Model File Path Rules
 
-(For the full D:\ tree see "Data Paths" above.)
 - Trained (per model): `D:\ais_models\{name}\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
-- Deploy: `ml/deploy/model.onnx`, `ml/deploy/scaler.json`, `ml/deploy/threshold.txt`
 - Plugin: `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
 
 ---
@@ -258,33 +374,27 @@ FE 피처 채택 시 orchestrator가 자동 실행. 수동 실행 시:
 python ml/core/patch_plugin.py --scaler D:/ais_models/dcdetect/scaler_dcdetect.json --dry_run
 python ml/core/patch_plugin.py --scaler D:/ais_models/dcdetect/scaler_dcdetect.json
 
-# 2. WSL 빌드
-wsl -d Ubuntu-24.04 bash ml/build_plugin_wsl.sh /mnt/c/Users/imcas/JB-Pirate-King
-# 결과: ais_ids_pi/ais_ids_pi-*.tar.gz
+# 2. Linux 빌드 (native Linux만 지원)
+./local-build-package.sh   # from ais_ids_pi/
+# 결과: ais_ids_pi-<version>-ubuntu-x86_64-24.04-noble.tar.gz
 ```
 
 **AUTO: 마커 위치** (C++ 자동 패치 구간):
-- `ais_ml.h`: `[AUTO:feat_block]` (ML_FEATURE_COUNT + 피처 주석), `[AUTO:push_decl]` (PushFeature 선언)
-- `ais_ml.cpp`: `[AUTO:push_impl]` (PushFeature 구현)
-- `ais_ids.cpp`: `[AUTO:extra_feats]` (파생 피처 계산), `[AUTO:push_calls]` (양 모델 PushFeature 호출)
-
-**지원 추가 피처** (`EXTRA_FEAT_CPP` in patch_plugin.py):
-`accel`, `heading_change`, `heading_rate`, `vec_sog_diff`, `cog_change`, `turn_rate`,
-`dist_speed_err`, `lowspeed_crab`, `cog_sin_hdg`, `status_fn4_flag`, `hdg_perp_score`, `status_motion_flag`
+- `ais_ml.h`: `[AUTO:feat_block]` (ML_FEATURE_COUNT + 피처 주석), `[AUTO:push_decl]`
+- `ais_ml.cpp`: `[AUTO:push_impl]`
+- `ais_ids.cpp`: `[AUTO:extra_feats]`, `[AUTO:push_calls]`
 
 ---
 
 ## Plugin Build & Deploy (native Linux ONLY)
 
-**The OpenCPN plugin is built and deployed on native Linux. Windows is used only for ML model training (the `ml/` pipeline). Do not add Windows/WSL-specific workarounds to the build scripts.**
+**The OpenCPN plugin is built and deployed on native Linux. Windows is used only for ML model training.**
 
-- Target: Ubuntu 24.04 (noble) — matches `OCPN_TARGET=noble` in `local-build-package.sh`.
-- `ais_ids_pi/opencpn-libs/` is a git submodule (`https://github.com/OpenCPN/opencpn-libs`). Before the first build run `git submodule update --init --recursive`, otherwise cmake fails with "opencpn-libs/... is not an existing directory".
-- ONNX Runtime is bundled at `ais_ids_pi/onnxruntime/{include,lib}`. On Linux the `.so`/`.so.1` files are real symlinks (only break when checked out on NTFS/Windows).
-- Build deps: `g++ cmake`, wxWidgets 3.2 dev (`libwxgtk3.2-dev`), `nlohmann-json3-dev`, and full OpenCPN build deps (`sudo mk-build-deps --install ci/control`).
-- Build command (from `ais_ids_pi/`): `./local-build-package.sh` → produces `ais_ids_pi-<version>-ubuntu-x86_64-24.04-noble.tar.gz`.
-- Plugin loads `model.onnx`/`scaler.json`/`threshold.txt` by default (single-model). For ensemble, drop an `ensemble_config.json` in `data/`. `model_seq5.*` is the optional early-detection seq5 model.
-- C++ feature count is hardcoded: `ML_FEATURE_COUNT` in `ais_ids_pi/include/ais_ml.h`. It MUST match the deployed model/scaler feature count (currently 12). Changing features requires updating `ML_FEATURE_COUNT`, `PushFeature()` (decl + impl in `ais_ml.cpp`), and the compute/call sites in `ais_ids.cpp`.
+- Target: Ubuntu 24.04 (noble)
+- `ais_ids_pi/opencpn-libs/` is a git submodule. Before first build: `git submodule update --init --recursive`
+- ONNX Runtime bundled at `ais_ids_pi/onnxruntime/{include,lib}`
+- Build command (from `ais_ids_pi/`): `./local-build-package.sh`
+- C++ feature count hardcoded: `ML_FEATURE_COUNT` in `ais_ids_pi/include/ais_ml.h`. Must match deployed model.
 
 ---
 
@@ -292,113 +402,45 @@ wsl -d Ubuntu-24.04 bash ml/build_plugin_wsl.sh /mnt/c/Users/imcas/JB-Pirate-Kin
 
 - `main`: stable releases
 - `develop`: main integration branch — work here
-- `claude/*`: Claude Code working branches (merge into develop when done)
+- `dcdetect_NNN`: run별 자동 생성 브랜치 (orchestrator가 생성, FE 완료 후 커밋)
 
 ---
 
 ## Release & Version Management
 
-### Version Scheme
+### Automated Run Releases (prerelease)
 
-`v{major}.{minor}.{patch}` — Semantic Versioning
+orchestrator가 FE 완료 시 자동 생성:
+- 태그: `run/dcdetect_NNN` (prerelease)
+- target: commit SHA (브랜치명 사용 시 422 오류)
+- 첨부: 모델 3파일 (`model_dcdetect.onnx`, `scaler_dcdetect.json`, `threshold_dcdetect.txt`)
+- 플러그인 tar.gz는 Linux에서만 빌드 가능 — 수동 첨부
 
-| Bump | When | Example |
-|---|---|---|
-| **major** | Input features change (12→N), model interface breaks, SEQ_LEN change | v1.0.0 → v2.0.0 |
-| **minor** | New model added, new eval scenarios added, significant accuracy improvement | v1.0.0 → v1.1.0 |
-| **patch** | Threshold re-tuned, bug fix, same model retrained on more data | v1.0.0 → v1.0.1 |
-
-A model retrained on new data (same architecture) = **patch**. New architecture = **minor**.
-
-### Release Assets
-
-Every release MUST attach the following.
-
-**1. Plugin package (REQUIRED) — output of `local-build-package.sh`**
-- `ais_ids_pi-{version}-ubuntu-x86_64-{ubuntu_ver}-noble.tar.gz` — built plugin (model/scaler/threshold bundled under `data/` + ONNX Runtime `.so`). Users just extract it and it works.
-- Built on native Linux (NOT Windows). Run `git submodule update --init --recursive` before building. See the "Plugin Build & Deploy" section.
-
-**2. Model files (REQUIRED) — for individual download**
-- `model_{name}.onnx` — trained ONNX model (one per model)
-- `scaler_{name}.json` — Min-Max scaler (the `features` array shows feature order/count)
-- `threshold_{name}.txt` — anomaly threshold
-
-**3. Performance reports (optional)**
-- `comparison_TIMESTAMP.txt` — human-readable performance table
-- `comparison_TIMESTAMP.csv` — combined model comparison CSV
-- `{model}_TIMESTAMP.csv` — per-model individual CSV (one per model)
-
-> For the detection-rate numbers, use the actual evaluation values of THAT model — do not misquote numbers from a different feature set.
-
-### How to Create a Release
+### Stable Releases (수동)
 
 ```bash
-# 1. Merge claude/* branch into develop, then develop into main
-git checkout main
-git merge develop
-
-# 2. Tag
-git tag v1.0.0
-git push origin main --tags
-
-# 3. Create release and attach files
-#    (1) plugin tar.gz  (2) model files  (3) performance reports (optional)
+git checkout main && git merge develop
+git tag v1.0.0 && git push origin main --tags
 gh release create v1.0.0 \
-  ais_ids_pi/ais_ids_pi-1.0.358.1-ubuntu-x86_64-24.04-noble.tar.gz \
-  D:\ais_models\dcdetect\model_dcdetect.onnx \
-  D:\ais_models\dcdetect\scaler_dcdetect.json \
-  D:\ais_models\dcdetect\threshold_dcdetect.txt \
-  D:\ais_output\pipeline\comparison_TIMESTAMP.txt \
-  D:\ais_output\pipeline\comparison_TIMESTAMP.csv \
-  --title "v1.0.0 — conv1d / tranad / dcdetect" \
-  --notes "$(cat <<'EOF'
-## Models
-- conv1d, tranad, dcdetect (3 epochs each)
-
-## Training Data
-- D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
-- Coverage: 2025-09-14 (1 day, expand later)
-
-## Performance (FP ≈ 1%)
-- conv1d:   train 68.3% / holdout 70.8%
-- tranad:   train 35.4% / holdout 61.0%
-- dcdetect: train 47.4% / holdout 65.6%
-
-## Plugin Deploy
-Copy model.onnx / scaler.json / threshold.txt to ais_ids_pi/data/
-EOF
-)"
-
-# 4. Download on another machine
-gh release download v1.0.0 --dir D:\ais_models
+  --title "v1.0.0 — dcdetect 24피처" \
+  --notes "..."
 ```
 
-### Release Notes Template
+### Version Scheme
 
-```
-## Models
-- <model list and epoch counts>
-
-## Training Data
-- <data file path and date coverage>
-
-## Performance (FP ≈ 1%)
-- <model>: train X% / holdout Y%
-
-## Changes from previous version
-- <what changed>
-
-## Plugin Deploy
-- Recommended: extract `ais_ids_pi-*.tar.gz` into the OpenCPN plugin path (model bundled, works immediately)
-- Manual: copy model_{name}.onnx/scaler/threshold to ais_ids_pi/data/ as model.onnx/scaler.json/threshold.txt
-```
+| Bump | When |
+|---|---|
+| **major** | 피처 수/인터페이스 변경 (12→N), SEQ_LEN 변경 |
+| **minor** | 신규 모델, 평가 시나리오 추가, 탐지율 대폭 향상 |
+| **patch** | 임계값 재조정, 버그 수정, 동일 구조 재학습 |
 
 ### Version History
 
-| Version | Date | Models | Notes |
-|---|---|---|---|
-| v0.1.0 | — | conv1d, tranad, dcdetect | Initial release (1-day training data) |
-| v0.2.0 | 2026-05-22 | dcdetect | Plugin default model.onnx → dcdetect (12 feat, 3yr data). Adds model_dcdetect.* + Linux tar.gz to release assets |
+| Version | Date | Notes |
+|---|---|---|
+| v0.1.0 | — | Initial release (conv1d, tranad, dcdetect, 1-day data) |
+| v0.2.0 | 2026-05-22 | dcdetect 12피처, 3yr 데이터 |
+| run/dcdetect_001~012 | 2026-05-29 | Greedy FE 자동화 runs (prerelease, 13~24피처) |
 
 ---
 
@@ -409,9 +451,7 @@ Two distinct environments — keep them separate:
 **ML training (Windows)**
 - Python 3.14 (Windows)
 - Console encoding: cp949 — `sys.stdout.reconfigure(encoding='utf-8')` applied in pipeline.py
-- GPU: Intel Arc B390 (iGPU, shared memory) — no CUDA, torch-directml not installed
-- Training runs on CPU
+- GPU: Intel Arc B390 (iGPU, shared memory) — no CUDA, training on CPU
 
 **Plugin build/deploy (native Linux)**
-- Ubuntu 24.04 (noble). See "Plugin Build & Deploy" section above.
-- Windows/WSL is NOT the build target — don't add Windows-specific hacks to build scripts.
+- Ubuntu 24.04 (noble). Windows/WSL is NOT the build target.
