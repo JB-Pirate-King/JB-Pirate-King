@@ -60,16 +60,18 @@ python ml/core/feature_engineer.py \
 ## 오케스트레이터 흐름
 
 ```
-[전처리 (선택)] → [피처 엔지니어링 — Greedy 수렴까지]
-                           ↓
-              채택 피처로 모델 export
-                           ↓
-         C++ 패치 → 플러그인 빌드 → git 커밋 → GitHub 릴리즈
+[전처리(첫 브랜치 1회, --skip_preprocess면 생략)]
+   ↓
+dcdetect_001: FE(Greedy 1피처 채택) → 채택셋 재학습/평가/threshold → export
+              → C++패치·플러그인빌드·커밋·릴리즈 → fe_state 저장
+   ↓ 자동 체이닝
+dcdetect_002 → 003 → ... → 채택 없으면 수렴 종료
 ```
 
-- Stage Train / Stage Eval 없음 — FE 베이스라인 학습이 그 역할 포함
-- Greedy가 수렴까지 자동 실행 (step 개념 없음)
-- 채택 발생 시: 배포용 `.onnx` / `scaler.json` / `threshold.txt` export 후 커밋
+- **베이스 Train/Eval 단계 없음** — 베이스라인 학습+평가는 FE 내부에서 수행 (중복·11GB 중복스캔 제거)
+- run(브랜치)당 **Greedy 1피처 채택**(`--max_steps 1`) → 새 브랜치로 체이닝
+- 채택 시: 채택셋 **재학습** → 배포 `.onnx`/`scaler.json`/`threshold.txt` export → 커밋 → project(upstream) push
+- 출력: 지표→Sheets, 모델→브랜치+릴리즈, FE 중간물→`ml/.pipeline_tmp/`(gitignore)
 
 ---
 
@@ -115,7 +117,8 @@ python ml/core/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed
 1. 베이스라인 학습 (현재 피처셋으로 DCdetect 학습 + FP=1%/5%/10% 평가)
 2. 후보 피처를 하나씩 추가해 목적점수(`전체평균 + 1.0 × 약세평균`) 계산
 3. 최고 향상이 `--min_gain`(기본 3.0pp) 이상이면 채택
-4. 수렴까지 반복 후 배포용 모델 export
+4. 채택셋으로 재학습(model_best) → 순열중요도 + 최종 FP1/5/10 + threshold → 배포 export
+5. `--max_steps`로 호출당 채택 횟수 제한 (오케스트레이터=`1`, 브랜치 체이닝 / 미지정 시 수렴까지)
 
 ### FP 평가 기준
 
