@@ -1007,6 +1007,10 @@ def main():
     parser.add_argument("--raw_dir",         default="D:/ais_data/raw/2025")
     parser.add_argument("--data_file",       default="D:/ais_data/preprocessed/2025/ais_preprocessed_2025.csv")
     parser.add_argument("--skip_preprocess", action="store_true")
+    parser.add_argument("--skip_train",      action="store_true",
+                        help="베이스 학습 단계 생략")
+    parser.add_argument("--skip_eval",       action="store_true",
+                        help="베이스 평가 단계 생략")
     parser.add_argument("--holdout_file",    default=None,
                         help="FP=1%% 측정용 별도 전처리 파일 (학습 데이터와 완전 분리)")
     parser.add_argument("--min_gain",        type=float, default=3.0,
@@ -1047,6 +1051,8 @@ def main():
 
     stages = []
     if not args.skip_preprocess: stages.append("전처리")
+    if not args.skip_train:      stages.append("베이스학습")
+    if not args.skip_eval:       stages.append("평가")
     stages.append("피처 엔지니어링 학습")
     total_steps = len(stages)
 
@@ -1057,6 +1063,18 @@ def main():
 
     if not args.skip_preprocess:
         if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
+            bot.log("파이프라인 중단", "warning")
+            git.checkout("develop")
+            return
+
+    if not args.skip_train:
+        if not stage_train(bot, sheet, branch, args, make_step_info("베이스학습")):
+            bot.log("파이프라인 중단", "warning")
+            git.checkout("develop")
+            return
+
+    if not args.skip_eval:
+        if not stage_eval(bot, sheet, branch, args, make_step_info("평가")):
             bot.log("파이프라인 중단", "warning")
             git.checkout("develop")
             return
