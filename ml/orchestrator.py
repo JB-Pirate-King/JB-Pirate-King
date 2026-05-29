@@ -35,6 +35,12 @@ BASE_FEATURES = [
 # feature_engineer.py 의 INITIAL_EXTRA 와 동기화
 FE_INITIAL_EXTRA = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
 
+# 파이프라인 작업용 임시 출력 디렉터리 (repo-local, gitignore 대상)
+#   - FE 결과 JSON / 모델 export 는 여기에 쓰고 transient 하게만 사용.
+#   - 영구 산출물: 지표→Google Sheets, 모델→브랜치(ais_ids_pi/data) 커밋.
+#   - D 드라이브(base_dir)에는 더 이상 출력물을 남기지 않음 (입력 데이터/캐시만 D).
+WORK_DIR = Path("ml/.pipeline_tmp")
+
 # 피처 설명 (계산 방식 포함)
 FEATURE_DESCRIPTIONS = {
     "sog":               "속력 — AIS 원본값 (knots)",
@@ -570,7 +576,7 @@ def stage_build_plugin(bot, args, scaler_path: str) -> list[str]:
     plugin_dir = Path("ais_ids_pi")
     data_dir   = plugin_dir / "data"
     data_dir.mkdir(exist_ok=True)
-    model_dir  = Path(args.base_dir) / "ais_models" / args.model
+    model_dir  = WORK_DIR / "model"
 
     # ── 1. C++ 패치 ──────────────────────────────────────────────────
     bot.log("🔧 플러그인 C++ 코드 패치 중...", "플러그인빌드")
@@ -674,7 +680,7 @@ def stage_release(bot, args, branch: str, run_num: int,
     첨부: tar.gz (존재하면) + 모델 3파일.
     """
     plugin_dir = Path("ais_ids_pi")
-    model_dir  = Path(args.base_dir) / "ais_models" / args.model
+    model_dir  = WORK_DIR / "model"
 
     tag = f"run/{args.model}_{run_num:03d}"
 
@@ -817,7 +823,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
          "--max_mmsi", str(args.max_mmsi),
          "--out_json", out_json,
          "--initial_extra"] + current_initial_extra + [
-         "--export_dir", str(Path(args.base_dir) / "ais_models" / args.model),
+         "--export_dir", str(WORK_DIR / "model"),
          "--min_gain", str(args.min_gain)]
         + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
         progress_cb=fe_progress
@@ -929,20 +935,11 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
         det_str  = f"{det_rate:.1f}" if det_rate else "?"
         n_feat_s = str(n_feat) if n_feat else "?"
 
-        commit_files = []
-        if Path(out_json).exists():
-            commit_files.append(out_json)
-        model_dir = Path(args.base_dir) / "ais_models" / args.model
-        for fname in [f"model_{args.model}.onnx",
-                      f"scaler_{args.model}.json",
-                      f"threshold_{args.model}.txt"]:
-            p = model_dir / fname
-            if p.exists():
-                commit_files.append(str(p))
-
+        # 모델/JSON은 WORK_DIR(gitignore, 임시)에만 존재 → 커밋 대상 아님.
+        # 영구 보존: 지표→Sheets, 모델→ais_ids_pi/data (plugin_files)로 커밋.
+        model_dir    = WORK_DIR / "model"
         scaler_path  = str(model_dir / f"scaler_{args.model}.json")
-        plugin_files = stage_build_plugin(bot, args, scaler_path)
-        commit_files += plugin_files
+        commit_files = stage_build_plugin(bot, args, scaler_path)
 
         if commit_files:
             git.commit_results(
@@ -967,7 +964,7 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
       None  — 사용자 중단
     """
     current_initial_extra = _load_fe_initial_extra()
-    fe_dir = Path(args.base_dir) / "ais_output" / "feat_eng_iter"
+    fe_dir = WORK_DIR
     fe_dir.mkdir(parents=True, exist_ok=True)
 
     while True:  # retry 전용 루프
