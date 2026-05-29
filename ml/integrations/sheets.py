@@ -138,57 +138,43 @@ class PipelineSheets:
         elapsed_str = f"{elapsed_sec:.0f}s" if elapsed_sec else ""
 
         ws_model = self._ensure_model_tab(model)
+        # MODEL_HEADERS: branch,timestamp,stage,status,det_change,n_features,adopted,threshold,elapsed_s
         self._append_and_track(ws_model, [
             "", ts, "베이스학습", status,
-            elapsed_str, "", "", "", notes
+            "", "", "", "", elapsed_str
         ])
 
         self._append_and_track(self._ws("상세로그"), [
             ts, branch, "베이스학습", status,
             "", "", "", elapsed_str.rstrip("s"), notes
         ])
-
-        if self._summary_row:
-            self._ws("실행요약").update_cell(self._summary_row,
-                                             SUMMARY_HEADERS.index("train_status") + 1, status)
+        # 실행요약은 FE 단계가 소유 — 학습 단계는 모델탭/상세로그에만 기록
 
     # ── 평가 ────────────────────────────────────────────────────────
 
     def log_eval(self, branch: str, model: str, status: str,
                  det_fp1: float = None, det_fp5: float = None,
-                 det_fp10: float = None, holdout_fp10: float = None,
-                 fp1_holdout: float = None,
+                 det_fp10: float = None,
                  elapsed_sec: float = None, notes: str = ""):
+        """베이스 평가 결과 기록 (모델탭 + 상세로그).
+        실행요약은 FE 단계가 소유하므로 여기서 건드리지 않음.
+        시나리오별 탐지율은 호출측에서 log_scenarios로 별도 기록."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f = lambda v, d=1: f"{v:.{d}f}" if v is not None else ""
-
-        m1 = f"FP1%: {f(det_fp1)}%|{f(fp1_holdout)}%" if det_fp1 else ""
-        m2 = f"FP5%: {f(det_fp5)}%" if det_fp5 else ""
-        m3 = f"FP10%: {f(det_fp10)}%|{f(holdout_fp10)}%" if det_fp10 else ""
+        f = lambda v, d=1: f"{v:.{d}f}" if v is not None else "-"
         elapsed_str = f"{elapsed_sec:.0f}s" if elapsed_sec else ""
 
+        det_summary = f"FP1:{f(det_fp1)}% FP5:{f(det_fp5)}% FP10:{f(det_fp10)}%" if det_fp1 else ""
+
         ws_model = self._ensure_model_tab(model)
+        # MODEL_HEADERS: branch,timestamp,stage,status,det_change,n_features,adopted,threshold,elapsed_s
         self._append_and_track(ws_model, [
-            "", ts, "평가", status, m1, m2, m3, elapsed_str, notes
+            "", ts, "베이스평가", status, det_summary, "", "", "", elapsed_str
         ])
 
         self._append_and_track(self._ws("상세로그"), [
-            ts, branch, "평가", status,
-            f(det_fp1), "", "", elapsed_str.rstrip("s"), notes
+            ts, branch, "베이스평가", status,
+            f(det_fp1), "", "", elapsed_str.rstrip("s"), det_summary
         ])
-
-        if self._summary_row:
-            ws_s = self._ws("실행요약")
-            for col_name, val in [
-                ("fp1_train",    f(det_fp1)),
-                ("fp1_holdout",  f(fp1_holdout)),
-                ("fp5_train",    f(det_fp5)),
-                ("fp10_train",   f(det_fp10)),
-                ("fp10_holdout", f(holdout_fp10)),
-            ]:
-                if val:
-                    ws_s.update_cell(self._summary_row,
-                                     SUMMARY_HEADERS.index(col_name) + 1, val)
 
     def log_scenarios(self, branch: str, model: str, fp_target: str,
                       scenarios: dict[str, float]):
