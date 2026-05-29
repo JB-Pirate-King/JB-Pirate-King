@@ -48,15 +48,9 @@ WEAK_WEIGHT    = 1.5
 MIN_GAIN       = 3.0
 MAX_FEAT       = 18
 MAX_ITER       = 5      # 피처 엔지니어링 최대 반복 횟수
+EXPORT_DIR     = r"D:\ais_models\dcdetect"  # 최적 피처셋 배포 모델 저장 경로
 
 
-# ── 알림 헬퍼 ────────────────────────────────────────────────────────
-def _notify(title: str, summary: str, color: int = 0x3498DB):
-    try:
-        from notify import notify_iteration
-        notify_iteration(title=title, summary=summary, color=color)
-    except Exception as e:
-        print(f"  [알림 건너뜀] {e}")
 
 
 # ── 다운로드 완료 감지 ────────────────────────────────────────────────
@@ -99,11 +93,6 @@ def download_complete(raw_base: str, years: list) -> bool:
 
 def wait_for_download(raw_base: str, years: list):
     print(f"\n[대기] 다운로드 완료 감지 중... ({POLL_SECONDS}초 주기, {IDLE_MINUTES}분 idle 기준)")
-    _notify(
-        "⏳ 파이프라인 대기 중",
-        f"다운로드 완료 감지 대기\n경로: {raw_base}\n연도: {years}\n"
-        f"완료 기준: {IDLE_MINUTES}분간 변화 없음",
-    )
     while not download_complete(raw_base, years):
         parts = []
         for yr in years:
@@ -114,7 +103,6 @@ def wait_for_download(raw_base: str, years: list):
         time.sleep(POLL_SECONDS)
 
     print(f"  [{time.strftime('%H:%M:%S')}] ✓ 다운로드 완료 감지!")
-    _notify("✅ 다운로드 완료", "데이터셋 빌드를 시작합니다.", color=0x2ECC71)
 
 
 # ── subprocess 실행 ───────────────────────────────────────────────────
@@ -127,11 +115,6 @@ def run_step(cmd: list, step_name: str):
     ret = subprocess.run(cmd, cwd=_ML)
     elapsed = time.time() - t0
     if ret.returncode != 0:
-        _notify(
-            f"❌ {step_name} 실패",
-            f"exit code: {ret.returncode}\n소요: {elapsed/60:.1f}분",
-            color=0xE74C3C,
-        )
         print(f"\n  ✗ {step_name} 실패 (exit {ret.returncode})")
         sys.exit(ret.returncode)
     print(f"\n  ✓ {step_name} 완료  ({elapsed/60:.1f}분)")
@@ -146,7 +129,7 @@ def run_feat_eng_iter(
 ) -> dict:
     """feature_engineer.py 1회 실행 → JSON 파싱 결과 반환."""
     cmd = [
-        sys.executable, "feature_engineer.py",
+        sys.executable, "core/feature_engineer.py",
         "--input",       args.out_csv,
         "--base_dir",    args.base_dir,
         "--max_mmsi",    str(args.max_mmsi),
@@ -157,6 +140,7 @@ def run_feat_eng_iter(
         "--min_gain",    str(args.min_gain),
         "--max_feat",    str(args.max_feat),
         "--out_json",    out_json,
+        "--export_dir",  args.export_dir,
     ]
     if initial_extra:
         cmd += ["--initial_extra"] + initial_extra
@@ -202,48 +186,8 @@ def feat_eng_loop(args):
             f"이번 개선: {intra_gain:+.1f}pp (베이스라인 → 최적)"
         )
 
-        # Discord 알림
-        _notify(
-            f"📊 Iter {iter_num:02d} 완료  ({best_det:.1f}%)",
-            (
-                f"탐지율: {baseline_det:.1f}% → {best_det:.1f}%\n"
-                f"{gain_str}\n"
-                f"채택 피처: {best_extra}\n"
-                f"신규: {newly_adopted or '없음'}\n"
-                f"JSON: {out_json}"
-            ),
-            color=0x2ECC71 if newly_adopted else 0xF39C12,
-        )
-
-        # Notion 구조화 결과 페이지
-        try:
-            from notify import send_notion_iter_report
-            ts = __import__("time").strftime("%Y-%m-%d %H:%M")
-            send_notion_iter_report(
-                title=f"Iter {iter_num:02d} — {best_det:.1f}% · {ts}",
-                iter_num=iter_num,
-                baseline_det=baseline_det,
-                best_det=best_det,
-                initial_extra=init_extra,
-                best_extra=best_extra,
-                newly_adopted=newly_adopted,
-                history=result.get("history", []),
-                permutation_importance=result.get("permutation_importance", []),
-                feature_descriptions=result.get("feature_descriptions", {}),
-                json_path=out_json,
-            )
-        except Exception as e:
-            print(f"  [Notion 건너뜀] {e}")
-
         # ── 수렴 판정 ──────────────────────────────────────────────
         if not newly_adopted and iter_num > 1:
-            _notify(
-                "✅ 피처 수렴",
-                f"Iter {iter_num}: 신규 채택 없음 → Greedy 수렴 완료\n"
-                f"최종 피처: {best_extra}\n"
-                f"최종 탐지율: {best_det:.1f}%",
-                color=0x2ECC71,
-            )
             print(f"\n  ✓ 수렴 완료 (신규 채택 없음). 루프 종료.")
             break
 
@@ -252,11 +196,7 @@ def feat_eng_loop(args):
 
     else:
         # max_iter 도달
-        _notify(
-            f"🏁 루프 완료 (max_iter={args.max_iter})",
-            f"최종 피처: {initial_extra}\n최종 탐지율: {prev_best_det:.1f}%",
-            color=0x9B59B6,
-        )
+        pass
 
     print(f"\n=== 피처 엔지니어링 루프 종료 ===")
     print(f"  결과 폴더: {iter_dir}")
@@ -281,6 +221,8 @@ def main():
     ap.add_argument("--weak_weight",    type=float, default=WEAK_WEIGHT)
     ap.add_argument("--min_gain",       type=float, default=MIN_GAIN)
     ap.add_argument("--max_feat",       type=int,   default=MAX_FEAT)
+    ap.add_argument("--export_dir",     default=EXPORT_DIR,
+                    help="최적 피처셋 배포 모델 저장 경로")
     ap.add_argument("--max_iter",       type=int,   default=MAX_ITER,
                     help=f"피처 엔지니어링 최대 반복 횟수 (기본: {MAX_ITER})")
     ap.add_argument("--skip_build",     action="store_true",

@@ -17,18 +17,22 @@
 
 ## ML 파이프라인 (`ml/`)
 
-비지도(오토인코더 계열) 9종 + 지도 학습 5종 모델을 지원한다.
+비지도(오토인코더 계열) 9종 모델을 지원한다 (지도 학습 모델은 develop에서 제거됨).
 
 ```bash
-# 비지도 학습
-python ml/train_benchmark.py --model dcdetect
+# 풀 오케스트레이터 (Slack 승인 게이트 + MLflow + git 자동화)
+python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
+  --data_file "D:/ais_data/preprocessed/ais_preprocessed_3yr.csv" \
+  --base_dir "D:/" --skip_preprocess
 
-# 지도 학습
-python ml/train_supervised.py --model moderntcn
-python ml/train_supervised.py --model all --max_mmsi 300
+# 단순 학습+평가 (실험용)
+python ml/core/pipeline.py --train --eval --models dcdetect tranad conv1d
 
 # 평가
-python ml/eval_anomaly.py --model sup_moderntcn
+python ml/core/eval_anomaly.py --model dcdetect
+
+# 피처 엔지니어링 자동화 (3년 균형 데이터셋 → Greedy 선택 → 배포 모델 export)
+python ml/auto_feat_eng.py --no_wait --skip_build
 ```
 
 자세한 내용은 [`ml/README.md`](ml/README.md)를 참고한다.
@@ -45,6 +49,15 @@ ais_ids_pi/data/
     scaler.json
     threshold.txt
 ```
+
+**빌드/배포는 native Linux 전용** (Windows는 ML 학습용). 최초 빌드 전 서브모듈 초기화 필요:
+
+```bash
+git submodule update --init --recursive    # opencpn-libs 받기
+cd ais_ids_pi && ./local-build-package.sh   # → tar.gz 생성
+```
+
+C++ 입력 피처 수는 `ais_ids_pi/include/ais_ml.h`의 `ML_FEATURE_COUNT`에 하드코딩되며 배포 모델의 피처 수와 반드시 일치해야 한다. 자세한 빌드 가이드는 [`CLAUDE.md`](CLAUDE.md)의 "Plugin Build & Deploy" 참고.
 
 ---
 
@@ -86,6 +99,6 @@ python aivdm_gen/aivdm_gen.py
 
 GitHub Actions로 Push/PR 시 자동 검사가 실행된다 (`.github/workflows/ci.yml`).
 
-- Python 문법 검사 + 5개 모델 smoke test
+- Python 문법 검사 + DCdetector smoke test
 - C++ 핵심 파일 컴파일 (`g++ -fsyntax-only`)
 - C++ 정적 분석 (`cppcheck`)

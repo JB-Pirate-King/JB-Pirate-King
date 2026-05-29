@@ -12,6 +12,7 @@ ml/output/
 # (pipeline.py --base_dir 사용 시에는 D:\ais_models\ 로 저장)
 ml/*.onnx
 ml/*.json
+!ml/fe_state.json
 ml/threshold*.txt
 ml/eval_result_*.txt
 
@@ -29,14 +30,27 @@ ml/**/*.pdf
 
 aivdm_gen/*.csv
 
-# 시크릿 / 설정
-ml/notify_config.json
-
 # 런타임 생성 파일
 ais_ids_alerts.log
 *.log
-ml/preprocess_progress.log
-ml/preprocess_error.log
+
+# 임시 테스트 파일 (루트의 _tmp_* 패턴)
+_tmp_*
+ais_skip_log.csv
+preprocess_meta.json
+
+# MLflow 로컬 실행 데이터
+mlruns/
+
+# 모델 디렉토리 (실제 경로: D:\ais_models\)
+ais_models/
+
+# 빌드 아티팩트
+*.tar.gz
+
+# 시퀀스 캐시 파일
+*.train.pkl
+*.holdout.pkl
 
 # Python 캐시
 __pycache__/
@@ -51,3 +65,7 @@ build/
 
 # Claude Code 설정
 .claude/
+
+# 민감한 설정 파일
+ml/pipeline_config.json
+ml/google_credentials.json

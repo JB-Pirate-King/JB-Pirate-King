@@ -21,6 +21,7 @@ import csv as csv_mod
 import json
 import math
 import os
+import pickle
 import random
 import sys
 import time
@@ -57,13 +58,13 @@ from train_benchmark import (
     train_standard,
     SEED,
     VAL_RATIO,
-    THRESHOLD_PERCENTILE,
 )
 
 # ── 고정 상수 ──────────────────────────────────────────────────────
 SEQ_LEN         = 10
 SEQ_BREAK       = 600   # dt 임계값 (초) — 시퀀스 분리
 MAX_SEQ_PER_MMSI = 500  # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
+EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 비율 (학습 풀에서 분리)
 
 # ── Greedy 목적함수 (약한 시나리오 가중) 기본값 ─────────────────────
 # 전체 평균만 최적화하면 90~100%인 다수 시나리오에 묻혀
@@ -333,15 +334,32 @@ def augment_seqs(seqs: list, extra_names: list) -> list:
 
 
 # ── 데이터 로드 (편향 제거) ────────────────────────────────────────
-def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
-    """전처리 CSV → BASE_FEATURES 기준 raw 시퀀스 리스트
+def load_raw_seqs(input_file: str, max_mmsi: int,
+                  eval_ratio: float = EVAL_NORMAL_RATIO) -> tuple:
+    """전처리 CSV → (train_seqs, eval_normal_seqs) 반환.
 
-    편향 제거 3종:
-    1. 연·월별 균등 MMSI 샘플링 — 연도/계절/시간 편향 방지
-       (3년 통합 시 2025 전체가 2023·2024 하반기를 압도하지 않도록 YYYY-MM 버킷)
+    편향 제거:
+    1. 연·월별 균등 MMSI 샘플링 — 연도/계절 편향 방지 (YYYY-MM 버킷)
     2. MMSI당 시퀀스 상한       — 고빈도 선박 지배 방지
+    3. 홀드아웃 정상셋          — FP(오탐) 측정용 정상 시퀀스를 MMSI 단위로 학습과 분리.
+       eval_ratio 만큼을 '월별 균등하게' 떼어내 학습에 한 번도 쓰지 않음(누수 방지).
     (스케일러 편향은 ClippedMinMaxScaler 에서 처리)
     """
+    # ── 시퀀스 캐시 (반복 iteration 간 대용량 재파싱 방지) ──────────────
+    # 키: 입력파일 + max_mmsi + eval_ratio + SEED + 시퀀스 파라미터 (결정적)
+    cache_path = (f"{input_file}.s{max_mmsi}_seed{SEED}_ev{eval_ratio}"
+                  f"_L{SEQ_LEN}_b{SEQ_BREAK}_c{MAX_SEQ_PER_MMSI}.holdout.pkl")
+    if (os.path.exists(cache_path)
+            and os.path.getmtime(cache_path) >= os.path.getmtime(input_file)):
+        print(f"\n[데이터] 시퀀스 캐시 로드: {cache_path}")
+        try:
+            with open(cache_path, "rb") as cf:
+                train_seqs, eval_seqs = pickle.load(cf)
+            print(f"  학습 정상 {len(train_seqs):,} / FP측정 정상 {len(eval_seqs):,} (캐시 적중)")
+            return train_seqs, eval_seqs
+        except Exception as e:
+            print(f"  [캐시 로드 실패 → 원본 재파싱] {e}")
+
     print(f"\n[데이터] {input_file} 로드 중...")
 
     mmsi_data:        dict = defaultdict(list)   # mmsi → [record, ...]
@@ -366,13 +384,14 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
     all_mmsis = list(mmsi_data.keys())
     print(f"  고유 MMSI: {len(all_mmsis):,}")
 
+    # MMSI별 주요 기간 (최빈 YYYY-MM) — 균등 샘플링/홀드아웃 분리에 공통 사용
+    mmsi_main_period = {
+        m: (max(cnt, key=cnt.get) if cnt else "")
+        for m, cnt in mmsi_period_cnt.items()
+    }
+
     # ── 1. 연·월별 균등 MMSI 샘플링 ───────────────────────────────
     if max_mmsi and len(all_mmsis) > max_mmsi:
-        # MMSI별 주요 기간 결정 (최빈 YYYY-MM)
-        mmsi_main_period = {
-            m: max(cnt, key=cnt.get) if cnt else ""
-            for m, cnt in mmsi_period_cnt.items()
-        }
         period_buckets: dict = defaultdict(list)
         for mmsi in all_mmsis:
             period_buckets[mmsi_main_period.get(mmsi, "")].append(mmsi)
@@ -390,7 +409,6 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
                 extra    = min(max_mmsi - len(selected), len(leftover))
                 selected.extend(random.sample(leftover, extra))
             selected = selected[:max_mmsi]
-            # 기간 분포 출력
             dist = defaultdict(int)
             for m in selected:
                 dist[mmsi_main_period.get(m, "")] += 1
@@ -402,40 +420,67 @@ def load_raw_seqs(input_file: str, max_mmsi: int) -> list:
         else:
             selected = random.sample(all_mmsis, max_mmsi)
             print(f"  랜덤 샘플: {len(selected):,}개 MMSI")
+    else:
+        selected = all_mmsis
 
-        mmsi_data = {k: mmsi_data[k] for k in selected}
+    # ── 2. 홀드아웃 정상셋 분리 (월별 균등하게 eval_ratio 만큼) ──────────
+    # 각 YYYY-MM 버킷에서 eval_ratio 비율씩 떼어내 학습/FP측정 모두 월 균등 유지.
+    split_rng = random.Random(SEED + 777)
+    eval_set: set = set()
+    sel_buckets: dict = defaultdict(list)
+    for m in selected:
+        sel_buckets[mmsi_main_period.get(m, "")].append(m)
+    for p, ms in sel_buckets.items():
+        k = int(round(len(ms) * eval_ratio))
+        k = min(k, len(ms) - 1) if len(ms) > 1 else 0   # 월별 최소 1개는 학습에
+        if k > 0:
+            eval_set.update(split_rng.sample(ms, k))
+    train_mmsis = [m for m in selected if m not in eval_set]
+    eval_mmsis  = [m for m in selected if m in eval_set]
+    print(f"  홀드아웃: 학습 {len(train_mmsis):,} MMSI / FP측정 {len(eval_mmsis):,} MMSI "
+          f"(eval_ratio={eval_ratio}, 월별 균등)")
 
-    # ── 2. 시퀀스 생성 + MMSI당 상한 적용 ────────────────────────
-    dt_idx   = _B["dt"]
-    sequences: list = []
-    capped   = 0
+    # ── 3. 시퀀스 생성 + MMSI당 상한 (MMSI 집합별로 독립 생성) ──────────
+    dt_idx = _B["dt"]
 
-    for records in mmsi_data.values():
-        seg, cur = [], [records[0]]
-        for rec in records[1:]:
-            if rec[dt_idx] >= SEQ_BREAK:
-                seg.append(cur); cur = [rec]
-            else:
-                cur.append(rec)
-        seg.append(cur)
+    def _build(mmsi_keys: list) -> tuple:
+        seqs: list = []
+        capped = 0
+        for m in mmsi_keys:
+            records = mmsi_data[m]
+            seg, cur = [], [records[0]]
+            for rec in records[1:]:
+                if rec[dt_idx] >= SEQ_BREAK:
+                    seg.append(cur); cur = [rec]
+                else:
+                    cur.append(rec)
+            seg.append(cur)
+            mmsi_seqs: list = []
+            for s in seg:
+                if len(s) < SEQ_LEN:
+                    continue
+                for i in range(len(s) - SEQ_LEN + 1):
+                    mmsi_seqs.append(s[i: i + SEQ_LEN])
+            if len(mmsi_seqs) > MAX_SEQ_PER_MMSI:
+                mmsi_seqs = random.sample(mmsi_seqs, MAX_SEQ_PER_MMSI)
+                capped += 1
+            seqs.extend(mmsi_seqs)
+        return seqs, capped
 
-        mmsi_seqs: list = []
-        for s in seg:
-            if len(s) < SEQ_LEN:
-                continue
-            for i in range(len(s) - SEQ_LEN + 1):
-                mmsi_seqs.append(s[i: i + SEQ_LEN])
+    train_seqs, cap_tr = _build(train_mmsis)
+    eval_seqs,  cap_ev = _build(eval_mmsis)
+    print(f"  시퀀스: 학습 {len(train_seqs):,} (상한적용 {cap_tr}) / "
+          f"FP측정 {len(eval_seqs):,} (상한적용 {cap_ev})")
 
-        if len(mmsi_seqs) > MAX_SEQ_PER_MMSI:
-            mmsi_seqs = random.sample(mmsi_seqs, MAX_SEQ_PER_MMSI)
-            capped += 1
+    # 다음 iteration을 위해 캐시 저장 (실패해도 진행에 영향 없음)
+    try:
+        with open(cache_path, "wb") as cf:
+            pickle.dump((train_seqs, eval_seqs), cf, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  시퀀스 캐시 저장: {cache_path}")
+    except Exception as e:
+        print(f"  [캐시 저장 실패] {e}")
 
-        sequences.extend(mmsi_seqs)
-
-    if capped:
-        print(f"  MMSI당 상한({MAX_SEQ_PER_MMSI}) 적용: {capped:,}개 MMSI 절감")
-    print(f"  총 시퀀스: {len(sequences):,}")
-    return sequences
+    return train_seqs, eval_seqs
 
 
 # ── Tensor 준비 ────────────────────────────────────────────────────
@@ -477,20 +522,38 @@ def train_dcdetect(
     return model, val_loader
 
 
-# ── 임계값 계산 ────────────────────────────────────────────────────
-def compute_threshold(model, val_loader) -> float:
+# ── 임계값 계산 (실제 정상 시퀀스 기준 목표 FP) ──────────────────────
+def compute_fp_threshold(model, scaler, extra_names: list, raw_seqs: list,
+                         fp_pct: float = 1.0, n_normal: int = 10000) -> float:
+    """실제 정상 시퀀스 점수의 (100-fp_pct) 퍼센타일 = 목표 FP 임계값.
+    evaluate()의 fp1_thr 와 동일 산식 → 배포 threshold가 평가 탐지율과 같은 FP 기준."""
     device = next(model.parameters()).device
     model.eval()
-    errors = []
-    with torch.no_grad():
-        for (batch,) in val_loader:
-            batch = batch.to(device)
-            out = model(batch)
-            mse = ((out - batch) ** 2).mean(dim=(1, 2))
-            errors.extend(mse.cpu().tolist())
-    errors.sort()
-    idx = int(len(errors) * THRESHOLD_PERCENTILE / 100)
-    return errors[min(idx, len(errors) - 1)]
+    mins        = scaler.data_min_
+    scale_range = scaler.data_max_ - mins
+    clip_lo = getattr(scaler, "clip_lo", None)
+    clip_hi = getattr(scaler, "clip_hi", None)
+
+    def _score(seq):
+        aug = augment_seq(seq, extra_names)
+        rows = []
+        for row in aug:
+            arr = np.asarray(row)
+            if clip_lo is not None:
+                arr = np.clip(arr, clip_lo, clip_hi)
+            rows.append([(v - mn) / (rng + 1e-9)
+                         for v, mn, rng in zip(arr.tolist(), mins, scale_range)])
+        x = torch.tensor(rows, dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            out = model(x)
+            return float(((out - x) ** 2).mean())
+
+    if raw_seqs:
+        sample = random.sample(raw_seqs, min(n_normal, len(raw_seqs)))
+    else:
+        sample = [make_normal_seq() for _ in range(n_normal)]
+    scores = [_score(s) for s in sample]
+    return float(np.percentile(scores, 100 - fp_pct))
 
 
 # ── 평가 ────────────────────────────────────────────────────────────
@@ -501,18 +564,19 @@ def evaluate(
     n_anom: int = 200,
     n_normal: int = 10000,
     raw_seqs: list = None,
+    extra_fp: tuple = (),   # 추가로 계산할 FP% 목록 ex) (5.0, 10.0)
 ):
     """
     FP ≈ 1% 기준 탐지율 계산.
-    반환: (avg_det, scenario_results)
-    n_normal=10000: 임계값 편향 줄이기 위해 기본값 상향
+    반환: (avg_det_fp1, scenario_results, extra_results, fp1_thr)
+      extra_results: {fp_pct: {sc_name: det}} — extra_fp 지정 시 채워짐
+      fp1_thr: FP=1% 임계값 (정상 점수 99퍼센타일)
     """
     device = next(model.parameters()).device
     model.eval()
     mins        = scaler.data_min_
     maxs        = scaler.data_max_
     scale_range = maxs - mins
-    # ClippedMinMaxScaler의 클리핑 범위 (없으면 무제한)
     clip_lo = getattr(scaler, "clip_lo", None)
     clip_hi = getattr(scaler, "clip_hi", None)
 
@@ -524,7 +588,6 @@ def evaluate(
                 for v, mn, rng in zip(arr.tolist(), mins, scale_range)]
 
     def _score(seq: list) -> float:
-        """raw 시퀀스(base) → 파생 추가 → 스케일 → MSE 스코어"""
         aug = augment_seq(seq, extra_names)
         scaled = [_scale_row(row) for row in aug]
         x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
@@ -532,16 +595,17 @@ def evaluate(
             out = model(x)
             return float(((out - x) ** 2).mean())
 
-    # 정상 시퀀스 점수 → FP 1% 임계값
     if raw_seqs:
         normal_raw = random.sample(raw_seqs, min(n_normal, len(raw_seqs)))
     else:
         normal_raw = [make_normal_seq() for _ in range(n_normal)]
 
     normal_scores = [_score(seq) for seq in normal_raw]
-    fp1_thr = float(np.percentile(normal_scores, 99))  # 상위 1% = FP 1% 임계
+    fp1_thr = float(np.percentile(normal_scores, 99))
 
-    # 시나리오별 탐지율
+    # extra_fp 임계값 사전 계산
+    extra_thrs = {fp: float(np.percentile(normal_scores, 100 - fp)) for fp in extra_fp}
+
     anom_scenarios = [
         (name, maker, is_holdout)
         for name, maker, is_anom, is_holdout in SCENARIO_MAKERS
@@ -549,15 +613,33 @@ def evaluate(
     ]
 
     all_dets = []
-    scenario_results = []   # [(name, det), ...]
+    scenario_results = []
+    # extra_fp별 결과 수집 {fp: {sc_name: det}}
+    extra_results: dict = {fp: {} for fp in extra_fp}
+
     for sc_name, maker, is_holdout in tqdm(anom_scenarios, desc="  시나리오 평가", leave=False):
-        anom_seqs = [maker() for _ in range(n_anom)]
+        anom_seqs   = [maker() for _ in range(n_anom)]
         anom_scores = [_score(seq) for seq in anom_seqs]
         det = sum(1 for s in anom_scores if s > fp1_thr) / len(anom_scores) * 100.0
         all_dets.append(det)
         scenario_results.append((sc_name, det, is_holdout))
+        for fp, thr in extra_thrs.items():
+            extra_results[fp][sc_name] = (
+                sum(1 for s in anom_scores if s > thr) / len(anom_scores) * 100.0
+            )
 
-    return float(np.mean(all_dets)), scenario_results
+    # extra_fp 출력
+    if extra_fp:
+        W = 52
+        for fp in sorted(extra_fp):
+            sc_dets = extra_results[fp]
+            avg = float(np.mean(list(sc_dets.values())))
+            print(f"\n  [FP≈{fp:.0f}%] 평균 탐지율 {avg:.1f}%")
+            for sc_name, det in sorted(sc_dets.items(), key=lambda x: x[1]):
+                mark = "❌" if det < 50 else "✅"
+                print(f"  {mark} {sc_name:<28} {det:>6.1f}%")
+
+    return float(np.mean(all_dets)), scenario_results, extra_results, fp1_thr
 
 
 # ── Permutation Importance ────────────────────────────────────────
@@ -689,7 +771,7 @@ def _objective(sc: list, weak_names: set, weak_weight: float) -> float:
 
 
 # ── Greedy Forward Selection 메인 루프 ────────────────────────────
-def greedy_forward_selection(raw_seqs: list, args) -> tuple:
+def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     weak_floor  = getattr(args, "weak_floor",  WEAK_FLOOR_DEFAULT)
     weak_weight = getattr(args, "weak_weight", WEAK_WEIGHT_DEFAULT)
     min_gain    = getattr(args, "min_gain",    MIN_GAIN_DEFAULT)
@@ -716,9 +798,10 @@ def greedy_forward_selection(raw_seqs: list, args) -> tuple:
     print(f"[베이스라인]  피처 {n_base_total}개: {BASE_FEATURES + current_extra}")
     print(f"{'─'*W}")
     t0 = time.time()
-    tensor, scaler = prepare_tensor(raw_seqs, current_extra)
+    tensor, scaler = prepare_tensor(train_seqs, current_extra)
     model, val_loader = train_dcdetect(tensor, n_base_total, args.epochs)
-    det0, sc0 = evaluate(model, scaler, current_extra, args.n_anom, raw_seqs=raw_seqs)
+    det0, sc0, _, _ = evaluate(model, scaler, current_extra, args.n_anom,
+                               raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
     elapsed = time.time() - t0
 
     # 약세 시나리오 집합 = 베이스라인 탐지율 < weak_floor (전 과정 고정)
@@ -734,7 +817,8 @@ def greedy_forward_selection(raw_seqs: list, args) -> tuple:
              det=det0, score=best_score, extra=list(current_extra), scenarios=sc0)
     )
 
-    max_feat = getattr(args, "max_feat", None)
+    max_feat  = getattr(args, "max_feat",  None)
+    max_steps = getattr(args, "max_steps", None)  # None = 수렴까지 전체 실행
 
     step = 1
     while remaining:
@@ -762,9 +846,9 @@ def greedy_forward_selection(raw_seqs: list, args) -> tuple:
             print(f"  + {cand:<20s}  ({desc})  →  {n_feat}개 학습 중...",
                   end="", flush=True)
             t0 = time.time()
-            tensor, scaler = prepare_tensor(raw_seqs, trial_extra)
+            tensor, scaler = prepare_tensor(train_seqs, trial_extra)
             model, val_loader = train_dcdetect(tensor, n_feat, args.epochs)
-            det, sc = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=raw_seqs)
+            det, sc, _, _ = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=eval_seqs)
             elapsed = time.time() - t0
             score = _objective(sc, weak_names, weak_weight)
             gain  = score - best_score          # 목적 점수 기준 향상
@@ -800,6 +884,10 @@ def greedy_forward_selection(raw_seqs: list, args) -> tuple:
             best_cand = step_best_feat
             print(f"\n  ✗ 개선 없음 (최고 후보: {best_cand}  목적점수 {step_best_gain:+.1f})"
                   f" → 종료")
+            break
+
+        if max_steps is not None and step >= max_steps:
+            print(f"\n  [max_steps={max_steps}] 스텝 제한 도달 → 종료")
             break
 
         step += 1
@@ -990,6 +1078,12 @@ def main():
                     help=f"목적점수 채택 임계 (기본: {MIN_GAIN_DEFAULT})")
     ap.add_argument("--max_feat", type=int, default=None,
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
+    ap.add_argument("--max_steps", type=int, default=None,
+                    help="Greedy 최대 채택 스텝 수 (orchestrator에서 1로 지정해 1회 채택 후 종료)")
+    ap.add_argument("--export_dir", default=None,
+                    help="최적 피처셋 모델을 배포용 ONNX/scaler/threshold로 저장할 디렉터리 (선택)")
+    ap.add_argument("--eval_ratio", type=float, default=EVAL_NORMAL_RATIO,
+                    help=f"FP 측정용 홀드아웃 정상 시퀀스 비율 (월별 균등, 기본: {EVAL_NORMAL_RATIO})")
     args = ap.parse_args()
 
     # 이전 반복 채택 피처를 CLI로 받았으면 전역 INITIAL_EXTRA 오버라이드
@@ -1007,18 +1101,20 @@ def main():
     print(f"입력: {args.input}")
     print(f"설정: max_mmsi={args.max_mmsi}  epochs={args.epochs}  n_anom={args.n_anom}")
 
-    raw_seqs = load_raw_seqs(args.input, args.max_mmsi)
-    history, best_extra = greedy_forward_selection(raw_seqs, args)
+    train_seqs, eval_normal_seqs = load_raw_seqs(
+        args.input, args.max_mmsi, args.eval_ratio)
+    history, best_extra = greedy_forward_selection(train_seqs, eval_normal_seqs, args)
     print_report(history)
 
     # ── 최적 피처셋으로 재학습 → Permutation Importance ──────────────
+    # 학습은 train_seqs, FP(오탐)·중요도 평가는 홀드아웃 eval_normal_seqs 사용
     best = max(history, key=lambda x: x.get("score", x["det"]))
     best_extra = best.get("extra", [])
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
-    tensor_best, scaler_best = prepare_tensor(raw_seqs, best_extra)
+    tensor_best, scaler_best = prepare_tensor(train_seqs, best_extra)
     model_best, _ = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
     perm_results = permutation_importance(
-        model_best, scaler_best, best_extra, raw_seqs, n_anom=args.n_anom
+        model_best, scaler_best, best_extra, eval_normal_seqs, n_anom=args.n_anom
     )
 
     print("\n  피처 중요도 순위 (탐지율 하락량):")
@@ -1027,6 +1123,17 @@ def main():
     for feat, base_det, imp in perm_results:
         bar = "█" * max(0, int(imp / 2)) if imp > 0 else ""
         print(f"  {feat:<25s}  {imp:>+7.2f}pp  {bar}")
+
+    # ── 최종 모델 다중 FP 평가 (threshold + FP=5%/10%) ──────────────
+    print(f"\n[최종 모델 다중 FP 평가]  피처 {best['n_feat']}개...")
+    det_final, sc_final, extra_final, threshold = evaluate(
+        model_best, scaler_best, best_extra, args.n_anom,
+        raw_seqs=eval_normal_seqs, extra_fp=(5.0, 10.0)
+    )
+    det_fp5  = float(np.mean(list(extra_final[5.0].values()))) if extra_final.get(5.0) else None
+    det_fp10 = float(np.mean(list(extra_final[10.0].values()))) if extra_final.get(10.0) else None
+    print(f"  FP=1%: {det_final:.1f}%  FP=5%: {det_fp5:.1f}%  FP=10%: {det_fp10:.1f}%")
+    print(f"  threshold (FP=1% 기준): {threshold:.8f}")
 
     # 저장 경로 준비
     out_dir = os.path.join(args.base_dir, "ais_output", "feat_eng")
@@ -1061,13 +1168,20 @@ def main():
         json.dump(
             {
                 "best_extra": best_extra,
-                "best_det": best["det"],
-                "baseline_det": history[0]["det"],
+                "best_det":      det_final,
+                "det_fp5":       det_fp5,
+                "det_fp10":      det_fp10,
+                "threshold":     threshold,
+                "baseline_det":  history[0]["det"],
+                "baseline_score": history[0].get("score"),
                 "initial_extra": INITIAL_EXTRA,
                 "feature_descriptions": {
                     f: _all_feat_descs.get(f, "") for f in
                     BASE_FEATURES + all_feats_in_result
                 },
+                "scenario_fp1":  {n: d for n, d, _ in sc_final},
+                "scenario_fp5":  dict(extra_final.get(5.0, {})),
+                "scenario_fp10": dict(extra_final.get(10.0, {})),
                 "history": [
                     {k: v for k, v in r.items() if k != "scenarios"}
                     | {"scenarios": [(n, d, h) for n, d, h in r.get("scenarios", [])]}
@@ -1085,6 +1199,49 @@ def main():
     txt_path = os.path.join(out_dir, f"feat_eng_{ts}.txt")
     save_txt_report(history, args, txt_path, ts, perm_results=perm_results)
 
+    # ── 배포용 모델 export (--export_dir 지정 시) ──────────────────────
+    # 최적 피처셋으로 학습된 model_best 를 플러그인 배포용 ONNX/scaler/threshold 로 저장.
+    # 실패해도 FE 결과(JSON/txt)에는 영향 없도록 try/except 로 격리.
+    if args.export_dir:
+        try:
+            import torch as _torch
+            import warnings as _warnings
+            os.makedirs(args.export_dir, exist_ok=True)
+            all_feat_names = BASE_FEATURES + best_extra
+            n_feat         = best["n_feat"]
+            onnx_path      = os.path.join(args.export_dir, "model_dcdetect.onnx")
+            scaler_path    = os.path.join(args.export_dir, "scaler_dcdetect.json")
+            threshold_path = os.path.join(args.export_dir, "threshold_dcdetect.txt")
+
+            # ONNX (input "x", shape (1, SEQ_LEN, n_feat))
+            model_best.eval()
+            dummy = _torch.zeros(1, SEQ_LEN, n_feat, dtype=_torch.float32)
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                _torch.onnx.export(
+                    model_best, (dummy,), onnx_path,
+                    dynamo=False, opset_version=14,
+                    input_names=["x"], output_names=["output"],
+                )
+
+            # scaler (C++ MLScaler 호환: features/min/max. clamp == 클리핑이므로 min/max만)
+            with open(scaler_path, "w", encoding="utf-8") as sf:
+                json.dump({
+                    "features": all_feat_names,
+                    "min": [float(x) for x in scaler_best.data_min_],
+                    "max": [float(x) for x in scaler_best.data_max_],
+                }, sf, indent=2, ensure_ascii=False)
+
+            # threshold: 위에서 evaluate()가 반환한 fp1_thr (정상 점수 99퍼센타일)
+            with open(threshold_path, "w", encoding="utf-8") as tf:
+                tf.write(str(threshold))
+
+            print(f"\n  [배포 export] {args.export_dir}  (피처 {n_feat}개)")
+            print(f"    features: {all_feat_names}")
+            print(f"    threshold: {threshold}")
+        except Exception as _e:
+            print(f"  [배포 export 실패] {_e}")
+
     print(f"\n  JSON:  {json_path}")
     print(f"\n  최적 추가 피처: {best_extra}")
     print(f"  탐지율 향상: {history[0]['det']:.1f}% → {best['det']:.1f}%"
@@ -1092,7 +1249,7 @@ def main():
 
     # ── Discord / Notion 알림 ──────────────────────────────────────
     try:
-        from notify import notify_iteration
+        from ml.integrations.notify import notify_iteration
         gain = best["det"] - history[0]["det"]
         new_adopted = [f for f in best_extra if f not in INITIAL_EXTRA]
         # 상위 중요 피처 3개

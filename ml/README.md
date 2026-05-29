@@ -1,232 +1,231 @@
 # ML 파이프라인 — AIS 이상 탐지
 
-선박 AIS 데이터 기반 이상 탐지 파이프라인.  
-2016~2025년 전체 기간 데이터를 자동 수집·전처리하여 비지도 앙상블 모델을 학습하고 평가한다.
+선박 AIS 데이터 기반 이상 탐지 파이프라인. DCdetect 모델 중심의 Greedy 피처 엔지니어링으로 배포용 ONNX 모델을 생성한다.
 
 ---
 
-## 디렉터리 구조
+## 파일 구조
 
 ```
 ml/
-├── README.md
-├── SELF_CHECK.md
-│
-├── # ── 데이터 수집 ──────────────────────────────
-├── download_ais.py              # 단일 날짜 AIS CSV 다운로드 (marinecadastre.gov)
-├── download_ais_allmonths.py    # 2016-2025 전 기간 자동 다운로드 (스트리밍/병렬)
-├── download_watchdog.py         # 다운로드 자동복구 워치독 (크래시 재시작 + Discord 하트비트)
-│
-├── # ── 전처리 ───────────────────────────────────
-├── preprocess.py                # AIS CSV → 12개 피처 정규화 (단일 파일)
-├── parallel_preprocess.py       # 병렬 전처리 (다중 파일)
-│
-├── # ── 학습 ─────────────────────────────────────
-├── train_benchmark.py           # 비지도 앙상블 학습 (TrANAD 등 9종)
-├── train_supervised.py          # 지도 학습 (PatchTST / Mamba 등 5종)
-├── train_runner.py              # 학습 러너 유틸리티
-│
-├── # ── 평가 ─────────────────────────────────────
-├── eval_all.py                  # 전체 모델 일괄 평가 (ROC AUC / Bootstrap CI)
-├── eval_anomaly.py              # 24개 이상 시나리오별 탐지율/오탐율 측정
-├── scaling_compare.py           # 소규모/5년/11년 3-way 탐지율 비교
-│
-├── # ── 오케스트레이션 ───────────────────────────
-├── watch_and_run_2c.py          # cache.pt 생성 감지 → 학습 → eval_all 자동 실행
-├── phase2_orchestrator.py       # Phase2 전체 파이프라인 오케스트레이터
-├── finish_2c.py                 # 2C 단계 마무리 처리
-│
-├── # ── 알림 / 유틸리티 ──────────────────────────
-├── notify.py                    # Discord 상태 카드 알림
-├── discord_command_bot.py       # Discord 명령 봇 (원격 파이프라인 제어)
-├── gdrive_upload_helper.py      # Google Drive 자동 업로드
-├── check_dml.py                 # DirectML GPU 가용성 확인
-│
-├── scripts/                     # PowerShell 자동화 스크립트
-│   ├── run_pipeline.ps1
-│   ├── run_pipeline_v2.ps1
-│   ├── run_pipeline_v3.ps1
-│   └── run_phase2_auto.ps1
-│
-├── data/                        # (gitignore) 학습 중간 산출물
-└── output/                      # (gitignore) 모델/스케일러/임계값
+├── core/                    # ML 핵심 로직
+│   ├── pipeline.py          # 멀티모델 학습/탐지율 비교 ★
+│   ├── preprocess.py        # AIS 전처리 (.csv / .csv.zst / .zip)
+│   ├── train_benchmark.py   # 비지도 모델 학습 (9종)
+│   ├── eval_anomaly.py      # 탐지율/오탐율 평가
+│   ├── feature_engineer.py  # DCdetect Greedy FE + ONNX export ★
+│   └── patch_plugin.py      # C++ 플러그인 자동 패치
+├── integrations/            # 외부 연동
+│   ├── slack_bot.py         # Slack 봇 (로그, 버튼 승인, Claude 질문)
+│   ├── sheets.py            # Google Sheets 기록
+│   ├── notify.py            # Discord + Notion 보고
+│   └── git_manager.py       # 브랜치 자동 생성/커밋
+├── orchestrator.py          # 풀 파이프라인 진입점 ★
+├── fe_state.json            # FE 시작점 피처 저장 (initial_extra)
+├── auto_feat_eng.py         # FE 자동 반복 루프
+├── build_3yr_dataset.py     # 2023–2025 균형 데이터셋 빌더
+└── download_ais.py          # AIS 원본 데이터 다운로더
 ```
 
 ---
 
-## 전체 파이프라인
+## 두 가지 실행 경로
 
-```
-[marinecadastre.gov]
-        │  download_ais_allmonths.py --stream --workers N
-        ▼
-[D:\AIS\YYYY\ais-YYYY-MM-DD.csv.zst]
-        │  preprocess.py  (streaming: 다운→전처리→raw삭제)
-        ▼
-[D:\JB-Pirate-King-AIS\preprocessed_all\*_preprocessed.csv]
-        │  train_benchmark.py --model tranad --cache ...
-        ▼
-[Pass 1: MMSI 수집] → [Pass 2: 6,000 MMSI 샘플 로드] → [cache.pt]
-        │  GPU 학습 (DirectML / AMD Radeon RX 9060 XT)
-        ▼
-[D:\JB-Pirate-King-ML-Results\ensemble_full\model_tranad.onnx]
-        │  eval_all.py  (테스트셋: 시간순 후미 10%)
-        ▼
-[eval_result_*.txt  +  Discord 최종 알림]
+| 경로 | 진입점 | 용도 |
+|---|---|---|
+| 풀 오케스트레이터 | `orchestrator.py` | Slack + Sheets + git 자동화. 실제 운용. |
+| 단순 학습+평가 | `core/pipeline.py` | Slack/git 없이 빠른 실험용. |
+
+```bash
+# 풀 오케스트레이터 (반드시 -m 플래그)
+python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
+  --data_file "D:/ais_data/preprocessed/ais_preprocessed_3yr.csv" \
+  --base_dir "D:/" --skip_preprocess
+
+# 자동 승인 모드 (무인 실행)
+python -m ml.orchestrator ... --auto_approve
+
+# 단순 학습+평가
+python ml/core/pipeline.py --train --eval --models dcdetect tranad conv1d --epochs 10
+
+# FE 단독 실행
+python ml/core/feature_engineer.py \
+  --input D:\ais_data\preprocessed\ais_preprocessed_3yr.csv \
+  --base_dir D:\ --max_mmsi 3000 --epochs 5 \
+  --export_dir D:\ais_models\dcdetect
 ```
 
 ---
 
-## 빠른 시작
+## 오케스트레이터 흐름
 
-### 1. 의존성 설치
-
-```bash
-pip install torch torch-directml onnx onnxruntime
-pip install pandas pyarrow scikit-learn numpy requests
+```
+[전처리 (선택)] → [피처 엔지니어링 — Greedy 수렴까지]
+                           ↓
+              채택 피처로 모델 export
+                           ↓
+         C++ 패치 → 플러그인 빌드 → git 커밋 → GitHub 릴리즈
 ```
 
-### 2. 설정 파일 생성
+- Stage Train / Stage Eval 없음 — FE 베이스라인 학습이 그 역할 포함
+- Greedy가 수렴까지 자동 실행 (step 개념 없음)
+- 채택 발생 시: 배포용 `.onnx` / `scaler.json` / `threshold.txt` export 후 커밋
 
-```json
-// ml/notify_config.json  (gitignore 처리됨 — 직접 생성)
-{
-  "discord_webhook": "https://discord.com/api/webhooks/...",
-  "discord_bot_token": "...",
-  "discord_channel_id": "..."
-}
+---
+
+## 데이터 경로 (`--base_dir` 기본: `D:\`)
+
 ```
-
-### 3. 데이터 수집 + 전처리 (워치독 사용 권장)
-
-```bash
-# 워치독: 크래시 자동 재시작 + 20분 Discord 하트비트
-python -u download_watchdog.py --workers 10 --max-restarts 10 --heartbeat-min 20
-
-# 직접 실행
-python download_ais_allmonths.py --stream --workers 6 --disk-guard-gb 80
-```
-
-### 4. 학습
-
-```bash
-# 비지도 앙상블 (TrANAD — GPU 필요)
-python train_benchmark.py \
-  --model tranad \
-  --input  D:\JB-Pirate-King-AIS\preprocessed_all \
-  --output D:\JB-Pirate-King-ML-Results\ensemble_full \
-  --cache  D:\JB-Pirate-King-ML-Results\ensemble_full\train_data_cache.pt \
-  --threshold-pct 99
-
-# 지도 학습
-python train_supervised.py --model moderntcn
-```
-
-### 5. 전자동 파이프라인 (권장)
-
-```bash
-# cache.pt 생성 감지 후 학습 → 평가 → Discord 알림 자동 실행
-python watch_and_run_2c.py
+<base_dir>/
+├── ais_data/
+│   ├── raw/2023/, 2024/   # .zip (Marine Cadastre)
+│   │   2025/              # .csv.zst
+│   └── preprocessed/
+│       ├── 2025/daily/    # 일별 전처리 결과
+│       ├── ais_preprocessed_2025.csv
+│       └── ais_preprocessed_3yr.csv   # 3년 균형 (~10.9 GB)
+├── ais_models/{name}/
+│   ├── model_{name}.onnx
+│   ├── scaler_{name}.json
+│   └── threshold_{name}.txt
+└── ais_output/
+    ├── pipeline/           # comparison_TIMESTAMP.txt/.csv
+    └── feat_eng/, feat_eng_iter/   # FE JSON/txt 결과
 ```
 
 ---
 
-## 입력 피처 (12개)
+## 전처리 (`core/preprocess.py`)
 
-| 피처 | 설명 |
-|---|---|
-| `sog` | 대지 속력 (knot) |
-| `cog` | 대지 침로 (°) |
-| `heading` | 선수 방위 (°) |
-| `status` | 항법 상태 코드 |
-| `dt` | 직전 메시지와의 시간 간격 (초) |
-| `dist_km` | 직전 위치와의 이동 거리 (km) |
-| `cog_hdg_diff` | COG-Heading 차이 (°) |
-| `sog_change` | 속력 변화량 |
-| `cog_hdg_change` | COG-Heading 차이 변화량 |
-| `speed_consistency` | 속력 대비 이동거리 일관성 |
-| `lat_speed` | 위도 방향 이동 속도 (deg/s) |
-| `lon_speed` | 경도 방향 이동 속도 (deg/s) |
+```bash
+# 일별 전처리
+python ml/core/preprocess.py D:\ais_data\raw\2025 --output_dir D:\ais_data\preprocessed\2025\daily
+
+# 합산
+python ml/core/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed.csv" ^
+    --output D:\ais_data\preprocessed\2025\ais_preprocessed_2025.csv
+```
 
 ---
 
-## 비지도 모델 (`train_benchmark.py`)
+## 피처 엔지니어링 (`core/feature_engineer.py`)
 
-정상 데이터만으로 학습 → 재구성 오차(MSE)로 이상 판정.
+### 알고리즘 — Greedy Forward Selection
 
-| 모델 | 설명 |
-|---|---|
-| `tranad` | TranAD — Transformer self-conditioning 재구성 |
-| `usad` | USAD — 이중 디코더 adversarial 학습 |
-| `conv1d` | Conv1D Autoencoder |
-| `lstm` | LSTM Autoencoder (Seq2Seq) |
-| `tcn` | TCN Autoencoder (Dilated Causal Conv) |
-| `anomtrans` | Anomaly Transformer (Association Discrepancy) |
-| `dcdetect` | DCDetector (채널/패치 이중 어텐션 대조 학습) |
-| `iforest` | Isolation Forest |
-| `ocsvm` | One-Class SVM (RBF 커널) |
+1. 베이스라인 학습 (현재 피처셋으로 DCdetect 학습 + FP=1%/5%/10% 평가)
+2. 후보 피처를 하나씩 추가해 목적점수(`전체평균 + 1.0 × 약세평균`) 계산
+3. 최고 향상이 `--min_gain`(기본 3.0pp) 이상이면 채택
+4. 수렴까지 반복 후 배포용 모델 export
 
-주요 옵션:
+### FP 평가 기준
+
+| 기준 | 임계값 | 의미 |
+|---|---|---|
+| FP=1% | 정상 점수 **99**퍼센타일 | 1% 선박이 오탐됨 |
+| FP=5% | 정상 점수 **95**퍼센타일 | 5% 오탐 허용 |
+| FP=10% | 정상 점수 **90**퍼센타일 | 10% 오탐 허용 |
+
+배포 threshold = FP=1% 임계값 → 현장 오탐율도 1%로 보장
+
+### 주요 옵션
 
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
-| `--model` | `tranad` | 학습 모델 (쉼표 구분 복수 지정 가능) |
-| `--input` | `./data` | 전처리 CSV 디렉터리 |
-| `--output` | `./output` | 모델 출력 디렉터리 |
-| `--cache` | — | `.pt` 캐시 경로 (지정 시 재실행 빠름) |
-| `--threshold-pct` | `99` | 이상 임계값 백분위 (FPR ≈ 1%) |
-| `--epochs` | `50` | 학습 에포크 수 |
+| `--input` | (필수) | 전처리 CSV |
+| `--max_mmsi` | 500 | 학습 선박 수 상한 |
+| `--epochs` | 5 | 에포크 수 |
+| `--n_anom` | 200 | 시나리오당 이상 시퀀스 수 |
+| `--min_gain` | 3.0 | Greedy 채택 최소 향상 (pp) |
+| `--initial_extra` | [] | 시작 추가 피처 (fe_state.json 자동 로드) |
+| `--export_dir` | — | 배포용 모델 저장 경로 |
+| `--holdout_file` | — | FP 측정 전용 파일 (학습 데이터와 완전 분리) |
+
+### 피처 중요도 해석
+
+`importance_pp`: 해당 피처를 제거(랜덤 셔플)했을 때 탐지율 하락량 (pp)
+- **음수가 클수록 중요**: `-20.9pp` = 그 피처 없으면 탐지율 20.9%p 하락
+- 양수 = 제거해도 탐지율 유지 (혹은 오히려 약간 상승) → 중요도 낮음
 
 ---
 
-## 지도 학습 모델 (`train_supervised.py`)
+## 입력 피처
 
-정상/이상 이진 분류. 이상은 합성 시나리오 사용.
+### 베이스 피처 (12개, 고정)
+
+| 피처 | 설명 |
+|---|---|
+| `sog` | 선속 (knots, AIS 원본) |
+| `cog` | 항로각 (0–360°, AIS 원본) |
+| `heading` | 선수방향 (0–360°, AIS 원본) |
+| `status` | 운항상태 코드 (0=운항, 1=정박, 5=계류 ...) |
+| `dt` | 이전 메시지와의 경과시간 (초) |
+| `dist_km` | 연속 위경도 간 이동거리 (km, Haversine) |
+| `cog_hdg_diff` | COG-Heading 각도 차이 (0–180°) |
+| `sog_change` | 속력 변화량 (현재–이전, knots) |
+| `cog_hdg_change` | cog_hdg_diff 변화량 |
+| `speed_consistency` | SOG와 거리/시간 속력의 일관성 |
+| `lat_speed` | 위도 방향 속도 성분 (°/s) |
+| `lon_speed` | 경도 방향 속도 성분 (°/s) |
+
+SEQ_LEN = 10
+
+### FE 채택 현황 (as of dcdetect_012)
+
+베이스 12개 + 추가 12개 = **24피처**
+최고 탐지율: dcdetect_011 → **83.5% (FP=1%, 23피처)**
+
+---
+
+## 모델 (`core/train_benchmark.py`)
 
 | 모델 | 설명 |
 |---|---|
-| `patchtst` | PatchTST (패치 토큰 + Transformer) |
-| `itrans` | iTransformer (피처=토큰 전치 어텐션) |
-| `tsmixer` | TSMixer (시간/피처 축 MLP 교차) |
-| `moderntcn` | ModernTCN (ConvNeXt 스타일 Depthwise Conv) |
-| `mamba` | Mamba SSM (선택적 상태 공간 모델) |
+| `dcdetect` | 채널/패치 이중 어텐션 대조 학습 ← **메인** |
+| `usad` | 이중 디코더 adversarial 학습 |
+| `tranad` | Transformer self-conditioning 재구성 |
+| `conv1d` | 1D 합성곱 오토인코더 |
+| `lstm` | LSTM Seq2Seq 오토인코더 |
+| `tcn` | Dilated Causal Conv 오토인코더 |
+| `anomtrans` | Association Discrepancy |
+| `iforest` | Isolation Forest |
+| `ocsvm` | One-Class SVM |
 
 ---
 
-## 평가 (`eval_all.py` / `eval_anomaly.py`)
+## 평가 시나리오 (32종)
 
-- **데이터 분할**: 전체 파일을 시간순 정렬 후 후미 10%를 테스트셋으로 분리 (누수 없음)
-- **지표**: ROC AUC, FPR 1% 동작점 탐지율, Bootstrap 95% CI
-- **이상 시나리오**: 24종 (기본 4 / FN 4 / D 4 / E 5 / F 7 홀드아웃)
+| 그룹 | 설명 |
+|---|---|
+| Basic (4종) | COG/HDG 불일치, 정박이동, 속도이상, 위치점프 |
+| FN (4종) | 규칙 탐지기 회피 |
+| D (4종) | ML 모델 1차 회피 |
+| E (5종) | ML 모델 2차 회피 |
+| F (7종) | 고급 공격 |
+| G (7종) | 신규 시나리오 |
 
-```bash
-python eval_all.py \
-  --input  D:\JB-Pirate-King-AIS\preprocessed_all \
-  --output D:\JB-Pirate-King-ML-Results\ensemble_full \
-  --test-files D:\JB-Pirate-King-ML-Results\ensemble_full\test_files.json
+---
+
+## Google Sheets 탭 구조
+
+| 탭 | 내용 |
+|---|---|
+| `dcdetect` | run별 단계 상세 로그 (det_change, n_features, adopted, threshold, elapsed_s) |
+| `실행요약` | run 1줄 요약 (fe_baseline, fe_det_fp1/fp5/fp10, fe_threshold, fe_features) |
+| `상세로그` | 모든 단계 raw 로그 |
+| `시나리오결과` | 시나리오별 탐지율 (FP=1% 기준, 32종) |
+| `피처중요도` | 피처별 순열 중요도 (importance_pp, 음수 클수록 중요) |
+
+자세한 컬럼 설명은 `CLAUDE.md` 참고.
+
+---
+
+## 플러그인 배포
+
+```
+ais_ids_pi/data/
+    model.onnx        ← model_dcdetect.onnx 복사
+    scaler.json       ← scaler_dcdetect.json 복사
+    threshold.txt     ← threshold_dcdetect.txt 복사
 ```
 
----
-
-## 출력 파일
-
-| 파일 | 설명 |
-|---|---|
-| `model_{name}.onnx` | 비지도 ONNX 모델 |
-| `model_sup_{name}.onnx` | 지도 학습 ONNX 모델 |
-| `scaler_{name}.json` | Min-Max 스케일러 파라미터 |
-| `threshold_{name}.txt` | 이상 판정 임계값 |
-| `train_data_cache.pt` | 데이터 로딩 캐시 (재실행 시 Pass 1/2 생략) |
-| `test_files.json` | 테스트셋 파일 목록 (시간순 후미 분리) |
-| `eval_result_{name}.json` | 평가 결과 (AUC / DR / CI) |
-
----
-
-## 하드웨어 요건
-
-| 항목 | 최소 | 권장 |
-|---|---|---|
-| GPU | DirectML 지원 | AMD Radeon RX 9060 XT 이상 |
-| RAM | 16 GB | 32 GB |
-| 저장공간 | 500 GB | 2 TB (2016-2025 전체 전처리 시) |
-| Python | 3.10+ | 3.11 |
+빌드/배포 절차: `CLAUDE.md` → Plugin Build & Deploy 섹션 참고.

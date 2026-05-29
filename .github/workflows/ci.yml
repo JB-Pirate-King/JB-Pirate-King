@@ -30,9 +30,9 @@ jobs:
 
       - name: 문법 검사 (py_compile)
         run: |
-          for f in ml/preprocess.py ml/train_benchmark.py ml/eval_anomaly.py \
-                   ml/feature_engineer.py ml/build_3yr_dataset.py \
-                   ml/auto_feat_eng.py ml/notify.py; do
+          for f in ml/core/preprocess.py ml/core/train_benchmark.py ml/core/eval_anomaly.py \
+                   ml/core/feature_engineer.py ml/build_3yr_dataset.py \
+                   ml/auto_feat_eng.py; do
             if [ -f "$f" ]; then
               python -m py_compile "$f" && echo "  ✅ $f" || { echo "  ❌ $f"; exit 1; }
             fi
@@ -44,10 +44,10 @@ jobs:
           python - <<'EOF'
           import torch, types, sys
 
-          source = open("train_benchmark.py").read()
+          source = open("core/train_benchmark.py").read()
           source = source.replace('if __name__ == "__main__":\n    main()', '')
           mod = types.ModuleType("tb")
-          exec(compile(source, "train_benchmark.py", "exec"), mod.__dict__)
+          exec(compile(source, "core/train_benchmark.py", "exec"), mod.__dict__)
 
           dummy = torch.zeros(2, 10, 12)
           m = mod.DCdetector(seq_len=10, n_feat=12)

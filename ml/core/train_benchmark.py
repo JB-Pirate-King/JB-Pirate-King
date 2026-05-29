@@ -86,21 +86,10 @@ OpenCPN 플러그인과 호환된다.
 하이퍼파라미터 수정: 파일 내 DEFAULTS 딕셔너리 직접 수정
 """
 
-import sys
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace", write_through=True)
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace", write_through=True)
-# D드라이브 패키지 우선, 구 경로 하위 호환
-for _p in (r"D:\packages", r"C:\pl"):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
 import argparse
 import os
 import shutil
 import csv
-import glob
 import json
 import math
 import random
@@ -115,43 +104,19 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
-
-def notify(msg: str, title: str = "JB-Pirate-King | 학습"):
-    """Discord 웹훅 알림 (실패 무시)"""
-    try:
-        import subprocess
-        _notify_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.py")
-        subprocess.Popen(
-            [sys.executable, _notify_py, msg, title],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    except Exception:
-        pass
-
-
-def get_best_device() -> torch.device:
-    """CUDA(NVIDIA) → DirectML 외장GPU 우선 → CPU 순으로 최적 디바이스 선택"""
-    if torch.cuda.is_available():
-        name = torch.cuda.get_device_name(0)
-        print(f"[GPU] CUDA -- {name}")
-        return torch.device("cuda")
-    try:
-        import torch_directml
-        n = torch_directml.device_count()
-        # 외장 GPU 우선: 내장(iGPU)은 이름에 "(TM) Graphics" 패턴
-        best_idx = 0
-        for i in range(n):
-            name = torch_directml.device_name(i)
-            print(f"  DML [{i}] {name}")
-            if "Graphics" not in name or "RX" in name or "RTX" in name or "GTX" in name:
-                best_idx = i   # 외장 GPU 발견 시 우선 선택
-        chosen_name = torch_directml.device_name(best_idx)
-        print(f"[GPU] DirectML [{best_idx}] {chosen_name}  ← 선택")
-        return torch_directml.device(best_idx)
-    except ImportError:
-        pass
-    print("[CPU] GPU 미감지, CPU로 실행")
-    return torch.device("cpu")
+# feature_engineer의 augment_seq 로드 (extra_features 지원)
+import sys as _sys, os as _os
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_ROOT = _os.path.dirname(_os.path.dirname(_HERE))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+try:
+    from ml.core.feature_engineer import CANDIDATE_FEATURES as _CAND_FEATURES, augment_seq as _augment_seq
+    _HAS_FE_AUGMENT = True
+except ImportError:
+    _HAS_FE_AUGMENT = False
+    _CAND_FEATURES = {}
+    def _augment_seq(seq, extra_names): return seq
 
 # ── 공통 설정 ─────────────────────────────────────────────────────
 FEATURES = [
@@ -169,19 +134,14 @@ SEED       = 42
 random.seed(SEED)
 torch.manual_seed(SEED)
 
-# GPU 가속 설정
-if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True   # Conv 자동 최적화 커널 선택
-
-INPUT_FILE           = "."   # 기본: 현재 폴더의 *_preprocessed.csv 파일 전체 사용
+INPUT_FILE           = "ais-2025-12-31_preprocessed.csv"
 SCALER_FILE          = "scaler.json"       # 모델별 실행 시 덮어씀
 THRESHOLD_FILE       = "threshold.txt"    # 모델별 실행 시 덮어씀
 SEQ_BREAK_DT         = 600
-SAMPLE_MMSI          = 6000    # 32GB RAM 활용 -- 6000 MMSI (약 20GB 예상)
-MAX_RECS_PER_MMSI    = 1500    # MMSI당 최대 레코드 수
+SAMPLE_MMSI          = 10000
 VAL_RATIO            = 0.1
-TEST_RATIO           = 0.1   # 시간순 마지막 10% 파일 → 평가 전용 (학습 시 미사용)
 THRESHOLD_PERCENTILE = 95
+MAX_SEQ_PER_MMSI     = 500   # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -189,23 +149,45 @@ THRESHOLD_PERCENTILE = 95
 # ══════════════════════════════════════════════════════════════════
 
 class MinMaxScaler:
+    """1~99 퍼센타일 클리핑 후 MinMaxScaling (이상치 편향 방지).
+
+    - clip_lo / clip_hi: 학습 데이터 1·99 퍼센타일
+    - min_ / max_: 클리핑 후 실제 min/max (스케일 기준)
+    - JSON 저장 시 clip_lo, clip_hi 포함 → eval_anomaly도 동일 처리
+    """
     def __init__(self):
-        self.min_ = None
-        self.max_ = None
+        self.min_    = None
+        self.max_    = None
+        self.clip_lo = None   # 1 퍼센타일
+        self.clip_hi = None   # 99 퍼센타일
 
     def fit(self, data: list):
-        n = len(data[0])
-        self.min_ = [min(row[i] for row in data) for i in range(n)]
-        self.max_ = [max(row[i] for row in data) for i in range(n)]
+        import numpy as _np
+        arr = _np.array(data, dtype=float)
+        lo = _np.percentile(arr, 1,  axis=0)
+        hi = _np.percentile(arr, 99, axis=0)
+        # 희소 피처(정상 99%가 동일값) 보호: 클리핑 구간 붕괴 열은
+        # 실제 min/max로 대체해 클리핑 비활성화 → 희소 이상신호 보존
+        degenerate = (hi - lo) <= 1e-9
+        if _np.any(degenerate):
+            lo = _np.where(degenerate, arr.min(axis=0), lo)
+            hi = _np.where(degenerate, arr.max(axis=0), hi)
+        self.clip_lo = lo.tolist()
+        self.clip_hi = hi.tolist()
+        arr_c = _np.clip(arr, self.clip_lo, self.clip_hi)
+        self.min_ = arr_c.min(axis=0).tolist()
+        self.max_ = arr_c.max(axis=0).tolist()
 
     def transform(self, data: list) -> list:
         result = []
         for row in data:
             scaled = []
             for i, val in enumerate(row):
+                # 클리핑 후 MinMax
+                v     = max(self.clip_lo[i], min(self.clip_hi[i], val))
                 denom = self.max_[i] - self.min_[i]
-                s = (val - self.min_[i]) / denom if denom != 0 else 0.0
-                scaled.append(max(0.0, min(1.0, s)))
+                s     = (v - self.min_[i]) / denom if denom != 0 else 0.0
+                scaled.append(s)   # [0,1] 범위 (이상치는 초과 가능)
             result.append(scaled)
         return result
 
@@ -214,293 +196,79 @@ class MinMaxScaler:
         return self.transform(data)
 
 
-def _iter_csv_files(input_path: str):
-    """단일 파일, 디렉터리, glob 패턴을 통일된 파일 목록으로 변환"""
-    if os.path.isdir(input_path):
-        files = sorted(glob.glob(os.path.join(input_path, "*_preprocessed.csv")))
-        if not files:
-            files = sorted(glob.glob(os.path.join(input_path, "*.csv")))
-    else:
-        files = sorted(glob.glob(input_path)) if "*" in input_path else [input_path]
-    return [f for f in files if os.path.isfile(f)]
+def load_and_prepare(input_file: str, scaler_path: str = "scaler.json",
+                     max_mmsi: int = None, extra_features: list = None):
+    """CSV 로드 → 시퀀스 생성 → 스케일러 fit → Tensor 반환
 
-
-CACHE_FILE      = r"D:\JB-Pirate-King-ML-Results\train_data_cache.pt"
-CACHE_META_FILE = r"D:\JB-Pirate-King-ML-Results\train_data_cache_meta.json"
-OUTPUT_DIR      = r"D:\JB-Pirate-King-ML-Results"   # 모델/스케일러/임계값 저장
-
-# ── 메모리 가드 (v3 OOM 사망 재발 방지) ──────────────────────────────
-RAM_GUARD_GB     = 28.0   # 28GB 초과 시 경고/중단 (총 32GB의 87.5%)
-RAM_WARN_GB      = 24.0   # 24GB 초과 시 경고만
-
-def _check_ram(ctx: str = ""):
-    """현재 프로세스 RAM 사용량 체크. 한도 초과면 경고/예외."""
-    try:
-        import psutil
-        proc = psutil.Process()
-        rss_gb = proc.memory_info().rss / (1024**3)
-        sys_avail_gb = psutil.virtual_memory().available / (1024**3)
-        if rss_gb > RAM_GUARD_GB or sys_avail_gb < 2.0:
-            msg = (f"[RAM 가드] {ctx} 프로세스 {rss_gb:.1f}GB / "
-                   f"시스템 여유 {sys_avail_gb:.1f}GB → 중단")
-            print(msg, flush=True)
-            try:
-                from notify import send
-                send(msg, "JB | RAM 가드 발동")
-            except Exception:
-                pass
-            raise MemoryError(msg)
-        elif rss_gb > RAM_WARN_GB:
-            print(f"[RAM 경고] {ctx} 프로세스 {rss_gb:.1f}GB / "
-                  f"여유 {sys_avail_gb:.1f}GB (한도 {RAM_GUARD_GB}GB)", flush=True)
-        return rss_gb, sys_avail_gb
-    except ImportError:
-        return None, None
-    except MemoryError:
-        raise
-    except Exception:
-        return None, None
-
-def load_and_prepare(input_path: str, scaler_path: str = "scaler.json"):
+    편향 제거:
+    - 연·월별 균등 MMSI 샘플링 (base_date_time 컬럼, YYYY-MM 버킷)
+      3년 통합 시 2025 전체가 2023·2024 하반기를 압도하지 않도록 연도까지 층화
+    - MMSI당 시퀀스 상한 MAX_SEQ_PER_MMSI
+    - ClippedMinMaxScaler (1~99 퍼센타일)
     """
-    CSV 로드 → 시퀀스 생성 → 스케일러 fit → Tensor 반환
-    캐시(train_data_cache.pt)가 있으면 로딩 생략 (수십 분 → 수 초)
+    extra_features = list(extra_features or [])
+    all_feat = FEATURES + extra_features
 
-    두 번 패스 스트리밍으로 대용량 데이터 처리:
-      1패스: 고유 MMSI 수집 (mmsi 컬럼만 읽음)
-      2패스: 샘플링된 MMSI 레코드만 읽음
-    → 117GB 파일도 최소 RAM으로 처리 가능
-    """
-    files = _iter_csv_files(input_path)
-    if not files:
-        raise FileNotFoundError(f"CSV 파일 없음: {input_path}")
+    print(f"[데이터] {input_file} 로드 중...")
+    mmsi_data       = defaultdict(list)
+    mmsi_period_cnt = defaultdict(lambda: defaultdict(int))  # mmsi → {"YYYY-MM": cnt}
 
-    # ── 시간순 분할: 마지막 TEST_RATIO 비율의 파일은 학습에서 제외 ──
-    # 파일명이 ais-YYYY-MM-DD 형식이므로 sort()하면 시간순 정렬됨
-    files.sort()
-    n_test = max(1, int(len(files) * TEST_RATIO))
-    test_files = files[-n_test:]
-    train_val_files = files[:-n_test]
-    # 테스트 파일 목록 저장 → eval_all.py가 이 파일만 사용
-    test_list_path = os.path.join(OUTPUT_DIR, "test_files.json")
-    try:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        with open(test_list_path, "w", encoding="utf-8") as f:
-            json.dump({"test_files": [os.path.basename(p) for p in test_files],
-                        "train_val_files": len(train_val_files),
-                        "total_files": len(files),
-                        "test_ratio": TEST_RATIO}, f, indent=2, ensure_ascii=False)
-        print(f"[분할] 전체 {len(files)}개 → 학습+검증 {len(train_val_files)}개 / 테스트 {n_test}개 (시간순)")
-        print(f"  테스트 파일 목록 저장: {test_list_path}")
-        print(f"  테스트 기간: {os.path.basename(test_files[0])} ~ {os.path.basename(test_files[-1])}")
-    except Exception as e:
-        print(f"  [경고] 테스트 파일 목록 저장 실패: {e}")
-    files = train_val_files   # 이후 로딩은 train+val 파일만
-
-    # ── 캐시 히트 (시간순 분할 후에 체크) ──────────────────────────────
-    # 캐시 유효성: 캐시 메타에 저장된 파일 해시가 현재 train_val 파일과 일치해야 함
-    import hashlib
-    file_sig = hashlib.md5("|".join(os.path.basename(f) for f in files).encode()).hexdigest()
-
-    cache_valid = False
-    if os.path.exists(CACHE_FILE) and os.path.getsize(CACHE_FILE) > 0:
-        try:
-            if os.path.exists(CACHE_META_FILE):
-                with open(CACHE_META_FILE, encoding="utf-8") as f:
-                    meta = json.load(f)
-                if meta.get("file_signature") == file_sig:
-                    cache_valid = True
-                else:
-                    print(f"[캐시 무효] 파일 목록 변경됨 (기존 캐시는 테스트 데이터 포함 가능)")
-            else:
-                print(f"[캐시 무효] 메타 파일 없음 (기존 캐시는 시간순 분할 이전 생성)")
-        except Exception:
-            pass
-
-    if cache_valid:
-        print(f"[캐시] {CACHE_FILE} 에서 로드 중...")
-        tensor = torch.load(CACHE_FILE, weights_only=True)
-        print(f"  캐시 로드 완료: {tensor.shape}")
-        return tensor
-    elif os.path.exists(CACHE_FILE):
-        print(f"[캐시 삭제] 무효 캐시 제거 중... ({os.path.getsize(CACHE_FILE)/1024/1024:.0f} MB)")
-        os.remove(CACHE_FILE)
-        if os.path.exists(CACHE_META_FILE):
-            os.remove(CACHE_META_FILE)
-
-    print(f"[데이터] {len(files)}개 파일 로드 중... (완료 후 캐시 저장)")
-
-    # pandas + pyarrow 사용 (pyarrow: include_columns으로 실제 컬럼만 읽어 10-20배 빠름)
-    try:
-        import pandas as pd
-        _HAS_PANDAS = True
-    except ImportError:
-        _HAS_PANDAS = False
-        print("  [경고] pandas 없음 -- csv.DictReader 사용 (느림)")
-
-    try:
-        import pyarrow.csv as _pa_csv
-        import pyarrow.compute as _pa_compute
-        import pyarrow as _pa
-        _HAS_PYARROW = True
-        print("  [최적화] pyarrow 활성화 -- 컬럼 선별 읽기로 I/O 대폭 절약")
-    except ImportError:
-        _HAS_PYARROW = False
-
-    # ── 1패스: 전체 MMSI 수집 (mmsi 컬럼만 읽음) ──────────────────
-    t1_start = time.time()
-    all_mmsi = set()
-    if _HAS_PYARROW:
-        # pyarrow: include_columns으로 mmsi 컬럼만 실제 읽음 (pandas의 10-20배 빠름)
-        _pa_read_opts = _pa_csv.ReadOptions(block_size=64 * 1024 * 1024)
-        for idx, fpath in enumerate(files):
-            try:
-                tbl = _pa_csv.read_csv(
-                    fpath,
-                    read_options=_pa_read_opts,
-                    convert_options=_pa_csv.ConvertOptions(include_columns=["mmsi"],
-                                                           auto_dict_encode=False),
-                )
-                col = tbl.column("mmsi").cast(_pa.large_string())
-                all_mmsi.update(col.drop_null().to_pylist())
-            except Exception as e:
-                print(f"  [1패스 스킵] {os.path.basename(fpath)}: {e}")
+    with open(input_file, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            mmsi = row.get("mmsi", "")
+            if not mmsi:
                 continue
-            if (idx + 1) % max(1, len(files) // 10) == 0:
-                pct = (idx + 1) / len(files) * 100
-                el  = time.time() - t1_start
-                eta = el / (idx + 1) * (len(files) - idx - 1)
-                rss_gb, avail_gb = _check_ram(f"1패스 {pct:.0f}%")
-                ram_str = f" RAM={rss_gb:.1f}GB" if rss_gb else ""
-                print(f"  1패스 {pct:.0f}% ({idx+1}/{len(files)}) "
-                      f"경과 {el/60:.1f}min ETA {eta/60:.1f}min{ram_str}")
-    elif _HAS_PANDAS:
-        for idx, fpath in enumerate(files):
             try:
-                df = pd.read_csv(fpath, usecols=["mmsi"], dtype={"mmsi": str},
-                                 low_memory=False, on_bad_lines="skip")
-                all_mmsi.update(df["mmsi"].dropna().unique())
-            except Exception as e:
-                print(f"  [1패스 스킵] {os.path.basename(fpath)}: {e}")
+                record = [float(row[col]) for col in FEATURES]
+                mmsi_data[mmsi].append(record)
+            except (ValueError, KeyError):
                 continue
-            if (idx + 1) % max(1, len(files) // 10) == 0:
-                pct = (idx + 1) / len(files) * 100
-                el  = time.time() - t1_start
-                eta = el / (idx + 1) * (len(files) - idx - 1)
-                rss_gb, avail_gb = _check_ram(f"1패스 {pct:.0f}%")
-                ram_str = f" RAM={rss_gb:.1f}GB" if rss_gb else ""
-                print(f"  1패스 {pct:.0f}% ({idx+1}/{len(files)}) "
-                      f"경과 {el/60:.1f}min ETA {eta/60:.1f}min{ram_str}")
-    else:
-        for fpath in files:
-            with open(fpath, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    m = row.get("mmsi", "")
-                    if m:
-                        all_mmsi.add(m)
-    t1_elapsed = (time.time() - t1_start) / 60
-    print(f"  전체 고유 MMSI: {len(all_mmsi):,}  (1패스 {t1_elapsed:.1f}min)")
+            dt_str = row.get("base_date_time", "")
+            if len(dt_str) >= 7 and dt_str[4] == "-":
+                mmsi_period_cnt[mmsi][dt_str[0:7]] += 1   # "YYYY-MM"
 
-    # MMSI 샘플링
-    if SAMPLE_MMSI and len(all_mmsi) > SAMPLE_MMSI:
-        sampled_mmsi = set(random.sample(sorted(all_mmsi), SAMPLE_MMSI))
-        print(f"  샘플링: {len(sampled_mmsi):,} MMSI 선택")
-    else:
-        sampled_mmsi = all_mmsi
+    all_mmsis = list(mmsi_data.keys())
+    print(f"  고유 MMSI: {len(all_mmsis):,}")
 
-    # ── 2패스: 샘플 MMSI 레코드만 읽기 (mmsi + FEATURES 컬럼만) ──
-    t2_start = time.time()
-    mmsi_data = defaultdict(list)
-    cols_needed = ["mmsi"] + FEATURES
-    _sampled_pa = _pa.array(list(sampled_mmsi)) if _HAS_PYARROW else None
-    if _HAS_PYARROW:
-        for idx, fpath in enumerate(files):
-            try:
-                tbl = _pa_csv.read_csv(
-                    fpath,
-                    read_options=_pa_read_opts,
-                    convert_options=_pa_csv.ConvertOptions(
-                        include_columns=cols_needed,
-                        auto_dict_encode=False,
-                        column_types={"mmsi": _pa.large_string()},
-                    ),
-                )
-                mask = _pa_compute.is_in(tbl.column("mmsi"), value_set=_sampled_pa)
-                df = tbl.filter(mask).to_pandas()
-                df["mmsi"] = df["mmsi"].astype(str)
-                df = df[df["mmsi"].isin(sampled_mmsi)]
-                # MMSI별 그룹화하여 레코드 추가
-                for mmsi_val, group in df.groupby("mmsi", sort=False):
-                    if MAX_RECS_PER_MMSI and len(mmsi_data[mmsi_val]) >= MAX_RECS_PER_MMSI:
-                        continue
-                    remaining = MAX_RECS_PER_MMSI - len(mmsi_data[mmsi_val]) if MAX_RECS_PER_MMSI else len(group)
-                    take = group[FEATURES].values[:remaining]
-                    # NaN/Inf 행 제거
-                    valid = ~np.isnan(take).any(axis=1) & ~np.isinf(take).any(axis=1)
-                    take = take[valid]
-                    mmsi_data[mmsi_val].extend(take.tolist())
-            except Exception as e:
-                print(f"  [2패스 스킵] {os.path.basename(fpath)}: {e}")
-                continue
-            if (idx + 1) % max(1, len(files) // 10) == 0:
-                pct = (idx + 1) / len(files) * 100
-                el  = time.time() - t2_start
-                eta = el / (idx + 1) * (len(files) - idx - 1)
-                rss_gb, avail_gb = _check_ram(f"2패스 {pct:.0f}%")
-                ram_str = f" RAM={rss_gb:.1f}GB" if rss_gb else ""
-                print(f"  2패스 {pct:.0f}% ({idx+1}/{len(files)}) "
-                      f"경과 {el/60:.1f}min ETA {eta/60:.1f}min{ram_str}")
-    elif _HAS_PANDAS:
-        for idx, fpath in enumerate(files):
-            try:
-                df = pd.read_csv(fpath, usecols=cols_needed,
-                                 dtype={"mmsi": str}, low_memory=False,
-                                 on_bad_lines="skip")
-                df = df[df["mmsi"].isin(sampled_mmsi)]
-                for mmsi_val, group in df.groupby("mmsi", sort=False):
-                    if MAX_RECS_PER_MMSI and len(mmsi_data[mmsi_val]) >= MAX_RECS_PER_MMSI:
-                        continue
-                    remaining = MAX_RECS_PER_MMSI - len(mmsi_data[mmsi_val]) if MAX_RECS_PER_MMSI else len(group)
-                    take = group[FEATURES].values[:remaining]
-                    valid = ~np.isnan(take).any(axis=1) & ~np.isinf(take).any(axis=1)
-                    take = take[valid]
-                    mmsi_data[mmsi_val].extend(take.tolist())
-            except Exception as e:
-                print(f"  [2패스 스킵] {os.path.basename(fpath)}: {e}")
-                continue
-            if (idx + 1) % max(1, len(files) // 10) == 0:
-                pct = (idx + 1) / len(files) * 100
-                el  = time.time() - t2_start
-                eta = el / (idx + 1) * (len(files) - idx - 1)
-                rss_gb, avail_gb = _check_ram(f"2패스 {pct:.0f}%")
-                ram_str = f" RAM={rss_gb:.1f}GB" if rss_gb else ""
-                print(f"  2패스 {pct:.0f}% ({idx+1}/{len(files)}) "
-                      f"경과 {el/60:.1f}min ETA {eta/60:.1f}min{ram_str}")
-    else:
-        for fpath in files:
-            with open(fpath, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    mmsi = row.get("mmsi", "")
-                    if mmsi not in sampled_mmsi:
-                        continue
-                    if MAX_RECS_PER_MMSI and len(mmsi_data[mmsi]) >= MAX_RECS_PER_MMSI:
-                        continue
-                    try:
-                        record = [float(row[col]) for col in FEATURES]
-                        mmsi_data[mmsi].append(record)
-                    except (ValueError, KeyError):
-                        continue
-    total_recs = sum(len(v) for v in mmsi_data.values())
-    t2_elapsed = (time.time() - t2_start) / 60
-    print(f"  로드 완료: {len(mmsi_data):,} MMSI | 총 레코드: {total_recs:,}  "
-          f"(2패스 {t2_elapsed:.1f}min)")
+    # ── 연·월별 균등 MMSI 샘플링 ──────────────────────────────────
+    limit = max_mmsi or SAMPLE_MMSI
+    if limit and len(all_mmsis) > limit:
+        mmsi_main_period = {
+            m: max(cnt, key=cnt.get) if cnt else ""
+            for m, cnt in mmsi_period_cnt.items()
+        }
+        period_buckets = defaultdict(list)
+        for mmsi in all_mmsis:
+            period_buckets[mmsi_main_period.get(mmsi, "")].append(mmsi)
 
-    # ── 시퀀스 생성 ────────────────────────────────────────────────
+        active_periods = sorted(p for p in period_buckets if p)
+        if active_periods:
+            per_period = max(1, limit // len(active_periods))
+            selected  = []
+            for p in active_periods:
+                pool = period_buckets[p]
+                selected.extend(random.sample(pool, min(per_period, len(pool))))
+            if len(selected) < limit:
+                leftover = [m for m in all_mmsis if m not in set(selected)]
+                selected.extend(random.sample(leftover, min(limit - len(selected), len(leftover))))
+            selected = selected[:limit]
+            dist = defaultdict(int)
+            for m in selected:
+                dist[mmsi_main_period.get(m, "")] += 1
+            dist_str = "  ".join(f"{p}:{c}" for p, c in sorted(dist.items()) if p)
+            print(f"  연·월별 균등 샘플: {len(selected):,}개 MMSI  "
+                  f"({len(active_periods)}개 기간)  [{dist_str}]")
+        else:
+            selected = random.sample(all_mmsis, limit)
+            print(f"  랜덤 샘플: {len(selected):,}개 MMSI")
+        mmsi_data = {k: mmsi_data[k] for k in selected}
+
+    # ── 시퀀스 생성 + MMSI당 상한 ────────────────────────────────
     dt_idx      = FEATURES.index("dt")
     dist_km_idx = FEATURES.index("dist_km")
     sequences   = []
+    capped      = 0
 
     for records in mmsi_data.values():
         segments, current = [], [records[0]]
@@ -513,13 +281,29 @@ def load_and_prepare(input_path: str, scaler_path: str = "scaler.json"):
             else:
                 current.append(rec)
         segments.append(current)
+
+        mmsi_seqs = []
         for seg in segments:
             if len(seg) < SEQ_LEN:
                 continue
             for i in range(len(seg) - SEQ_LEN + 1):
-                sequences.append(seg[i: i + SEQ_LEN])
+                mmsi_seqs.append(seg[i: i + SEQ_LEN])
 
+        if len(mmsi_seqs) > MAX_SEQ_PER_MMSI:
+            mmsi_seqs = random.sample(mmsi_seqs, MAX_SEQ_PER_MMSI)
+            capped += 1
+        sequences.extend(mmsi_seqs)
+
+    if capped:
+        print(f"  MMSI당 상한({MAX_SEQ_PER_MMSI}) 적용: {capped:,}개 MMSI 절감")
     print(f"  총 시퀀스: {len(sequences):,}")
+
+    if extra_features:
+        if _HAS_FE_AUGMENT:
+            sequences = [_augment_seq(seq, extra_features) for seq in sequences]
+            print(f"  extra 피처 {len(extra_features)}개 augment: {extra_features}")
+        else:
+            print(f"  [경고] feature_engineer import 실패 — extra_features 무시")
 
     flat   = [row for seq in sequences for row in seq]
     scaler = MinMaxScaler()
@@ -527,49 +311,30 @@ def load_and_prepare(input_path: str, scaler_path: str = "scaler.json"):
     scaled = [scaler.transform(seq) for seq in sequences]
 
     with open(scaler_path, "w") as f:
-        json.dump({"features": FEATURES, "min": scaler.min_, "max": scaler.max_}, f, indent=2)
+        json.dump({
+            "features": all_feat,
+            "min":      scaler.min_,
+            "max":      scaler.max_,
+            "clip_lo":  scaler.clip_lo,   # 1 퍼센타일 (eval 시 클리핑용)
+            "clip_hi":  scaler.clip_hi,   # 99 퍼센타일
+        }, f, indent=2)
     print(f"  스케일러 저장: {scaler_path}")
 
     tensor = torch.tensor(scaled, dtype=torch.float32)
-
-    # ── 캐시 저장 (다음 실행 시 로딩 생략) ──────────────────────────
-    try:
-        torch.save(tensor, CACHE_FILE)
-        size_mb = os.path.getsize(CACHE_FILE) / 1024 / 1024
-        # 메타 파일도 함께 저장 (캐시 유효성 검증용)
-        with open(CACHE_META_FILE, "w", encoding="utf-8") as f:
-            json.dump({"file_signature": file_sig,
-                        "n_files": len(files),
-                        "n_sequences": len(sequences),
-                        "tensor_shape": list(tensor.shape),
-                        "test_ratio": TEST_RATIO}, f, indent=2)
-        print(f"  캐시 저장 완료: {CACHE_FILE} ({size_mb:.0f} MB)")
-    except Exception as e:
-        print(f"  캐시 저장 실패 (무시): {e}")
-
     return tensor
 
 
 def make_loaders(tensor: torch.Tensor, batch_size: int):
-    """시간순 분할: 앞쪽 90% train, 뒤쪽 10% val.
-
-    시퀀스는 파일 순서(시간순)로 정렬된 상태이므로,
-    뒤쪽 10%는 시간적으로 가장 늦은 데이터 → 데이터 누수 방지.
-    (기존 random_split은 같은 선박의 인접 시퀀스가 train/val에 섞여 누수 발생)
-    """
-    n_total = len(tensor)
-    n_val   = max(1, int(n_total * VAL_RATIO))
-    n_train = n_total - n_val
-
-    train_tensor = tensor[:n_train]
-    val_tensor   = tensor[n_train:]
-
-    pin = torch.cuda.is_available()
-    train_loader = DataLoader(TensorDataset(train_tensor), batch_size=batch_size,
-                              shuffle=True, drop_last=True, pin_memory=pin, num_workers=0)
-    val_loader   = DataLoader(TensorDataset(val_tensor), batch_size=batch_size,
-                              shuffle=False, drop_last=False, pin_memory=pin, num_workers=0)
-    print(f"  학습: {n_train:,}  검증: {n_val:,}  배치: {batch_size}  (시간순 분할)")
+    dataset = TensorDataset(tensor)
+    n_val   = max(1, int(len(dataset) * VAL_RATIO))
+    n_train = len(dataset) - n_val
+    train_ds, val_ds = random_split(
+        dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(SEED)
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
+    print(f"  학습: {n_train:,}  검증: {n_val:,}  배치: {batch_size}")
     return train_loader, val_loader
 
 
@@ -593,33 +358,18 @@ def calc_threshold(model, val_loader, device, threshold_path: str = "threshold.t
 
 
 def export_onnx(model, device, onnx_path: str):
-    # ONNX export는 항상 CPU에서 수행 (DirectML/ROCm 등 비표준 디바이스 대응)
-    cpu_model = model.cpu().eval()
-    dummy = torch.zeros(1, SEQ_LEN, N_FEAT, dtype=torch.float32)
-    pt_path = onnx_path.replace(".onnx", ".pt")
-
-    for opset in (13, 11):
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                torch.onnx.export(
-                    cpu_model, (dummy,), onnx_path,
-                    dynamo=False,
-                    opset_version=opset,
-                    input_names=["x"],
-                    output_names=["output"],
-                    dynamic_axes={"x": {0: "batch"}, "output": {0: "batch"}},
-                )
-            model.to(device)
-            print(f"  ONNX 저장 (opset={opset}): {onnx_path}")
-            return
-        except Exception as e:
-            print(f"  ONNX opset={opset} 실패 ({e.__class__.__name__}) -- 다음 시도...")
-
-    # 모든 opset 실패 -> .pt 로 저장
-    torch.save(cpu_model.state_dict(), pt_path)
-    model.to(device)
-    print(f"  ONNX 불가 -- PyTorch 모델 저장: {pt_path}")
+    model.eval()
+    dummy = torch.zeros(1, SEQ_LEN, N_FEAT, dtype=torch.float32).to(device)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torch.onnx.export(
+            model, (dummy,), onnx_path,
+            dynamo=False,
+            opset_version=14,
+            input_names=["x"],
+            output_names=["output"],
+        )
+    print(f"  ONNX 저장: {onnx_path}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1309,9 +1059,10 @@ class DCdetector(nn.Module):
         self.n_feat     = n_feat
         self.patch_size = patch_size
         self.n_patches  = seq_len // patch_size
-        # Channel-wise attention
+        # Channel-wise attention — nhead는 n_feat의 약수여야 함
+        ch_nhead = next(n for n in range(min(nhead, n_feat), 0, -1) if n_feat % n == 0)
         self.ch_attn  = nn.MultiheadAttention(
-            n_feat, num_heads=min(nhead, n_feat), dropout=dropout, batch_first=True)
+            n_feat, num_heads=ch_nhead, dropout=dropout, batch_first=True)
         self.ch_norm  = nn.LayerNorm(n_feat)
         # Patch embedding + attention
         self.patch_embed = nn.Linear(patch_size * n_feat, d_model)
@@ -1421,272 +1172,19 @@ def train_sklearn_ae(sk_name: str, model: FlattenAE, tensor: torch.Tensor,
     train_standard(model, normal_loader, val_loader, device, epochs, lr, patience)
 
 # ══════════════════════════════════════════════════════════════════
-# 신규 알고리즘 1: DeepSVDD (Ruff et al., ICML 2018)
-# ══════════════════════════════════════════════════════════════════
-class DeepSVDD(nn.Module):
-    """
-    Deep Support Vector Data Description + AE 하이브리드
-    - 인코더+디코더로 재구성 학습 (AE loss)
-    - 잠재 공간 중심 C 근방으로 집중 학습 (SVDD loss)
-    - 이상 = 재구성 오차 高 + 잠재 중심 거리 遠
-    OCSVM 대체 (GPU 가속, O(n) 복잡도)
-    """
-    def __init__(self, seq_len: int = SEQ_LEN, n_feat: int = N_FEAT,
-                 hidden_dim: int = 128, latent_dim: int = 32):
-        super().__init__()
-        self.seq_len, self.n_feat, self.latent_dim = seq_len, n_feat, latent_dim
-        self.encoder = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(seq_len * n_feat, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, latent_dim),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, seq_len * n_feat),
-        )
-        self.register_buffer("center", torch.zeros(latent_dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        z = self.encoder(x)
-        return self.decoder(z).view(B, self.seq_len, self.n_feat)
-
-    def svdd_loss(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.encoder(x)
-        return ((z - self.center) ** 2).mean()
-
-
-def train_deepsvdd(model: DeepSVDD, train_loader, val_loader, device,
-                   epochs: int, lr: float, patience: int):
-    """AE loss + SVDD loss 결합 학습. center는 첫 배치 forward로 초기화."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
-
-    # center 초기화 (첫 에폭 인코더 출력 평균)
-    model.eval()
-    with torch.no_grad():
-        z_list = []
-        for (batch,) in train_loader:
-            z = model.encoder(batch.to(device))
-            z_list.append(z)
-            if len(z_list) >= 10:
-                break
-        model.center.copy_(torch.cat(z_list).mean(0).detach())
-    model.train()
-
-    best_val, wait = float("inf"), 0
-    svdd_w = 0.3  # SVDD loss 가중치
-
-    for ep in range(1, epochs + 1):
-        model.train()
-        t_loss = 0.0
-        for (batch,) in tqdm(train_loader, desc=f"Epoch {ep:3d}/{epochs}", leave=False):
-            batch = batch.to(device)
-            recon = model(batch)
-            ae_loss   = F.mse_loss(recon, batch)
-            svdd_loss = model.svdd_loss(batch)
-            loss = ae_loss + svdd_w * svdd_loss
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
-            t_loss += loss.item()
-        scheduler.step()
-
-        model.eval()
-        v_loss = 0.0
-        with torch.no_grad():
-            for (batch,) in val_loader:
-                batch = batch.to(device)
-                recon = model(batch)
-                v_loss += F.mse_loss(recon, batch).item()
-        v_loss /= max(len(val_loader), 1)
-
-        if ep % 10 == 0 or ep == epochs:
-            print(f"  Epoch {ep:3d}/{epochs} | train={t_loss/len(train_loader):.6f} | val={v_loss:.6f}")
-
-        if v_loss < best_val - 1e-6:
-            best_val, wait = v_loss, 0
-        else:
-            wait += 1
-            if wait >= patience:
-                print(f"  조기 종료 (epoch={ep})")
-                break
-
-
-# ══════════════════════════════════════════════════════════════════
-# 신규 알고리즘 2: TimesNet AE (Wu et al., ICLR 2023 -- 간소화)
-# ══════════════════════════════════════════════════════════════════
-class TimesNetAE(nn.Module):
-    """
-    TimesNet 아이디어 적용: 시계열을 (T × d_model) 2D 공간으로 임베딩 후
-    Conv2D 인코더/디코더로 temporal + feature 패턴을 동시에 포착.
-    seq_len=10 짧은 시퀀스에 최적화된 경량 버전.
-    """
-    def __init__(self, seq_len: int = SEQ_LEN, n_feat: int = N_FEAT,
-                 d_model: int = 32, n_ch: int = 16):
-        super().__init__()
-        self.seq_len, self.n_feat, self.d_model = seq_len, n_feat, d_model
-        self.embed = nn.Linear(n_feat, d_model)
-        # 인코더: (B, 1, T, d_model) → Conv2D 스택
-        self.enc = nn.Sequential(
-            nn.Conv2d(1, n_ch, kernel_size=(3, 3), padding=1),
-            nn.GELU(),
-            nn.Conv2d(n_ch, n_ch * 2, kernel_size=(3, 3), padding=1),
-            nn.GELU(),
-        )
-        # 디코더
-        self.dec = nn.Sequential(
-            nn.ConvTranspose2d(n_ch * 2, n_ch, kernel_size=(3, 3), padding=1),
-            nn.GELU(),
-            nn.ConvTranspose2d(n_ch, 1, kernel_size=(3, 3), padding=1),
-        )
-        self.proj = nn.Linear(d_model, n_feat)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, F)
-        h = self.embed(x).unsqueeze(1)          # (B, 1, T, d_model)
-        h = self.dec(self.enc(h)).squeeze(1)     # (B, T, d_model)
-        return self.proj(h)                      # (B, T, F)
-
-
-# ══════════════════════════════════════════════════════════════════
-# 신규 알고리즘 3: DAGMM (Zong et al., ICLR 2018)
-# ══════════════════════════════════════════════════════════════════
-class DAGMM(nn.Module):
-    """
-    Deep Autoencoding Gaussian Mixture Model
-    - AE로 재구성 + 잠재벡터+재구성오차 결합 → GMM 멤버십 추정
-    - 에너지(GMM 음로그우도) 기반 이상 점수
-    - forward()는 eval_anomaly.py 호환을 위해 재구성 텐서 반환
-    """
-    def __init__(self, seq_len: int = SEQ_LEN, n_feat: int = N_FEAT,
-                 latent_dim: int = 16, n_gmm: int = 4):
-        super().__init__()
-        self.seq_len, self.n_feat, self.latent_dim, self.n_gmm = seq_len, n_feat, latent_dim, n_gmm
-        in_dim = seq_len * n_feat
-        self.encoder = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_dim, 64), nn.Tanh(),
-            nn.Linear(64, latent_dim),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 64), nn.Tanh(),
-            nn.Linear(64, in_dim),
-        )
-        # z_combined = [z(latent_dim) | recon_err(1) | cos_sim(1)]
-        self.estimation = nn.Sequential(
-            nn.Linear(latent_dim + 2, 16), nn.Tanh(),
-            nn.Dropout(0.5),
-            nn.Linear(16, n_gmm), nn.Softmax(dim=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        z = self.encoder(x)
-        return self.decoder(z).view(B, self.seq_len, self.n_feat)
-
-    def _z_combined(self, x: torch.Tensor):
-        B = x.shape[0]
-        z = self.encoder(x)
-        x_hat = self.decoder(z).view(B, self.seq_len, self.n_feat)
-        xf = x.view(B, -1); xhf = x_hat.view(B, -1)
-        err = ((xf - xhf) ** 2).mean(1, keepdim=True)
-        cos = F.cosine_similarity(xf, xhf, dim=1, eps=1e-8).unsqueeze(1)
-        return torch.cat([z, err, cos], dim=1), x_hat
-
-    def energy(self, x: torch.Tensor):
-        """이상 점수 (에너지) -- 학습 후 사용"""
-        zc, _ = self._z_combined(x)
-        gamma = self.estimation(zc)        # (B, K)
-        # batch 단위 GMM 파라미터 추정
-        phi = gamma.mean(0)                # (K,)
-        mu  = (gamma.T @ zc) / gamma.sum(0, keepdim=True).T  # (K, D)
-        diff = zc.unsqueeze(1) - mu.unsqueeze(0)              # (B, K, D)
-        sigma = (gamma.unsqueeze(-1) * diff.unsqueeze(-1) *
-                 diff.unsqueeze(-2)).mean(0)                   # (K, D, D)
-        # 에너지 계산
-        energies = []
-        for k in range(self.n_gmm):
-            S = sigma[k] + 1e-6 * torch.eye(sigma.shape[-1], device=x.device)
-            try:
-                Sinv = torch.linalg.inv(S)
-                det  = torch.linalg.det(S).clamp(min=1e-12)
-            except Exception:
-                Sinv = torch.eye(S.shape[-1], device=x.device)
-                det  = torch.tensor(1.0, device=x.device)
-            d = diff[:, k, :]  # (B, D)
-            e = -0.5 * (d.unsqueeze(1) @ Sinv @ d.unsqueeze(2)).squeeze() \
-                - 0.5 * det.log()
-            energies.append(phi[k] * e.exp())
-        return -torch.stack(energies, dim=1).sum(1).log().clamp(min=-100)
-
-
-def train_dagmm(model: DAGMM, train_loader, val_loader, device,
-                epochs: int, lr: float, patience: int):
-    """AE loss + GMM 에너지 loss 결합 학습"""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr*0.01)
-    best_val, wait = float("inf"), 0
-
-    for ep in range(1, epochs + 1):
-        model.train()
-        t_loss = 0.0
-        for (batch,) in tqdm(train_loader, desc=f"Epoch {ep:3d}/{epochs}", leave=False):
-            batch = batch.to(device)
-            zc, x_hat = model._z_combined(batch)
-            gamma = model.estimation(zc)
-            ae_loss = F.mse_loss(x_hat, batch)
-            # 에너지 정규화 손실 (간소화 버전)
-            phi = gamma.mean(0)
-            reg = -(phi * (phi + 1e-8).log()).sum()  # 엔트로피 최대화로 GMM 다양성 유지
-            loss = ae_loss + 0.1 * reg
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
-            t_loss += ae_loss.item()
-        scheduler.step()
-
-        model.eval()
-        v_loss = 0.0
-        with torch.no_grad():
-            for (batch,) in val_loader:
-                batch = batch.to(device)
-                _, x_hat = model._z_combined(batch)
-                v_loss += F.mse_loss(x_hat, batch).item()
-        v_loss /= max(len(val_loader), 1)
-
-        if ep % 10 == 0 or ep == epochs:
-            print(f"  Epoch {ep:3d}/{epochs} | train={t_loss/len(train_loader):.6f} | val={v_loss:.6f}")
-
-        if v_loss < best_val - 1e-6:
-            best_val, wait = v_loss, 0
-        else:
-            wait += 1
-            if wait >= patience:
-                print(f"  조기 종료 (epoch={ep})")
-                break
-
-
-# ══════════════════════════════════════════════════════════════════
 # 모델별 하이퍼파라미터 ← 여기서 직접 수정
 # ══════════════════════════════════════════════════════════════════
 DEFAULTS = {
-    #              epochs  lr      batch   patience
-    "usad":      dict(epochs=50,  lr=1e-3, batch_size=2048, patience=7),
-    "tranad":    dict(epochs=50,  lr=1e-3, batch_size=2048, patience=7),
-    "conv1d":    dict(epochs=30,  lr=1e-3, batch_size=2048, patience=5),
-    "lstm":      dict(epochs=30,  lr=1e-3, batch_size=2048, patience=5),
-    "tcn":       dict(epochs=30,  lr=1e-3, batch_size=2048, patience=5),
-    "anomtrans": dict(epochs=50,  lr=1e-3, batch_size=2048, patience=7),
-    "dcdetect":  dict(epochs=30,  lr=1e-3, batch_size=2048, patience=5),
-    "iforest":   dict(epochs=30,  lr=1e-3, batch_size=2048, patience=5),
-    # 신규
-    "deepsvdd":  dict(epochs=50,  lr=1e-3, batch_size=2048, patience=7),
-    "timesnet":  dict(epochs=30,  lr=1e-3, batch_size=2048, patience=5),
-    "dagmm":     dict(epochs=50,  lr=1e-3, batch_size=2048, patience=7),
+    #              epochs  lr      batch  patience
+    "usad":      dict(epochs=50,  lr=1e-3, batch_size=256, patience=7),
+    "tranad":    dict(epochs=50,  lr=1e-3, batch_size=256, patience=7),
+    "conv1d":    dict(epochs=30,  lr=1e-3, batch_size=256, patience=5),
+    "lstm":      dict(epochs=30,  lr=1e-3, batch_size=256, patience=5),
+    "tcn":       dict(epochs=30,  lr=1e-3, batch_size=256, patience=5),
+    "anomtrans": dict(epochs=50,  lr=1e-3, batch_size=256, patience=7),
+    "dcdetect":  dict(epochs=30,  lr=1e-3, batch_size=256, patience=5),
+    "iforest":   dict(epochs=30,  lr=1e-3, batch_size=256, patience=5),
+    "ocsvm":     dict(epochs=30,  lr=5e-4, batch_size=256, patience=5),
 }
 
 
@@ -1709,185 +1207,117 @@ def run_model(model_name: str, tensor: torch.Tensor,
 
     train_loader, val_loader = make_loaders(tensor, batch_size)
 
-    # LSTM은 DirectML 미지원 -- CPU 강제
-    model_device = torch.device("cpu") if model_name == "lstm" else device
-
     if model_name == "usad":
-        model = USAD(SEQ_LEN, N_FEAT, latent_dim=40, hidden_dim=128).to(model_device)
-        train_usad(model, train_loader, val_loader, model_device, epochs, lr, patience)
+        model = USAD(SEQ_LEN, N_FEAT, latent_dim=40, hidden_dim=128).to(device)
+        train_usad(model, train_loader, val_loader, device, epochs, lr, patience)
 
     elif model_name == "tranad":
         model = TranAD(SEQ_LEN, N_FEAT, d_model=64, nhead=4,
                        num_encoder_layers=1, num_decoder_layers=1,
-                       dim_feedforward=128).to(model_device)
-        train_tranad(model, train_loader, val_loader, model_device, epochs, lr, patience)
+                       dim_feedforward=128).to(device)
+        train_tranad(model, train_loader, val_loader, device, epochs, lr, patience)
 
     elif model_name == "conv1d":
-        model = Conv1DAE(N_FEAT, hidden_ch=32).to(model_device)
-        train_standard(model, train_loader, val_loader, model_device,
+        model = Conv1DAE(N_FEAT, hidden_ch=32).to(device)
+        train_standard(model, train_loader, val_loader, device,
                        epochs, lr, patience)
 
     elif model_name == "lstm":
-        # DirectML은 aten::_thnn_fused_lstm_cell 미지원 -- CPU로 학습
-        model = LSTMAutoencoder(input_size=N_FEAT, hidden_size=64, num_layers=2).to(model_device)
-        train_standard(model, train_loader, val_loader, model_device,
+        model = LSTMAutoencoder(input_size=N_FEAT, hidden_size=64, num_layers=2).to(device)
+        train_standard(model, train_loader, val_loader, device,
                        epochs, lr, patience)
 
     elif model_name == "tcn":
-        model = TCNAE(N_FEAT, hidden_ch=32, kernel_size=3, dilations=[1, 2, 4]).to(model_device)
-        train_standard(model, train_loader, val_loader, model_device,
+        model = TCNAE(N_FEAT, hidden_ch=32, kernel_size=3, dilations=[1, 2, 4]).to(device)
+        train_standard(model, train_loader, val_loader, device,
                        epochs, lr, patience)
 
     elif model_name == "anomtrans":
         model = AnomalyTransformerAE(SEQ_LEN, N_FEAT, d_model=64, nhead=4,
-                                     n_layers=2, dim_ff=128).to(model_device)
-        train_anomtrans(model, train_loader, val_loader, model_device, epochs, lr, patience)
+                                     n_layers=2, dim_ff=128).to(device)
+        train_anomtrans(model, train_loader, val_loader, device, epochs, lr, patience)
 
     elif model_name == "dcdetect":
-        model = DCdetector(SEQ_LEN, N_FEAT, patch_size=2, d_model=64, nhead=4).to(model_device)
-        train_standard(model, train_loader, val_loader, model_device,
+        model = DCdetector(SEQ_LEN, N_FEAT, patch_size=2, d_model=64, nhead=4).to(device)
+        train_standard(model, train_loader, val_loader, device,
                        epochs, lr, patience)
 
-    elif model_name == "iforest":
-        model = FlattenAE(SEQ_LEN, N_FEAT, hidden_dim=128, latent_dim=32).to(model_device)
+    elif model_name in ("iforest", "ocsvm"):
+        model = FlattenAE(SEQ_LEN, N_FEAT, hidden_dim=128, latent_dim=32).to(device)
         train_sklearn_ae(model_name, model, full_tensor, train_loader, val_loader,
-                         model_device, epochs, lr, patience)
-
-    elif model_name == "deepsvdd":
-        model = DeepSVDD(SEQ_LEN, N_FEAT, hidden_dim=128, latent_dim=32).to(model_device)
-        train_deepsvdd(model, train_loader, val_loader, model_device, epochs, lr, patience)
-
-    elif model_name == "timesnet":
-        model = TimesNetAE(SEQ_LEN, N_FEAT, d_model=32, n_ch=16).to(model_device)
-        train_standard(model, train_loader, val_loader, model_device, epochs, lr, patience)
-
-    elif model_name == "dagmm":
-        model = DAGMM(SEQ_LEN, N_FEAT, latent_dim=16, n_gmm=4).to(model_device)
-        train_dagmm(model, train_loader, val_loader, model_device, epochs, lr, patience)
-
+                         device, epochs, lr, patience)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    calc_threshold(model, val_loader, model_device, threshold_path)
-    export_onnx(model, model_device, onnx_path)
+    calc_threshold(model, val_loader, device, threshold_path)
+    export_onnx(model, device, onnx_path)
     return model
 
 
 def main():
-    global OUTPUT_DIR, CACHE_FILE, THRESHOLD_PERCENTILE
-
     parser = argparse.ArgumentParser(description="AIS 벤치마크 학습 (eval_anomaly.py 호환)")
     parser.add_argument("--model",      type=str, default="usad",
-                        help="학습할 모델 (all: 전체 / 콤마 구분 복수: lstm,timesnet,usad)")
+                        choices=["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","all"],
+                        help="학습할 모델 (all: 전체 7개 모델 순차 학습)")
     parser.add_argument("--input",      type=str, default=INPUT_FILE)
     parser.add_argument("--epochs",     type=int, default=None)
     parser.add_argument("--lr",         type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--patience",   type=int, default=None)
-    parser.add_argument("--output",     type=str, default=None,
-                        help="모델/스케일러/임계값 저장 경로 (기본: D:\\JB-Pirate-King-ML-Results)")
-    parser.add_argument("--cache",      type=str, default=None,
-                        help="데이터 캐시 파일 경로 (기본: OUTPUT_DIR\\train_data_cache.pt)")
-    parser.add_argument("--threshold-pct", type=int, default=None,
-                        help="임계값 퍼센타일 (기본 95 → FPR≈5%%, 99 → FPR≈1%%)")
+    parser.add_argument("--output_dir", type=str, default=".",
+                        help="모델 파일 저장 디렉터리 (기본: 현재 폴더)")
+    parser.add_argument("--max_mmsi",  type=int, default=None,
+                        help=f"학습에 사용할 최대 MMSI 수 (기본: {SAMPLE_MMSI})")
+    parser.add_argument("--extra_features", nargs="*", default=[],
+                        help="추가 피처 목록 (feature_engineer.py CANDIDATE_FEATURES 키)")
     args = parser.parse_args()
 
-    # 전역 경로/설정 재정의 (scaling 비교 등 별도 실행 시 사용)
-    if args.output:
-        OUTPUT_DIR = args.output
-    if args.cache:
-        CACHE_FILE = args.cache
-    elif args.output:
-        # --output만 지정 시 캐시도 해당 디렉터리에
-        CACHE_FILE = os.path.join(args.output, "train_data_cache.pt")
-    if args.threshold_pct:
-        THRESHOLD_PERCENTILE = args.threshold_pct
-        print(f"[임계값] THRESHOLD_PERCENTILE={THRESHOLD_PERCENTILE} (FPR~{100-THRESHOLD_PERCENTILE}%)")
+    extra_features = list(args.extra_features or [])
+    if extra_features:
+        global N_FEAT
+        N_FEAT = len(FEATURES) + len(extra_features)
 
-    device = get_best_device()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[디바이스] {device}")
     print(f"[피처 수]  {N_FEAT}  |  시퀀스 길이: {SEQ_LEN}")
-    print(f"[출력경로] {OUTPUT_DIR}")
-    print(f"[캐시경로] {CACHE_FILE}")
-
-    # D드라이브 출력 디렉터리 생성
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     t0 = time.time()
-    all_models = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect",
-                  "iforest","deepsvdd","timesnet","dagmm"]
-    if args.model == "all":
-        models_to_run = all_models
-    else:
-        models_to_run = [m.strip() for m in args.model.split(",") if m.strip() in all_models]
+    models_to_run = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect"] if args.model == "all" else [args.model]
 
-    total = len(models_to_run)
-    notify(f"비지도 학습 시작 -- {total}개 모델: {', '.join(models_to_run)}\n"
-           f"SAMPLE_MMSI={SAMPLE_MMSI}  batch=2048  D드라이브 저장",
-           "JB-Pirate-King | 비지도 학습 시작")
+    # 데이터는 한 번만 로드 (스케일러는 모델별로 저장)
+    first_scaler = os.path.join(args.output_dir, f"scaler_{models_to_run[0]}.json")
+    tensor = load_and_prepare(args.input, scaler_path=first_scaler,
+                              max_mmsi=args.max_mmsi, extra_features=extra_features)
 
-    # 데이터는 한 번만 로드
-    first_scaler = os.path.join(OUTPUT_DIR, f"scaler_{models_to_run[0]}.json")
-    tensor = load_and_prepare(args.input, scaler_path=first_scaler)
-
-    done_count = 0
-    for idx, name in enumerate(models_to_run):
-        onnx_path      = os.path.join(OUTPUT_DIR, f"model_{name}.onnx")
-        pt_path        = os.path.join(OUTPUT_DIR, f"model_{name}.pt")
-        scaler_path    = os.path.join(OUTPUT_DIR, f"scaler_{name}.json")
-        threshold_path = os.path.join(OUTPUT_DIR, f"threshold_{name}.txt")
-
-        if os.path.exists(onnx_path) and os.path.getsize(onnx_path) > 0:
-            print(f"\n[스킵] {name} -- 이미 ONNX 완료: {onnx_path}")
-            done_count += 1
-            continue
-        if os.path.exists(pt_path) and os.path.getsize(pt_path) > 0:
-            print(f"\n[스킵] {name} -- 이미 PT 완료: {pt_path}")
-            done_count += 1
-            continue
-
+    for name in models_to_run:
         d = DEFAULTS[name]
         epochs     = args.epochs     or d["epochs"]
         lr         = args.lr         or d["lr"]
         batch_size = args.batch_size or d["batch_size"]
         patience   = args.patience   or d["patience"]
 
-        if name != models_to_run[0] and os.path.exists(first_scaler):
+        onnx_path      = os.path.join(args.output_dir, f"model_{name}.onnx")
+        scaler_path    = os.path.join(args.output_dir, f"scaler_{name}.json")
+        threshold_path = os.path.join(args.output_dir, f"threshold_{name}.txt")
+
+        # 첫 모델 외에는 scaler 재저장 (동일 데이터이므로 값은 같음)
+        if name != models_to_run[0]:
             shutil.copy(first_scaler, scaler_path)
+            print(f"  스케일러 복사: {first_scaler} → {scaler_path}")
 
-        elapsed_min = round((time.time() - t0) / 60, 1)
-        prog_pct    = round(idx / total * 100)
-        notify(f"[{idx+1}/{total}] {name.upper()} 학습 시작\n"
-               f"전체 진행: {prog_pct}%  |  경과: {elapsed_min}분",
-               f"JB-Pirate-King | {name}")
+        run_model(name, tensor, epochs, lr, batch_size, patience, device,
+                  onnx_path, scaler_path, threshold_path, full_tensor=tensor)
 
-        try:
-            run_model(name, tensor, epochs, lr, batch_size, patience, device,
-                      onnx_path, scaler_path, threshold_path, full_tensor=tensor)
-            done_count += 1
-            elapsed_min = round((time.time() - t0) / 60, 1)
-            prog_pct    = round((idx + 1) / total * 100)
-            notify(f"[{idx+1}/{total}] {name.upper()} 완료 -- {prog_pct}%\n"
-                   f"경과: {elapsed_min}분  |  남은 모델: {total-idx-1}개",
-                   f"JB-Pirate-King | {name} 완료")
-        except Exception as _e:
-            print(f"\n[모델 오류] {name}: {_e.__class__.__name__}: {_e}")
-            print(f"  --> {name} 스킵, 다음 모델로 계속 진행")
-            notify(f"[오류] {name}: {_e.__class__.__name__} -- 스킵 후 계속",
-                   "JB-Pirate-King | 오류")
+    print(f"\n완료! 전체 소요: {time.time() - t0:.1f}s")
+    print(f"\n생성된 파일: ({args.output_dir})")
+    for name in models_to_run:
+        print(f"  model_{name}.onnx  |  scaler_{name}.json  |  threshold_{name}.txt")
 
-    total_min = round((time.time() - t0) / 60, 1)
-    result_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith(".onnx") or f.endswith(".pt")]
-    notify(f"비지도 학습 전체 완료!\n"
-           f"성공: {done_count}/{total}개  |  총 소요: {total_min}분\n"
-           f"저장: {OUTPUT_DIR}",
-           "JB-Pirate-King | 전체 완료")
-
-    print(f"\n완료! 전체 소요: {total_min}분")
-    print(f"저장 위치: {OUTPUT_DIR}")
-    for f in sorted(result_files):
-        size = round(os.path.getsize(os.path.join(OUTPUT_DIR, f)) / 1024, 1)
-        print(f"  {f}  ({size} KB)")
+    print("\neval_anomaly.py 사용법:")
+    for name in models_to_run:
+        print(f"  python eval_anomaly.py --model {name}")
 
 
 if __name__ == "__main__":
