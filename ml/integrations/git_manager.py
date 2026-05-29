@@ -14,7 +14,8 @@ PUSH_REMOTE = "upstream"
 
 
 def _run(cmd: list[str]) -> str:
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
     return result.stdout.strip()
 
 
@@ -40,7 +41,7 @@ def create_branch(model: str, run_num: int) -> str:
 
     result = subprocess.run(
         ["git", "push", "-u", PUSH_REMOTE, branch],
-        capture_output=True, text=True
+        capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     if result.returncode == 0:
         print(f"브랜치 생성 + 푸시: {branch} (base: {base})")
@@ -61,13 +62,13 @@ def commit_results(files: list[str], message: str, branch: str = None):
 
     result = subprocess.run(
         ["git", "commit", "-m", message],
-        capture_output=True, text=True
+        capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     if result.returncode == 0:
         print(f"커밋 완료: {message}")
         push = subprocess.run(
             ["git", "push"],
-            capture_output=True, text=True
+            capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
         if push.returncode == 0:
             print(f"푸시 완료: {branch or _run(['git', 'branch', '--show-current'])}")
