@@ -835,17 +835,21 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
         return decision, None, {}
 
     # 결과 파싱
-    det_rate, n_feat, threshold, full_extra, baseline_det, baseline_score = None, None, None, [], None, None
+    det_rate, det_fp5, det_fp10, n_feat, threshold = None, None, None, None, None
+    full_extra, baseline_det, baseline_score, scenario_fp1 = [], None, None, {}
     if Path(out_json).exists():
         with open(out_json, encoding="utf-8") as f:
             result = json.load(f)
         det_rate       = result.get("best_det")
-        n_feat         = len(result.get("best_extra", [])) + len(BASE_FEATURES)
+        det_fp5        = result.get("det_fp5")
+        det_fp10       = result.get("det_fp10")
         threshold      = result.get("threshold")
+        n_feat         = len(result.get("best_extra", [])) + len(BASE_FEATURES)
         _best = result.get("best_extra", [])
         full_extra = list(dict.fromkeys(current_initial_extra + _best))
         baseline_det   = result.get("baseline_det")
         baseline_score = result.get("baseline_score")
+        scenario_fp1   = result.get("scenario_fp1", {})
 
     newly_adopted = [f for f in full_extra if f not in current_initial_extra]
 
@@ -914,7 +918,12 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
     if importance:
         sheet.log_importance(branch, 1, importance, FEATURE_DESCRIPTIONS)
 
-    fe_stats = {"baseline_det": baseline_det, "det_rate": det_rate, "threshold": threshold}
+    fe_stats = {
+        "baseline_det": baseline_det, "det_rate": det_rate,
+        "det_fp5": det_fp5, "det_fp10": det_fp10, "threshold": threshold,
+    }
+    if scenario_fp1:
+        sheet.log_scenarios(branch, args.model, "FP=1%", scenario_fp1)
 
     if newly_adopted:
         det_str  = f"{det_rate:.1f}" if det_rate else "?"
@@ -978,6 +987,8 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
             fe_steps=n_adopted,
             fe_baseline=fe_stats.get("baseline_det"),
             fe_det=fe_stats.get("det_rate"),
+            fe_det_fp5=fe_stats.get("det_fp5"),
+            fe_det_fp10=fe_stats.get("det_fp10"),
             fe_n_feat=len(BASE_FEATURES) + len(new_extra) if new_extra else None,
             adopted=new_extra or current_initial_extra,
             threshold=fe_stats.get("threshold"),

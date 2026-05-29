@@ -568,8 +568,9 @@ def evaluate(
 ):
     """
     FP ≈ 1% 기준 탐지율 계산.
-    반환: (avg_det_fp1, scenario_results)
-    extra_fp 지정 시: 해당 FP 기준 탐지율도 출력 (참고용, 반환값 변경 없음)
+    반환: (avg_det_fp1, scenario_results, extra_results, fp1_thr)
+      extra_results: {fp_pct: {sc_name: det}} — extra_fp 지정 시 채워짐
+      fp1_thr: FP=1% 임계값 (정상 점수 99퍼센타일)
     """
     device = next(model.parameters()).device
     model.eval()
@@ -638,7 +639,7 @@ def evaluate(
                 mark = "❌" if det < 50 else "✅"
                 print(f"  {mark} {sc_name:<28} {det:>6.1f}%")
 
-    return float(np.mean(all_dets)), scenario_results
+    return float(np.mean(all_dets)), scenario_results, extra_results, fp1_thr
 
 
 # ── Permutation Importance ────────────────────────────────────────
@@ -799,8 +800,8 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     t0 = time.time()
     tensor, scaler = prepare_tensor(train_seqs, current_extra)
     model, val_loader = train_dcdetect(tensor, n_base_total, args.epochs)
-    det0, sc0 = evaluate(model, scaler, current_extra, args.n_anom,
-                         raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
+    det0, sc0, _, _ = evaluate(model, scaler, current_extra, args.n_anom,
+                               raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
     elapsed = time.time() - t0
 
     # 약세 시나리오 집합 = 베이스라인 탐지율 < weak_floor (전 과정 고정)
@@ -847,7 +848,7 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
             t0 = time.time()
             tensor, scaler = prepare_tensor(train_seqs, trial_extra)
             model, val_loader = train_dcdetect(tensor, n_feat, args.epochs)
-            det, sc = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=eval_seqs)
+            det, sc, _, _ = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=eval_seqs)
             elapsed = time.time() - t0
             score = _objective(sc, weak_names, weak_weight)
             gain  = score - best_score          # 목적 점수 기준 향상
@@ -1123,6 +1124,17 @@ def main():
         bar = "█" * max(0, int(imp / 2)) if imp > 0 else ""
         print(f"  {feat:<25s}  {imp:>+7.2f}pp  {bar}")
 
+    # ── 최종 모델 다중 FP 평가 (threshold + FP=5%/10%) ──────────────
+    print(f"\n[최종 모델 다중 FP 평가]  피처 {best['n_feat']}개...")
+    det_final, sc_final, extra_final, threshold = evaluate(
+        model_best, scaler_best, best_extra, args.n_anom,
+        raw_seqs=eval_normal_seqs, extra_fp=(5.0, 10.0)
+    )
+    det_fp5  = float(np.mean(list(extra_final[5.0].values()))) if extra_final.get(5.0) else None
+    det_fp10 = float(np.mean(list(extra_final[10.0].values()))) if extra_final.get(10.0) else None
+    print(f"  FP=1%: {det_final:.1f}%  FP=5%: {det_fp5:.1f}%  FP=10%: {det_fp10:.1f}%")
+    print(f"  threshold (FP=1% 기준): {threshold:.8f}")
+
     # 저장 경로 준비
     out_dir = os.path.join(args.base_dir, "ais_output", "feat_eng")
     os.makedirs(out_dir, exist_ok=True)
@@ -1156,13 +1168,20 @@ def main():
         json.dump(
             {
                 "best_extra": best_extra,
-                "best_det": best["det"],
-                "baseline_det": history[0]["det"],
+                "best_det":      det_final,
+                "det_fp5":       det_fp5,
+                "det_fp10":      det_fp10,
+                "threshold":     threshold,
+                "baseline_det":  history[0]["det"],
+                "baseline_score": history[0].get("score"),
                 "initial_extra": INITIAL_EXTRA,
                 "feature_descriptions": {
                     f: _all_feat_descs.get(f, "") for f in
                     BASE_FEATURES + all_feats_in_result
                 },
+                "scenario_fp1":  {n: d for n, d, _ in sc_final},
+                "scenario_fp5":  dict(extra_final.get(5.0, {})),
+                "scenario_fp10": dict(extra_final.get(10.0, {})),
                 "history": [
                     {k: v for k, v in r.items() if k != "scenarios"}
                     | {"scenarios": [(n, d, h) for n, d, h in r.get("scenarios", [])]}
@@ -1213,15 +1232,13 @@ def main():
                     "max": [float(x) for x in scaler_best.data_max_],
                 }, sf, indent=2, ensure_ascii=False)
 
-            # threshold: 홀드아웃 정상셋 99퍼센타일 = FP 1% (평가 탐지율과 동일 기준)
-            thr = compute_fp_threshold(model_best, scaler_best, best_extra,
-                                       eval_normal_seqs, fp_pct=1.0)
+            # threshold: 위에서 evaluate()가 반환한 fp1_thr (정상 점수 99퍼센타일)
             with open(threshold_path, "w", encoding="utf-8") as tf:
-                tf.write(str(thr))
+                tf.write(str(threshold))
 
             print(f"\n  [배포 export] {args.export_dir}  (피처 {n_feat}개)")
             print(f"    features: {all_feat_names}")
-            print(f"    threshold: {thr}")
+            print(f"    threshold: {threshold}")
         except Exception as _e:
             print(f"  [배포 export 실패] {_e}")
 
