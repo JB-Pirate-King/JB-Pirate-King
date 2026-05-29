@@ -775,6 +775,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
     fe_total_cand      = [0]
     fe_baseline_det    = [None]
     fe_baseline_done   = [False]
+    fe_final_phase     = [False]  # 채택 후 재학습/최종평가 단계
     fe_cur_cand: list  = [None]   # 현재 평가 중인 후보 (feat, desc)
     fe_pending_adoption: list = []
 
@@ -805,6 +806,51 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
         mw = re.search(r"약세 시나리오\((\d+)개\):\s*(.+)", s)
         if mw:
             bot.log(f"⚠️ 약세 시나리오 {mw.group(1)}개 (베이스 탐지율<50%): {mw.group(2)[:250]}", "피처개선")
+            return
+
+        # ── 채택 후: 최적 피처셋으로 재학습 시작 ──
+        mrt = re.search(r"최적 피처셋\((\d+)개\)으로 재학습", s)
+        if mrt:
+            fe_final_phase[0] = True
+            bot.log(
+                f"🔁 *채택 피처셋({mrt.group(1)}개)으로 최종 모델 재학습 시작*\n"
+                f"  (이 모델이 배포본 — 순열중요도 + FP=1%/5%/10% 평가 + threshold 산출)",
+                "피처개선"
+            )
+            return
+
+        # 최종 재학습 검증 손실 (최종 단계만)
+        if fe_final_phase[0] and "최적 검증 MSE" in s:
+            m = re.search(r"최적 검증 MSE:\s*([\d.]+)", s)
+            if m:
+                bot.log(f"  ✅ 최종 모델 학습 완료 — 최적 검증 MSE {m.group(1)}", "피처개선")
+            return
+
+        # 최종 다중 FP 평가 시작
+        if "최종 모델 다중 FP 평가" in s:
+            bot.log("📊 *최종 모델 평가 중* (FP=1%/5%/10% + 시나리오별 탐지율)...", "피처개선")
+            return
+
+        # 최종 FP별 평균: "FP=1%: X%  FP=5%: Y%  FP=10%: Z%"
+        mfp = re.search(r"FP=1%:\s*([\d.]+)%\s+FP=5%:\s*([\d.]+)%\s+FP=10%:\s*([\d.]+)%", s)
+        if mfp:
+            bot.log(
+                f"📈 *최종 탐지율* — FP=1%: *{mfp.group(1)}%*  ·  "
+                f"FP=5%: {mfp.group(2)}%  ·  FP=10%: {mfp.group(3)}%",
+                "피처개선"
+            )
+            return
+
+        # 최종 [FP≈N%] 평균 (참고)
+        mfpavg = re.search(r"\[FP≈(\d+)%\]\s*평균 탐지율\s*([\d.]+)%", s)
+        if mfpavg:
+            bot.log(f"  · FP≈{mfpavg.group(1)}% 평균 탐지율 {mfpavg.group(2)}%", "피처개선")
+            return
+
+        # 배포 임계값
+        mth = re.search(r"threshold \(FP=1% 기준\):\s*([\d.]+)", s)
+        if mth:
+            bot.log(f"🎯 배포 임계값(FP=1% 정상 99퍼센타일): `{mth.group(1)}`", "피처개선")
             return
 
         # 채택 확정 follow-up: "전체평균 X% → Y%  |  목적점수 +g"
@@ -862,8 +908,8 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
             fe_pending_adoption.append((feat_name, feat_desc))
             return
 
-        # 베이스라인 학습 중 epoch 진행 (후보 스캔 시작 전까지만 — 스팸 방지)
-        if not fe_baseline_done[0]:
+        # epoch 진행 — 베이스라인 또는 최종 재학습 단계만 (후보 스캔 중엔 스팸이라 생략)
+        if not fe_baseline_done[0] or fe_final_phase[0]:
             me = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*train=", line)
             if me:
                 ep, total_ep = int(me.group(1)), int(me.group(2))
@@ -871,8 +917,11 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
                 milestone = (pct // 25) * 25
                 if milestone > 0 and ep == round(total_ep * milestone / 100):
                     elapsed_now = time.time() - t0
+                    label = "최종 모델 학습" if fe_final_phase[0] else "베이스라인 학습"
+                    mtl = re.search(r"train=([\d.]+)\s*\|?\s*val=([\d.]+)", line)
+                    loss = f"  (train={mtl.group(1)} val={mtl.group(2)})" if mtl else ""
                     bot.log(
-                        f"🧠 베이스라인 학습 {milestone}% — Epoch {ep}/{total_ep}  "
+                        f"🧠 {label} {milestone}% — Epoch {ep}/{total_ep}{loss}  "
                         f"(경과 {elapsed_now:.0f}s)",
                         "피처개선"
                     )
