@@ -1,12 +1,18 @@
 """
-AIS 파이프라인 오케스트레이터
+AIS 파이프라인 오케스트레이터 (DCdetect 피처 엔지니어링 자동화)
 
-전처리 → 학습 → 평가 → 피처개선
-각 단계마다 Claude 분석 보고서 + Slack 승인 게이트 + Google Sheets 기록
+구조: 브랜치마다 Greedy 1피처 채택 → 채택 시 그 피처셋으로 재학습/평가 →
+      배포모델 export + 플러그인 빌드 + 커밋 + 릴리즈 → fe_state 저장 →
+      새 브랜치(dcdetect_001 → 002 → ...)로 자동 체이닝, 수렴(채택 없음)하면 종료.
+  - 베이스라인 학습+평가는 FE 내부(feature_engineer.py)에서 수행 (별도 단계 없음).
+  - 전처리는 --skip_preprocess 가 아니면 첫 브랜치에서 1회만.
+  - 각 단계: 실행 → Claude 분석 → Slack 보고/승인(또는 --auto_approve) → Sheets 기록.
+  - 모델 브랜치/커밋은 project(upstream) 저장소로 push.
 
 사용법:
-    python ml/orchestrator.py --model dcdetect --epochs 5 --max_mmsi 500
-    python ml/orchestrator.py --model dcdetect --skip_preprocess
+    python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
+        --data_file D:/ais_data/preprocessed/ais_preprocessed_3yr.csv \
+        --skip_preprocess --auto_approve
 """
 import argparse
 import json
@@ -114,73 +120,6 @@ def _extract_lines(out: str, keywords: list[str], max_lines: int = 8) -> list[st
 
 def _parse_preprocess(out: str) -> list[str]:
     return _extract_lines(out, ["MMSI", "행", "총", "입력", "출력", "완료", "처리"], max_lines=6)
-
-
-def _parse_train(out: str) -> list[str]:
-    details = []
-    for line in out.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        # 데이터 통계
-        if any(k in s for k in ["고유 MMSI", "총 시퀀스", "시퀀스:", "학습:", "검증:"]):
-            # tqdm 진행줄 제외 (Epoch N/M: 로 시작하는 줄)
-            if re.match(r"Epoch\s+\d+/\d+:", s):
-                continue
-            details.append(s)
-        # epoch 완료 요약줄: "Epoch N/M | train=X val=Y"
-        elif re.search(r"Epoch\s+\d+/\d+\s*\|", s) and "train=" in s:
-            details.append(s)
-        # 최종 완료/실패 줄
-        elif any(k in s for k in ["학습 완료", "✓", "✗ dcdetect", "전체 소요", "임계값:", "ONNX 저장"]):
-            if "it/s" not in s:   # tqdm 줄 제외
-                details.append(s)
-    return details[-10:]
-
-
-def _parse_eval(out: str) -> list[str]:
-    details = []
-    for line in out.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if "%" in s and any(k in s for k in ["탐지", "overall", "FP", "holdout", "train"]):
-            details.append(s)
-        elif "|" in s and "%" in s:
-            details.append(s)
-        elif any(k in s for k in ["FP≈", "FP =", "탐지율"]):
-            details.append(s)
-    return details[-12:]
-
-
-def _parse_eval_full(out: str) -> dict:
-    """평가 출력 전체 파싱 → {saved/fp1/fp5/fp10: {scenarios, avg}}"""
-    sections: dict = {}
-    current = None
-    for line in out.splitlines():
-        s = line.strip()
-        if "저장 임계값 기준" in s:
-            current = "saved"; sections[current] = {"scenarios": {}, "avg": None}
-        elif re.search(r"FP\s*[≈=]\s*1%", s):
-            current = "fp1";  sections[current] = {"scenarios": {}, "avg": None}
-        elif re.search(r"FP\s*[≈=]\s*5%", s):
-            current = "fp5";  sections[current] = {"scenarios": {}, "avg": None}
-        elif re.search(r"FP\s*[≈=]\s*10%", s):
-            current = "fp10"; sections[current] = {"scenarios": {}, "avg": None}
-        if not current:
-            continue
-        m = re.match(r"(.+?)\s{2,}(\d+\.?\d*)%\s*$", s)
-        if m:
-            name = m.group(1).strip()
-            if name and not re.match(r"[─═▶dcdetect]", name) and \
-               "오탐율" not in name and "탐지율" not in name and \
-               "평균" not in name and len(name) > 1:
-                sections[current]["scenarios"][name] = float(m.group(2))
-        if "전체 평균" in s or "학습 평균" in s:
-            m2 = re.search(r"(\d+\.?\d*)%", s)
-            if m2: sections[current]["avg"] = float(m2.group(1))
-    return sections
-
 
 def _parse_permutation_importance(out: str) -> list[tuple[str, float]]:
     """순열 중요도 파싱 → [(feat, pp), ...] 절댓값 내림차순 (더 음수 = 더 중요)"""
@@ -367,188 +306,6 @@ def stage_preprocess(bot, sheet, branch, args, step_info: tuple):
             return True
         if decision == "stop":
             return False
-
-
-def stage_train(bot, sheet, branch, args, step_info: tuple):
-    cur, total, next_name = step_info
-    current_extra = _load_fe_initial_extra()
-    all_feats = BASE_FEATURES + current_extra
-    while True:
-        feat_lines = "\n".join(
-            f"  • `{f}` — {FEATURE_DESCRIPTIONS.get(f, '')}" for f in all_feats
-        )
-        bot.log_stage_start(
-            "학습",
-            f"{_step_header(cur, total, '베이스학습', next_name)}\n"
-            f"【베이스 학습】 {args.model} / epochs={args.epochs} / max_mmsi={args.max_mmsi}\n"
-            f"사용 피처: {len(all_feats)}개 (베이스 {len(BASE_FEATURES)} + 기채택 {len(current_extra)})\n"
-            f"{feat_lines}\n"
-            f"목적: 기준 성능(baseline) 측정 — 이 모델은 배포용이 아님\n"
-            f"배포용 모델은 피처 엔지니어링 학습 단계에서 생성됨"
-        )
-        t0 = time.time()
-        # 에폭 진행 → Slack 알림
-        last_epoch_reported = [0]
-        def train_progress(line, proc=None):
-            m = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*train=", line)
-            if m:
-                cur, total = int(m.group(1)), int(m.group(2))
-                pct = int(cur / total * 100)
-                milestone = (pct // 10) * 10
-                if milestone > last_epoch_reported[0]:
-                    last_epoch_reported[0] = milestone
-                    elapsed_now = time.time() - t0
-                    bot.log(
-                        f"🧠 학습 진행 {milestone}% — Epoch {cur}/{total}  "
-                        f"(경과 {elapsed_now:.0f}s)",
-                        "학습"
-                    )
-
-        train_cmd = [
-            "python", "ml/core/pipeline.py", "--train",
-            "--models", args.model,
-            "--epochs", str(args.epochs),
-            "--max_mmsi", str(args.max_mmsi),
-            "--data_file", args.data_file,
-            "--base_dir", args.base_dir,
-        ]
-        if current_extra:
-            train_cmd += ["--extra_features"] + current_extra
-
-        ret, out = run_cmd(train_cmd, progress_cb=train_progress)
-        elapsed = time.time() - t0
-        details  = _parse_train(out)
-        analysis = claude_analyze("학습", out, ret == 0, elapsed, {
-            "model": args.model, "epochs": args.epochs, "max_mmsi": args.max_mmsi
-        })
-
-        hdr = _step_header(cur, total, "베이스학습", next_name)
-        if ret != 0:
-            summary = [hdr, "❌ 학습 실패", f"소요: {elapsed:.0f}s"] + details + ["─"] + analysis
-            bot.log_stage_result("학습", summary, success=False)
-            sheet.log_train(branch, args.model, args.epochs, args.max_mmsi,
-                            "실패", elapsed_sec=elapsed)
-        else:
-            summary = [hdr, f"모델: {args.model}", f"소요: {elapsed:.0f}s"] + details + ["─"] + analysis
-            bot.log_stage_result("학습", summary, success=True)
-            sheet.log_train(branch, args.model, args.epochs, args.max_mmsi,
-                            "완료", elapsed_sec=elapsed)
-
-        decision = _wait(bot,"학습", summary)
-        if decision == "approve":
-            return True
-        if decision == "stop":
-            return False
-
-
-def stage_eval(bot, sheet, branch, args, step_info: tuple):
-    cur, total, next_name = step_info
-    while True:
-        bot.log_stage_start("평가",
-            f"{_step_header(cur, total, '평가', next_name)}\n"
-            f"{args.model} / FP목표=1%,5%,10%")
-        t0 = time.time()
-
-        # FP 구간별 탐지율 완성 시 중간 알림
-        eval_sections_done = [0]
-        def eval_progress(line, proc=None):
-            s = line.strip()
-            if "전체 평균" in s and "%" in s:
-                eval_sections_done[0] += 1
-                m = re.search(r"(\d+\.?\d*)%", s)
-                avg = m.group(1) if m else "?"
-                fp_label = ["저장임계값", "FP≈1%", "FP≈5%", "FP≈10%"][
-                    min(eval_sections_done[0] - 1, 3)
-                ]
-                elapsed_now = time.time() - t0
-                bot.log(
-                    f"📊 평가 [{fp_label}] 전체평균 탐지율: *{avg}%*  (경과 {elapsed_now:.0f}s)",
-                    "평가"
-                )
-
-        current_extra = _load_fe_initial_extra()
-        eval_cmd = ["python", "ml/core/pipeline.py", "--eval",
-                    "--models", args.model,
-                    "--base_dir", args.base_dir,
-                    "--data_file", args.data_file]
-        if current_extra:
-            eval_cmd += ["--extra_features"] + current_extra
-        ret, out = run_cmd(eval_cmd, progress_cb=eval_progress)
-        elapsed = time.time() - t0
-        details  = _parse_eval(out)
-
-        det_rate = None
-        for line in out.splitlines():
-            if "overall" in line.lower() or "탐지율" in line.lower():
-                m = re.search(r"(\d+\.?\d*)%", line)
-                if m:
-                    det_rate = float(m.group(1))
-
-        analysis = claude_analyze("평가", out, ret == 0, elapsed, {
-            "model": args.model, "det_rate": det_rate
-        })
-
-        # 전체 파싱
-        eval_data = _parse_eval_full(out)
-
-        if ret != 0:
-            summary = ["❌ 평가 실패", f"소요: {elapsed:.0f}s"] + details + ["─"] + analysis
-            bot.log_stage_result("평가", summary, success=False)
-            sheet.log_eval(branch, args.model, "실패", elapsed_sec=elapsed)
-        else:
-            fp1  = eval_data.get("fp1", {})
-            fp5  = eval_data.get("fp5", {})
-            fp10 = eval_data.get("fp10", {})
-
-            fp1_avg  = fp1.get("avg")
-            fp5_avg  = fp5.get("avg")
-            fp10_avg = fp10.get("avg")
-
-            hdr = _step_header(cur, total, "평가", next_name)
-            summary = [
-                hdr,
-                "─── FP 기준별 탐지율 ───",
-                f"FP≈1%   {fp1_avg:.1f}%"  if fp1_avg  else "FP≈1%   -",
-                f"FP≈5%   {fp5_avg:.1f}%"  if fp5_avg  else "FP≈5%   -",
-                f"FP≈10%  {fp10_avg:.1f}%" if fp10_avg else "FP≈10%  -",
-                f"소요: {elapsed:.0f}s",
-                "─",
-            ] + analysis
-            bot.log_stage_result("평가", summary, success=True)
-
-            # ── 약세 시나리오 (FP≈1% 기준 50% 미만) ──
-            if fp1.get("scenarios"):
-                weak = {k: v for k, v in fp1["scenarios"].items() if v < 50.0}
-                ok   = {k: v for k, v in fp1["scenarios"].items() if v >= 50.0}
-                weak_rows = []
-                for name, rate in sorted(weak.items(), key=lambda x: x[1]):
-                    weak_rows.append(f"  ❌ {name:<22} {rate:>6.1f}%")
-                for name, rate in sorted(ok.items(), key=lambda x: x[1]):
-                    weak_rows.append(f"  ✅ {name:<22} {rate:>6.1f}%")
-                if weak_rows:
-                    bot.log_table("FP≈1% 전체 시나리오 탐지율", weak_rows, "📊")
-
-            # ── FP별 요약 표 ──
-            fp_rows = ["구간       전체평균"]
-            fp_rows.append("─" * 22)
-            for label, sec in [("FP≈1% ", fp1), ("FP≈5% ", fp5), ("FP≈10%", fp10)]:
-                avg = f"{sec['avg']:.1f}%" if sec.get("avg") else "  -  "
-                fp_rows.append(f"{label}    {avg:>7}")
-            bot.log_table("FP 기준별 탐지율 요약", fp_rows, "📈")
-
-            sheet.log_eval(branch, args.model, "완료",
-                           det_fp1=fp1_avg, det_fp5=fp5_avg,
-                           det_fp10=fp10_avg,
-                           elapsed_sec=elapsed)
-            if fp1.get("scenarios"):
-                sheet.log_scenarios(branch, args.model, "FP1%", fp1["scenarios"])
-
-        decision = _wait(bot,"평가", summary)
-        if decision == "approve":
-            return True
-        if decision == "stop":
-            return False
-
 
 # ─────────────────────────────────────────────
 # 플러그인 자동 빌드
@@ -1119,10 +876,6 @@ def main():
     parser.add_argument("--raw_dir",         default="D:/ais_data/raw/2025")
     parser.add_argument("--data_file",       default="D:/ais_data/preprocessed/2025/ais_preprocessed_2025.csv")
     parser.add_argument("--skip_preprocess", action="store_true")
-    parser.add_argument("--skip_train",      action="store_true",
-                        help="베이스 학습 단계 생략")
-    parser.add_argument("--skip_eval",       action="store_true",
-                        help="베이스 평가 단계 생략")
     parser.add_argument("--holdout_file",    default=None,
                         help="FP=1%% 측정용 별도 전처리 파일 (학습 데이터와 완전 분리)")
     parser.add_argument("--min_gain",        type=float, default=3.0,
@@ -1146,8 +899,10 @@ def main():
         cfg["google_sheets"]["sheet_id"]
     )
 
-    # 자던 run 구조: 브랜치마다 1피처 채택 → fe_state 갱신 → 새 브랜치(dcdetect_001→002→...)로
-    # 자동 체이닝, 수렴(채택 없음)하면 종료. Train/Eval 은 --skip_* 로 끄면 FE만 (자던 run 동일).
+    # FE-only 체이닝: 브랜치마다 Greedy 1피처 채택 → fe_state 갱신 → 새 브랜치
+    #   (dcdetect_001→002→...) → 수렴(채택 없음)하면 종료.
+    #   베이스라인 학습+평가는 FE 내부에서 수행. 전처리는 첫 브랜치에서만(--skip_preprocess 아니면).
+    first_iter = True
     while True:
         run_num = git.get_next_run_num(args.model)
         branch  = git.create_branch(args.model, run_num)
@@ -1164,11 +919,8 @@ def main():
             "출발 피처": f"{len(_load_fe_initial_extra())}개 (기채택)",
         })
 
-        stages = []
-        if not args.skip_preprocess: stages.append("전처리")
-        if not args.skip_train:      stages.append("베이스학습")
-        if not args.skip_eval:       stages.append("평가")
-        stages.append("피처 엔지니어링 학습")
+        run_preprocess = first_iter and not args.skip_preprocess
+        stages = (["전처리"] if run_preprocess else []) + ["피처 엔지니어링 학습"]
         total_steps = len(stages)
 
         def make_step_info(name: str) -> tuple:
@@ -1176,23 +928,12 @@ def main():
             nxt = stages[idx + 1] if idx + 1 < total_steps else "파이프라인 종료"
             return (idx + 1, total_steps, nxt)
 
-        if not args.skip_preprocess:
+        if run_preprocess:
             if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
                 bot.log("파이프라인 중단", "warning")
                 git.checkout("develop")
                 return
-
-        if not args.skip_train:
-            if not stage_train(bot, sheet, branch, args, make_step_info("베이스학습")):
-                bot.log("파이프라인 중단", "warning")
-                git.checkout("develop")
-                return
-
-        if not args.skip_eval:
-            if not stage_eval(bot, sheet, branch, args, make_step_info("평가")):
-                bot.log("파이프라인 중단", "warning")
-                git.checkout("develop")
-                return
+        first_iter = False
 
         fe_result = stage_fe(bot, sheet, branch, args, run_num,
                              make_step_info("피처 엔지니어링 학습"))
