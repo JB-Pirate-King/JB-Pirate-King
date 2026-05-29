@@ -736,32 +736,24 @@ def _load_fe_initial_extra() -> list[str]:
         return FE_INITIAL_EXTRA
 
 
-def _save_fe_initial_extra(adopted: list[str]):
-    """이번 run 채택 피처를 다음 run을 위해 저장."""
-    with open(FE_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"initial_extra": adopted}, f, ensure_ascii=False, indent=2)
-
-
-def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
-                 current_initial_extra, fe_dir, step_info):
-    """Greedy 스텝 1회 실행 + Slack 보고 + 승인 대기.
-    반환: ('approve' | 'retry' | 'stop', newly_adopted_full_extra | None)
+def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, step_info):
+    """Greedy FE 수렴까지 전체 실행 + Slack 보고.
+    반환: ('approve' | 'retry' | 'stop', full_extra | None, fe_stats)
     """
     cur, total, next_name = step_info
     fe_start_total = len(BASE_FEATURES) + len(current_initial_extra)
     init_feat_lines = "\n".join(
         f"  • `{f}` — {FEATURE_DESCRIPTIONS.get(f, '')}" for f in current_initial_extra
-    )
+    ) or "  (없음 — 베이스 12개만)"
     bot.log_stage_start(
         "피처개선",
         f"{_step_header(cur, total, '피처 엔지니어링 학습', next_name)}\n"
-        f"【Greedy Step {fe_step}】 iter {run_num:03d} / epochs={args.epochs} / max_mmsi={args.max_mmsi}\n"
+        f"iter {run_num:03d} / epochs={args.epochs} / max_mmsi={args.max_mmsi}\n"
         f"베이스 {len(BASE_FEATURES)}개 + 기채택 {len(current_initial_extra)}개 = 출발점 {fe_start_total}개\n"
         f"기채택 피처:\n{init_feat_lines}\n"
         f"─\n"
-        f"📐 목적함수 (실제신호 FP=1% 기준): `전체평균 + 1.0 × 약세평균`\n"
-        f"  약세 = 베이스라인 탐지율 < 50% 시나리오\n"
-        f"  채택 조건: 목적점수 +3.0 이상 향상 시 해당 피처 채택"
+        f"📐 목적함수 (FP=1% 기준): `전체평균 + 1.0 × 약세평균`\n"
+        f"  채택 조건: 목적점수 +{args.min_gain} 이상  |  수렴 시 자동 종료"
     )
     t0 = time.time()
 
@@ -772,12 +764,10 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
     fe_pending_adoption: list = []
     def fe_progress(line, proc=None):
         s = line.strip()
-        # 베이스라인 탐지율 캡처
         if "전체 평균 탐지율" in s and "목적점수" in s:
             m = re.search(r"탐지율\s+([\d.]+)%", s)
             if m:
                 fe_baseline_det[0] = float(m.group(1))
-        # 채택 완료 메시지 (목적점수 결과 라인 바로 뒤)
         if fe_pending_adoption and "전체평균" in s and "→" in s:
             feat_name, feat_desc = fe_pending_adoption.pop()
             m = re.search(r"([\d.]+)%\s*→\s*([\d.]+)%.*목적점수\s*([+-][\d.]+)", s)
@@ -791,19 +781,17 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
             else:
                 bot.log(f"✅ 채택! `{feat_name}` — {feat_desc}  {s}", "피처개선")
             return
-        # 에폭 진행 알림 (10% 단위)
         me = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*train=", line)
         if me:
             ep, total_ep = int(me.group(1)), int(me.group(2))
             pct = int(ep / total_ep * 100)
-            milestone = (pct // 25) * 25  # FE는 25% 단위 (후보 많아서)
+            milestone = (pct // 25) * 25
             if milestone > 0 and ep == round(total_ep * milestone / 100):
                 elapsed_now = time.time() - t0
                 bot.log(
                     f"🧠 FE 학습 {milestone}% — Epoch {ep}/{total_ep}  (경과 {elapsed_now:.0f}s)",
                     "피처개선"
                 )
-        # 학습 시작 알림
         if s.startswith("+ ") and "학습 중" in s:
             fe_candidate_count[0] += 1
             elapsed_now = time.time() - t0
@@ -811,11 +799,10 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
             feat_name = m.group(1) if m else "?"
             feat_desc = FEATURE_DESCRIPTIONS.get(feat_name, "")
             bot.log(
-                f"🔬 Step {fe_step} — 후보 #{fe_candidate_count[0]} 학습 중: "
+                f"🔬 후보 #{fe_candidate_count[0]} 학습 중: "
                 f"`{feat_name}` ({feat_desc})  (경과 {elapsed_now:.0f}s)",
                 "피처개선"
             )
-        # 채택 완료 마커
         elif "✓ 채택" in s:
             m = re.search(r"✓ 채택: \[?(\w+)\]?", s)
             feat_name = m.group(1) if m else "?"
@@ -829,7 +816,6 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
          "--epochs", str(args.epochs),
          "--max_mmsi", str(args.max_mmsi),
          "--out_json", out_json,
-         "--max_steps", "1",
          "--initial_extra"] + current_initial_extra + [
          "--export_dir", str(Path(args.base_dir) / "ais_models" / args.model),
          "--min_gain", str(args.min_gain)]
@@ -845,7 +831,7 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
                    + fe_details + ["─"] + analysis)
         bot.log_stage_result("피처개선", summary, success=False)
         sheet.log_fe(branch, run_num, "실패", elapsed_sec=elapsed)
-        decision = _wait(bot,f"피처개선 Step {fe_step} 실패", summary)
+        decision = _wait(bot, "피처 엔지니어링 실패", summary)
         return decision, None, {}
 
     # 결과 파싱
@@ -856,7 +842,6 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
         det_rate       = result.get("best_det")
         n_feat         = len(result.get("best_extra", [])) + len(BASE_FEATURES)
         threshold      = result.get("threshold")
-        # best_extra = INITIAL_EXTRA + 신채택. current_initial_extra와 합쳐 누락 방지.
         _best = result.get("best_extra", [])
         full_extra = list(dict.fromkeys(current_initial_extra + _best))
         baseline_det   = result.get("baseline_det")
@@ -870,8 +855,8 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
         if m:
             weak_names = [s.strip() for s in m.group(1).split(",")]
 
-    analysis       = claude_analyze("피처개선", out, True, elapsed, {
-        "step": fe_step, "newly_adopted": newly_adopted,
+    analysis       = claude_analyze("피처개선", out, bool(newly_adopted), elapsed, {
+        "newly_adopted": newly_adopted,
         "det_rate": det_rate, "baseline_det": baseline_det, "n_feat": n_feat
     })
     adopted_detail = fe_adopted_analysis(out, newly_adopted, det_rate, baseline_det, weak_names)
@@ -879,14 +864,12 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
     importance     = _parse_permutation_importance(out)
 
     gain_pp = (det_rate - baseline_det) if (det_rate and baseline_det) else 0.0
-    if newly_adopted:
-        step_title = f"Step {fe_step} ✅ 채택: {', '.join(newly_adopted)}"
-    else:
-        step_title = f"Step {fe_step} — 수렴 (신규 채택 없음)"
+    result_title = (f"✅ 채택 {len(newly_adopted)}개: {', '.join(newly_adopted)}"
+                    if newly_adopted else "수렴 — 신규 채택 없음")
 
     summary = (
         [
-            step_title,
+            result_title,
             f"FP=1% 탐지율: {baseline_det:.1f}% → {det_rate:.1f}%  ({gain_pp:+.1f}pp)" if det_rate else "탐지율: -",
             f"총 피처 수: {n_feat}개  |  소요: {elapsed:.0f}s",
             "─",
@@ -897,15 +880,11 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
     )
     bot.log_stage_result("피처개선", summary, success=True)
 
-    # ── 후보 결과 표 ──
     if candidates:
         baseline_info = ""
         if baseline_det is not None and baseline_score is not None:
-            baseline_info = f"베이스라인: FP=1% 탐지율 {baseline_det:.1f}%  목적점수 {baseline_score:.1f}  → 채택기준 +3.0"
-        elif baseline_det is not None:
-            baseline_info = f"베이스라인: FP=1% 탐지율 {baseline_det:.1f}%  → 채택기준 목적점수 +3.0"
-        cand_rows = [baseline_info] if baseline_info else []
-        cand_rows += ["─" * 70,
+            baseline_info = f"베이스라인: FP=1% 탐지율 {baseline_det:.1f}%  목적점수 {baseline_score:.1f}  → 채택기준 +{args.min_gain}"
+        cand_rows = ([baseline_info] if baseline_info else []) + ["─" * 70,
                       f"{'피처':<22} {'탐지율gain(FP1%)':>16}  {'목적점수':>8}  {'목적gain':>8}  설명",
                       "─" * 70]
         for feat, desc, det_gain, obj_score, obj_gain in candidates:
@@ -914,18 +893,10 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
             cand_rows.append(
                 f"{mark}{feat:<20} {det_gain:>+8.1f}pp  {obj_score:>8.1f}  {arrow}{obj_gain:>+6.1f}  {desc[:18]}"
             )
-        cand_rows.append("─" * 70)
-        best = candidates[0]
-        cand_rows.append(
-            f"최고: {best[0]}  목적gain {best[4]:+.1f}"
-            f"  → {'✅ 채택' if best[0] in newly_adopted else '기준 미달 (<3.0)'}"
-        )
-        bot.log_table(f"Step {fe_step} Greedy 후보 평가 결과", cand_rows, "🔬")
+        bot.log_table("Greedy 후보 평가 결과", cand_rows, "🔬")
 
-    # ── 피처 중요도 표 ──
     if importance:
-        imp_rows = [f"{'피처':<22} {'중요도':>10}"]
-        imp_rows.append("─" * 38)
+        imp_rows = [f"{'피처':<22} {'중요도':>10}", "─" * 38]
         for feat, pp in importance:
             bar = "★" * min(int(abs(pp) / 5) + 1, 5)
             desc = FEATURE_DESCRIPTIONS.get(feat, "")
@@ -935,20 +906,20 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
         bot.log_table("피처 중요도 (순열 기반)", imp_rows, "🔑")
 
     sheet.log_fe(branch, run_num, "완료",
-                 model=args.model, fe_step=fe_step,
+                 model=args.model, fe_step=len(newly_adopted),
                  baseline_det=baseline_det, best_det=det_rate,
                  n_features=n_feat, adopted=newly_adopted,
                  all_features=full_extra,
                  threshold=threshold, elapsed_sec=elapsed)
     if importance:
-        sheet.log_importance(branch, fe_step, importance, FEATURE_DESCRIPTIONS)
+        sheet.log_importance(branch, 1, importance, FEATURE_DESCRIPTIONS)
 
-    # 채택 있으면 플러그인 빌드 + 커밋
+    fe_stats = {"baseline_det": baseline_det, "det_rate": det_rate, "threshold": threshold}
+
     if newly_adopted:
         det_str  = f"{det_rate:.1f}" if det_rate else "?"
         n_feat_s = str(n_feat) if n_feat else "?"
 
-        # FE 결과 JSON + D:\ 모델 파일
         commit_files = []
         if Path(out_json).exists():
             commit_files.append(out_json)
@@ -960,7 +931,6 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
             if p.exists():
                 commit_files.append(str(p))
 
-        # 플러그인 빌드: C++ 패치 + 모델 복사 + WSL cmake
         scaler_path  = str(model_dir / f"scaler_{args.model}.json")
         plugin_files = stage_build_plugin(bot, args, scaler_path)
         commit_files += plugin_files
@@ -968,34 +938,23 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
         if commit_files:
             git.commit_results(
                 commit_files,
-                f"feat(fe): {args.model} iter{run_num:03d} step{fe_step:02d} "
-                f"det={det_str}% feat={n_feat_s}",
+                f"feat(fe): {args.model} iter{run_num:03d} "
+                f"det={det_str}% feat={n_feat_s} ({len(newly_adopted)}개 채택)",
                 branch=branch
             )
 
         stage_release(bot, args, branch, run_num, full_extra, det_rate)
-
-    fe_stats = {"baseline_det": baseline_det, "det_rate": det_rate, "threshold": threshold}
-
-    if newly_adopted:
-        # 채택 발생 → 자동으로 다음 스텝 진행 (승인 불필요)
-        bot.log(
-            f"🔁 Step {fe_step} 채택 완료 → 다음 스텝 자동 시작\n"
-            f"  현재 피처: {full_extra}",
-            "피처개선"
-        )
         return "approve", full_extra, fe_stats
     else:
-        # 수렴 → 사용자 최종 확인
-        decision = _wait(bot,f"피처개선 Step {fe_step} — 수렴 완료 → 파이프라인 종료?", summary)
+        decision = _wait(bot, "피처 엔지니어링 — 수렴 완료 → 파이프라인 종료?", summary)
         return decision, None, fe_stats
 
 
 def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
-    """FE 1스텝 실행.
+    """FE 수렴까지 전체 실행.
     반환값:
-      list  — 채택된 전체 extra 피처 목록 (새 브랜치로 재시작 필요)
-      []    — 수렴 (신규 채택 없음, 완전 종료)
+      list  — 채택된 전체 extra 피처 목록
+      []    — 수렴 (신규 채택 없음)
       None  — 사용자 중단
     """
     current_initial_extra = _load_fe_initial_extra()
@@ -1003,8 +962,8 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
     fe_dir.mkdir(parents=True, exist_ok=True)
 
     while True:  # retry 전용 루프
-        decision, new_extra, fe_stats = _fe_run_step(
-            bot, sheet, branch, args, run_num, fe_step=1,
+        decision, new_extra, fe_stats = _fe_run(
+            bot, sheet, branch, args, run_num,
             current_initial_extra=current_initial_extra,
             fe_dir=fe_dir, step_info=step_info
         )
@@ -1014,26 +973,17 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
         if decision == "retry":
             continue
 
-        # approve
-        if new_extra is not None:
-            sheet.update_run_summary(
-                fe_steps=1,
-                fe_baseline=fe_stats.get("baseline_det"),
-                fe_det=fe_stats.get("det_rate"),
-                fe_n_feat=len(BASE_FEATURES) + len(new_extra),
-                adopted=new_extra,
-                threshold=fe_stats.get("threshold")
-            )
-            return new_extra  # 채택된 전체 extra 피처 목록
-        else:
-            sheet.update_run_summary(
-                fe_steps=0,
-                fe_baseline=fe_stats.get("baseline_det"),
-                fe_det=fe_stats.get("det_rate"),
-                adopted=current_initial_extra,
-                notes="수렴 완료"
-            )
-            return []  # 수렴
+        n_adopted = len(new_extra) - len(current_initial_extra) if new_extra else 0
+        sheet.update_run_summary(
+            fe_steps=n_adopted,
+            fe_baseline=fe_stats.get("baseline_det"),
+            fe_det=fe_stats.get("det_rate"),
+            fe_n_feat=len(BASE_FEATURES) + len(new_extra) if new_extra else None,
+            adopted=new_extra or current_initial_extra,
+            threshold=fe_stats.get("threshold"),
+            notes="완료" if new_extra else "수렴 완료"
+        )
+        return new_extra if new_extra is not None else []
 
 
 # ─────────────────────────────────────────────
@@ -1072,67 +1022,59 @@ def main():
         cfg["google_sheets"]["sheet_id"]
     )
 
-    while True:
-        run_num = git.get_next_run_num(args.model)
-        branch  = git.create_branch(args.model, run_num)
+    run_num = git.get_next_run_num(args.model)
+    branch  = git.create_branch(args.model, run_num)
 
-        sheet.log_run_start(branch, args.model, args.epochs, args.max_mmsi,
-                            data_file=args.data_file)
-        bot.log_run_start(branch, {
-            "모델": args.model,
-            "epochs": args.epochs,
-            "max_mmsi": args.max_mmsi,
-            "데이터": args.data_file,
-            "base_dir": args.base_dir,
-            "베이스 피처": f"{len(BASE_FEATURES)}개",
-        })
+    sheet.log_run_start(branch, args.model, args.epochs, args.max_mmsi,
+                        data_file=args.data_file)
+    bot.log_run_start(branch, {
+        "모델": args.model,
+        "epochs": args.epochs,
+        "max_mmsi": args.max_mmsi,
+        "데이터": args.data_file,
+        "base_dir": args.base_dir,
+        "베이스 피처": f"{len(BASE_FEATURES)}개",
+        "출발 피처": f"{len(_load_fe_initial_extra())}개 (기채택)",
+    })
 
-        # 단계 목록 — Stage Train/Eval 제거 (FE 스캔이 베이스라인 학습+평가 포함)
-        stages = []
-        if not args.skip_preprocess: stages.append("전처리")
-        stages.append("피처 엔지니어링 학습")
-        total_steps = len(stages)
+    stages = []
+    if not args.skip_preprocess: stages.append("전처리")
+    stages.append("피처 엔지니어링 학습")
+    total_steps = len(stages)
 
-        def make_step_info(name: str) -> tuple:
-            idx = stages.index(name)
-            nxt = stages[idx + 1] if idx + 1 < total_steps else "파이프라인 종료"
-            return (idx + 1, total_steps, nxt)
+    def make_step_info(name: str) -> tuple:
+        idx = stages.index(name)
+        nxt = stages[idx + 1] if idx + 1 < total_steps else "파이프라인 종료"
+        return (idx + 1, total_steps, nxt)
 
-        if not args.skip_preprocess:
-            if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
-                bot.log("파이프라인 중단", "warning")
-                git.checkout("develop")
-                return
-
-        fe_result = stage_fe(bot, sheet, branch, args, run_num,
-                             make_step_info("피처 엔지니어링 학습"))
-
-        sheet.log_run_done(branch, args.model, success=(fe_result is not None))
-
-        if fe_result is None:
-            # 사용자 중단
+    if not args.skip_preprocess:
+        if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
             bot.log("파이프라인 중단", "warning")
             git.checkout("develop")
             return
-        elif fe_result:
-            # 채택 발생 → 저장 후 새 브랜치로 재시작
-            _save_fe_initial_extra(fe_result)
-            next_run = git.get_next_run_num(args.model)
-            bot.log(
-                f"🔁 채택 완료 ({', '.join(fe_result)}) → {args.model}_{next_run:03d} 브랜치로 재시작",
-                "피처개선"
-            )
-            git.checkout("develop")
-            continue
-        else:
-            # 수렴 완료 — 더 이상 채택 없음
-            bot.log_stage_result(
-                "파이프라인 완료 — 수렴",
-                [f"브랜치: {branch}", "수렴 완료 — 더 이상 채택 피처 없음"],
-                success=True
-            )
-            git.checkout("develop")
-            return
+
+    fe_result = stage_fe(bot, sheet, branch, args, run_num,
+                         make_step_info("피처 엔지니어링 학습"))
+
+    sheet.log_run_done(branch, args.model, success=(fe_result is not None))
+
+    if fe_result is None:
+        bot.log("파이프라인 중단", "warning")
+    elif fe_result:
+        bot.log_stage_result(
+            "파이프라인 완료",
+            [f"브랜치: {branch}",
+             f"채택 피처 {len(fe_result)}개: {', '.join(fe_result)}"],
+            success=True
+        )
+    else:
+        bot.log_stage_result(
+            "파이프라인 완료 — 수렴",
+            [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
+            success=True
+        )
+
+    git.checkout("develop")
 
 
 if __name__ == "__main__":
