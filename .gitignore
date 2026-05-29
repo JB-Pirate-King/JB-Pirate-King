@@ -29,6 +29,19 @@ ml/**/*.pdf
 
 aivdm_gen/*.csv
 
+# ── automation/ ─────────────────────────────────────────────────────────────
+# 실제 환경변수 (절대 커밋 금지)
+automation/.env
+
+# Google Sheets 서비스 계정 JSON 키
+automation/credentials.json
+
+# MLflow 로컬 DB / 실험 디렉토리
+mlflow.db
+mlruns/
+_test_mlruns/
+_test_output/
+
 # 시크릿 / 설정
 ml/notify_config.json
 

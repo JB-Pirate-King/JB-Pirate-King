@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── MLflow ───────────────────────────────────────────────────────────────────
-MLFLOW_TRACKING_URI   = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+MLFLOW_TRACKING_URI   = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 MLFLOW_EXPERIMENT     = os.getenv("MLFLOW_EXPERIMENT", "ais-anomaly-detection")
 
 # ─── Slack ────────────────────────────────────────────────────────────────────
