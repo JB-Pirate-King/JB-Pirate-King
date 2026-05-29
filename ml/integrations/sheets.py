@@ -26,14 +26,11 @@ SCOPES = [
 
 MODEL_HEADERS = [
     "branch", "timestamp", "stage", "status",
-    "metric_1", "metric_2", "metric_3", "metric_4", "notes"
+    "det_change", "n_features", "adopted", "threshold", "elapsed_s"
 ]
 
 SUMMARY_HEADERS = [
     "timestamp", "branch", "model", "epochs", "max_mmsi", "data_file",
-    "train_status",
-    "fp1_train", "fp1_holdout",
-    "fp5_train", "fp10_train", "fp10_holdout",
     "fe_steps", "fe_baseline", "fe_det", "fe_gain_pp",
     "fe_n_feat", "fe_features", "fe_threshold",
     "notes"
@@ -46,7 +43,7 @@ DETAIL_HEADERS = [
 
 SCENARIO_HEADERS = [
     "timestamp", "branch", "model", "fp_target",
-    "scenario", "det_rate", "is_holdout"
+    "scenario", "det_rate"
 ]
 
 IMPORTANCE_HEADERS = [
@@ -60,9 +57,6 @@ FIXED_TABS = {
     "시나리오결과": SCENARIO_HEADERS,
     "피처중요도":  IMPORTANCE_HEADERS,
 }
-
-# F/G 그룹은 홀드아웃
-HOLDOUT_PREFIXES = ("F", "G", "holdout", "Holdout")
 
 
 class PipelineSheets:
@@ -131,7 +125,6 @@ class PipelineSheets:
         ws_s = self._ws("실행요약")
         self._summary_row = self._append_and_track(ws_s, [
             ts, branch, model, epochs, max_mmsi, data_file,
-            "-", "-", "-", "-", "-", "-",
             "-", "-", "-", "-", "-", "-", "-",
             "진행 중"
         ])
@@ -204,9 +197,8 @@ class PipelineSheets:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ws = self._ws("시나리오결과")
         for name, rate in sorted(scenarios.items()):
-            is_holdout = any(name.startswith(p) for p in HOLDOUT_PREFIXES)
             self._append_and_track(ws, [
-                ts, branch, model, fp_target, name, f"{rate:.1f}", "Y" if is_holdout else "N"
+                ts, branch, model, fp_target, name, f"{rate:.1f}"
             ])
 
     # ── 피처 엔지니어링 ──────────────────────────────────────────────

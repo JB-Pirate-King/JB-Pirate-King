@@ -50,10 +50,19 @@ FEATURE_DESCRIPTIONS = {
     "lat_speed":         "위도속도 — Δlat/dt (°/s)",
     "lon_speed":         "경도속도 — Δlon/dt (°/s)",
     # FE 추가 피처
-    "accel":             "가속도 — Δsog/dt (knots/s)",
-    "heading_rate":      "선수변화율 — Δheading/dt (°/s)",
-    "vec_sog_diff":      "벡터SOG차이 — 벡터분해 후 크기 차이",
-    "heading_change":    "선수각변화 — |heading(t) - heading(t-1)|",
+    "accel":                 "가속도 — Δsog/dt (knots/s)",
+    "heading_rate":          "선수변화율 — Δheading/dt (°/s)",
+    "vec_sog_diff":          "벡터SOG차이 — 벡터분해 후 크기 차이",
+    "heading_change":        "선수각변화 — |heading(t) - heading(t-1)|",
+    "sog_vec_kn":            "GPS유도 속력 (노트) — lat/lon_speed로 계산한 실제 이동속력",
+    "lowspeed_crab":         "저속 crab각 — cog_hdg_diff × max(0, 1-sog/3kn)",
+    "cog_change":            "COG 변화량 — |COG(t) - COG(t-1)| (도)",
+    "cog_move_diff":         "COG vs 실이동방향 차이 — AIS COG와 lat/lon 기반 실이동각 오차 (도)",
+    "dist_speed_err":        "거리/속도 불일치 — |dist_km/dt×3600 - sog×1.852| (km/h)",
+    "dist_speed_ratio":      "거리/속도 비율 — dist_km / max(sog×1.852×dt/3600, 1e-6)",
+    "anchor_suspicion":      "정박의심 — 저속+Heading변화 복합 지표",
+    "speed_ratio":           "상대 속도 변화율 — |sog_change| / max(sog, 0.5)",
+    "anchored_excess_speed": "정박 중 초과속력 — status∈{1,5,6} × max(0, sog-1.5kn)",
 }
 
 
@@ -837,7 +846,7 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
         bot.log_stage_result("피처개선", summary, success=False)
         sheet.log_fe(branch, run_num, "실패", elapsed_sec=elapsed)
         decision = _wait(bot,f"피처개선 Step {fe_step} 실패", summary)
-        return decision, None
+        return decision, None, {}
 
     # 결과 파싱
     det_rate, n_feat, threshold, full_extra, baseline_det, baseline_score = None, None, None, [], None, None
@@ -966,6 +975,8 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
 
         stage_release(bot, args, branch, run_num, full_extra, det_rate)
 
+    fe_stats = {"baseline_det": baseline_det, "det_rate": det_rate, "threshold": threshold}
+
     if newly_adopted:
         # 채택 발생 → 자동으로 다음 스텝 진행 (승인 불필요)
         bot.log(
@@ -973,11 +984,11 @@ def _fe_run_step(bot, sheet, branch, args, run_num, fe_step,
             f"  현재 피처: {full_extra}",
             "피처개선"
         )
-        return "approve", full_extra
+        return "approve", full_extra, fe_stats
     else:
         # 수렴 → 사용자 최종 확인
         decision = _wait(bot,f"피처개선 Step {fe_step} — 수렴 완료 → 파이프라인 종료?", summary)
-        return decision, None
+        return decision, None, fe_stats
 
 
 def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
@@ -992,7 +1003,7 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
     fe_dir.mkdir(parents=True, exist_ok=True)
 
     while True:  # retry 전용 루프
-        decision, new_extra = _fe_run_step(
+        decision, new_extra, fe_stats = _fe_run_step(
             bot, sheet, branch, args, run_num, fe_step=1,
             current_initial_extra=current_initial_extra,
             fe_dir=fe_dir, step_info=step_info
@@ -1007,13 +1018,18 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
         if new_extra is not None:
             sheet.update_run_summary(
                 fe_steps=1,
+                fe_baseline=fe_stats.get("baseline_det"),
+                fe_det=fe_stats.get("det_rate"),
                 fe_n_feat=len(BASE_FEATURES) + len(new_extra),
-                adopted=new_extra
+                adopted=new_extra,
+                threshold=fe_stats.get("threshold")
             )
             return new_extra  # 채택된 전체 extra 피처 목록
         else:
             sheet.update_run_summary(
                 fe_steps=0,
+                fe_baseline=fe_stats.get("baseline_det"),
+                fe_det=fe_stats.get("det_rate"),
                 adopted=current_initial_extra,
                 notes="수렴 완료"
             )
