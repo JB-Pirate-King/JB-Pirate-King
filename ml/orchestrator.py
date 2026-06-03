@@ -724,6 +724,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
 
     ret, out = run_cmd(
         [sys.executable, "ml/core/feature_engineer.py",
+         "--model", args.model,
          "--input", args.data_file,
          "--base_dir", args.base_dir,
          "--epochs", str(args.epochs),

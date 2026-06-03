@@ -1,47 +1,56 @@
-# JB-Pirate-King — AIS 이상 탐지 시스템
+# JB-Pirate-King — AIS Anomaly Detection System
 
-선박 AIS 신호에서 이상 행동을 탐지하는 시스템. OpenCPN 플러그인, 로컬 서버, ML 파이프라인으로 구성된다.
+A system that detects anomalous behavior in ship AIS signals. It consists of an OpenCPN plugin, a local server, and an ML pipeline.
 
 ---
 
-## 구성 요소
+## Components
 
-| 디렉토리 | 설명 |
+| Directory | Description |
 |---|---|
-| `ml/` | AIS 이상 탐지 ML 파이프라인 (학습 · 평가) |
-| `ais_ids_pi/` | OpenCPN 플러그인 (C++, ONNX 추론) |
-| `s-c/` | 로컬 서버 + GUI (Python, Docker) |
-| `aivdm_gen/` | AIVDM 공격 시나리오 시뮬레이터 (15개 시나리오, GUI) |
+| `ml/` | AIS anomaly-detection ML pipeline (training · evaluation) |
+| `ais_ids_pi/` | OpenCPN plugin (C++, ONNX inference) |
+| `s-c/` | Local server + GUI (Python, Docker) |
+| `aivdm_gen/` | AIVDM attack-scenario simulator (GUI) |
 
 ---
 
-## ML 파이프라인 (`ml/`)
+## ML Pipeline (`ml/`)
 
-비지도(오토인코더 계열) 9종 모델을 지원한다 (지도 학습 모델은 develop에서 제거됨).
+Supports 9 unsupervised (autoencoder-family) models (supervised models were removed on develop).
 
 ```bash
-# 풀 오케스트레이터 (Slack 승인 게이트 + MLflow + git 자동화)
+# Full orchestrator (Slack approval gates + Google Sheets + git automation)
 python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
   --data_file "D:/ais_data/preprocessed/ais_preprocessed_3yr.csv" \
   --base_dir "D:/" --skip_preprocess
 
-# 단순 학습+평가 (실험용)
+# Unattended (all gates auto-approved)
+python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
+  --data_file "D:/ais_data/preprocessed/ais_preprocessed_3yr.csv" \
+  --base_dir "D:/" --skip_preprocess --auto_approve
+
+# Simple train+eval (experiments)
 python ml/core/pipeline.py --train --eval --models dcdetect tranad conv1d
 
-# 평가
+# Evaluation
 python ml/core/eval_anomaly.py --model dcdetect
 
-# 피처 엔지니어링 자동화 (3년 균형 데이터셋 → Greedy 선택 → 배포 모델 export)
-python ml/auto_feat_eng.py --no_wait --skip_build
+# Standalone feature engineering (Greedy selection → export deployable model)
+python ml/core/feature_engineer.py --input D:/ais_data/preprocessed/ais_preprocessed_3yr.csv \
+  --base_dir D:/ --max_mmsi 3000 --epochs 5 --export_dir D:/ais_models/dcdetect
 ```
 
-자세한 내용은 [`ml/README.md`](ml/README.md)를 참고한다.
+The orchestrator auto-chains run branches (`dcdetect_001 → 002 → ...`), adopting one feature per
+run until convergence. See [`CLAUDE.md`](CLAUDE.md) for the full pipeline architecture, the
+`--max_runs` / `--build_plugin` flags, branch-chaining behavior, and the **Ralph Loop** for
+autonomous feature invention. More ML detail in [`ml/README.md`](ml/README.md).
 
 ---
 
-## OpenCPN 플러그인 (`ais_ids_pi/`)
+## OpenCPN Plugin (`ais_ids_pi/`)
 
-학습된 ONNX 모델을 플러그인 `data/` 폴더에 넣으면 실시간 추론이 활성화된다.
+Placing a trained ONNX model in the plugin's `data/` folder enables real-time inference.
 
 ```
 ais_ids_pi/data/
@@ -50,55 +59,55 @@ ais_ids_pi/data/
     threshold.txt
 ```
 
-**빌드/배포는 native Linux 전용** (Windows는 ML 학습용). 최초 빌드 전 서브모듈 초기화 필요:
+**Build/deploy is native-Linux only** (Windows is for ML training). Initialize the submodule before the first build:
 
 ```bash
-git submodule update --init --recursive    # opencpn-libs 받기
-cd ais_ids_pi && ./local-build-package.sh   # → tar.gz 생성
+git submodule update --init --recursive    # fetch opencpn-libs
+cd ais_ids_pi && ./local-build-package.sh   # → produces tar.gz
 ```
 
-C++ 입력 피처 수는 `ais_ids_pi/include/ais_ml.h`의 `ML_FEATURE_COUNT`에 하드코딩되며 배포 모델의 피처 수와 반드시 일치해야 한다. 자세한 빌드 가이드는 [`CLAUDE.md`](CLAUDE.md)의 "Plugin Build & Deploy" 참고.
+The C++ input-feature count is hardcoded in `ML_FEATURE_COUNT` (`ais_ids_pi/include/ais_ml.h`) and must match the deployed model's feature count. See the "Plugin Build & Deploy" section of [`CLAUDE.md`](CLAUDE.md) for the full build guide.
 
 ---
 
-## 로컬 서버 (`s-c/`)
+## Local Server (`s-c/`)
 
-OpenCPN에서 TCP로 AIS NMEA 신호를 받아 이상을 탐지하는 서버. GUI 또는 CLI로 실행한다.
+A server that receives AIS NMEA signals from OpenCPN over TCP and detects anomalies. Run via GUI or CLI.
 
 ```powershell
 cd s-c
 python ais_ids_gui.py
 ```
 
-자세한 내용은 [`s-c/Readme.md`](s-c/Readme.md)를 참고한다.
+See [`s-c/Readme.md`](s-c/Readme.md) for details.
 
 ---
 
-## 시나리오 시뮬레이터 (`aivdm_gen/`)
+## Scenario Simulator (`aivdm_gen/`)
 
-OpenCPN 또는 IDS 서버로 AIVDM NMEA 신호를 직접 주입하는 ML-Aware 공격 시뮬레이터.
+An ML-aware attack simulator that injects AIVDM NMEA signals directly into OpenCPN or the IDS server.
 
 ```bash
 python aivdm_gen/aivdm_gen.py
 ```
 
-| 그룹 | 시나리오 | 설명 |
+| Group | Scenarios | Description |
 |---|---|---|
-| A | A1~A4 | 규칙 기반 탐지 검증 (속도·정박·COG/HDG·위치 점프) |
-| B | B5~B7 | 다중 선박 협조 패턴 (글자 선단, 집게, 파상 대형) |
-| D | D1~D4 | ML 탐지 우회 1세대 (Low&Slow, 시간 위장, Gradual Drift, Mimicry) |
-| E | E4~E5 | ML 탐지 우회 2세대 (Contextual Blend, Shadow Vessel) |
-| F | F3, F6 | 구조적 공격 (궤적 봉합, AIS Gap으로 이력 리셋) |
+| A | A1~A4 | Rule-based detection checks (speed · anchored · COG/HDG · position jump) |
+| B | B5~B7 | Multi-vessel coordinated patterns (text formation, pincer, wave formation) |
+| D | D1~D4 | ML-evasion 1st gen (Low&Slow, time disguise, Gradual Drift, Mimicry) |
+| E | E4~E5 | ML-evasion 2nd gen (Contextual Blend, Shadow Vessel) |
+| F | F3, F6 | Structural attacks (trajectory stitching, history reset via AIS gap) |
 
-전송 프로토콜은 TCP 서버·클라이언트·UDP를 GUI에서 선택할 수 있다.  
-자세한 내용은 [`aivdm_gen/README.md`](aivdm_gen/README.md)를 참고한다.
+Transport (TCP server/client, UDP) is selectable in the GUI.
+See [`aivdm_gen/README.md`](aivdm_gen/README.md) for details.
 
 ---
 
 ## CI
 
-GitHub Actions로 Push/PR 시 자동 검사가 실행된다 (`.github/workflows/ci.yml`).
+GitHub Actions runs automatic checks on Push/PR (`.github/workflows/ci.yml`).
 
-- Python 문법 검사 + DCdetector smoke test
-- C++ 핵심 파일 컴파일 (`g++ -fsyntax-only`)
-- C++ 정적 분석 (`cppcheck`)
+- Python syntax check + DCdetector smoke test
+- C++ core-file compile (`g++ -fsyntax-only`)
+- C++ static analysis (`cppcheck`)
