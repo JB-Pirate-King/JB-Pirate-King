@@ -73,16 +73,13 @@ class PipelineSheets:
     - 모델 `m` 의 탭: `m_실행요약 / m_상세로그 / m_시나리오결과 / m_피처중요도 / m`(상세).
     - 허브 탭(`모델목록`)에 모델별 탭으로 점프하는 HYPERLINK 를 등록 → "클릭→이동" UX.
     - 파이프라인은 한 번에 한 모델(run)만 처리하므로 '현재 모델' 상태로 라우팅.
-
-    share_email 은 호환을 위해 받지만 단일 시트 방식에선 사용하지 않음
-    (마스터 시트 1개만 서비스계정에 공유돼 있으면 됨).
+    - 마스터 시트 1개만 서비스계정에 공유돼 있으면 됨 (모델별 시트 공유 불필요).
     """
 
-    def __init__(self, credentials_file: str, sheet_id: str, share_email: str = None):
+    def __init__(self, credentials_file: str, sheet_id: str):
         creds = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
         self.gc = gspread.authorize(creds)
         self.master = self.gc.open_by_key(sheet_id)
-        self._share_email = share_email
         self._tabs: dict[tuple, gspread.Worksheet] = {}     # (model, base_title) -> 탭
         self._summary_row: int | None = None
         self._cur_model: str | None = None
@@ -206,51 +203,7 @@ class PipelineSheets:
             "진행 중"
         ])
 
-    # ── 학습 ────────────────────────────────────────────────────────
-
-    def log_train(self, branch: str, model: str, epochs: int, max_mmsi: int,
-                  status: str, elapsed_sec: float = None, notes: str = ""):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        elapsed_str = f"{elapsed_sec:.0f}s" if elapsed_sec else ""
-
-        ws_model = self._ensure_model_tab(model)
-        # MODEL_HEADERS: branch,timestamp,stage,status,det_change,n_features,adopted,threshold,elapsed_s
-        self._append_and_track(ws_model, [
-            "", ts, "베이스학습", status,
-            "", "", "", "", elapsed_str
-        ])
-
-        self._append_and_track(self._ws("상세로그"), [
-            ts, branch, "베이스학습", status,
-            "", "", "", elapsed_str.rstrip("s"), notes
-        ])
-        # 실행요약은 FE 단계가 소유 — 학습 단계는 모델탭/상세로그에만 기록
-
-    # ── 평가 ────────────────────────────────────────────────────────
-
-    def log_eval(self, branch: str, model: str, status: str,
-                 det_fp1: float = None, det_fp5: float = None,
-                 det_fp10: float = None,
-                 elapsed_sec: float = None, notes: str = ""):
-        """베이스 평가 결과 기록 (모델탭 + 상세로그).
-        실행요약은 FE 단계가 소유하므로 여기서 건드리지 않음.
-        시나리오별 탐지율은 호출측에서 log_scenarios로 별도 기록."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f = lambda v, d=1: f"{v:.{d}f}" if v is not None else "-"
-        elapsed_str = f"{elapsed_sec:.0f}s" if elapsed_sec else ""
-
-        det_summary = f"FP1:{f(det_fp1)}% FP5:{f(det_fp5)}% FP10:{f(det_fp10)}%" if det_fp1 else ""
-
-        ws_model = self._ensure_model_tab(model)
-        # MODEL_HEADERS: branch,timestamp,stage,status,det_change,n_features,adopted,threshold,elapsed_s
-        self._append_and_track(ws_model, [
-            "", ts, "베이스평가", status, det_summary, "", "", "", elapsed_str
-        ])
-
-        self._append_and_track(self._ws("상세로그"), [
-            ts, branch, "베이스평가", status,
-            f(det_fp1), "", "", elapsed_str.rstrip("s"), det_summary
-        ])
+    # ── 시나리오 결과 ─────────────────────────────────────────────────
 
     def log_scenarios(self, branch: str, model: str, fp_target: str,
                       scenarios: dict[str, float]):
@@ -390,5 +343,4 @@ def from_config(config_path: str = "ml/pipeline_config.json") -> "PipelineSheets
     return PipelineSheets(
         credentials_file=cfg["google_sheets"]["credentials_file"],
         sheet_id=cfg["google_sheets"]["sheet_id"],
-        share_email=cfg["google_sheets"].get("share_email"),
     )
