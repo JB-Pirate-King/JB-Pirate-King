@@ -29,6 +29,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 import ml.integrations.slack_bot as _sb
 import ml.integrations.sheets as _sh
 import ml.integrations.git_manager as git
+import ml.integrations.notify as _notify
 
 CONFIG_PATH = "ml/pipeline_config.json"
 
@@ -509,6 +510,10 @@ def stage_release(bot, args, branch: str, run_num: int,
     if ret == 0:
         url_line = next((l for l in out.splitlines() if "github.com" in l), out.strip())
         bot.log(f"✅ 릴리스 완료: {url_line}", "릴리스")
+        _notify.notify_pipeline(
+            f"🎉 릴리즈 생성: `{tag}`",
+            f"탐지율 {det_str}%  |  피처 {n_feat}개  |  {url_line}",
+        )
     else:
         bot.log(f"⚠ 릴리스 실패 (수동 생성 필요)\n{out[-300:]}", "릴리스")
 
@@ -973,6 +978,10 @@ def main():
             "베이스 피처": f"{len(BASE_FEATURES)}개",
             "출발 피처": f"{len(_load_fe_initial_extra())}개 (기채택)",
         })
+        _notify.notify_pipeline(
+            f"🚀 파이프라인 시작: `{branch}`",
+            f"모델 {args.model}  |  epochs={args.epochs}  |  max_mmsi={args.max_mmsi}",
+        )
 
         run_preprocess = first_iter and not args.skip_preprocess
         stages = (["전처리"] if run_preprocess else []) + ["피처 엔지니어링 학습"]
@@ -1004,6 +1013,10 @@ def main():
             # 채택 발생 → fe_state 저장 후 새 브랜치로 재시작
             _save_fe_initial_extra(fe_result)
             next_run = git.get_next_run_num(args.model)
+            _notify.notify_pipeline(
+                f"✅ 피처 채택: `{', '.join(fe_result[-1:])}`",
+                f"누적 피처 {len(BASE_FEATURES) + len(fe_result)}개  |  다음: `{args.model}_{next_run:03d}`",
+            )
             bot.log(
                 f"🔁 채택 완료 ({', '.join(fe_result)}) → "
                 f"{args.model}_{next_run:03d} 브랜치로 자동 재시작",
@@ -1017,6 +1030,10 @@ def main():
                 "파이프라인 완료 — 수렴",
                 [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
                 success=True
+            )
+            _notify.notify_pipeline(
+                f"🏁 파이프라인 수렴 완료: `{branch}`",
+                "모든 피처 후보 탐색 완료 — 추가 채택 없음",
             )
             git.checkout("develop")
             return
