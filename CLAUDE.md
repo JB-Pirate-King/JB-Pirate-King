@@ -452,7 +452,22 @@ Goal: find derived features that raise the DCdetect detection rate, then export 
 ## Model File Path Rules
 
 - Trained (per model): `D:\ais_models\{name}\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
-- Plugin: `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
+- Plugin source (bundled into the build): `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
+- **Runtime load location** (`g_pData`, `ais_ids_pi.cpp:157`): `GetpPrivateApplicationDataLocation()/plugins/ais_ids_pi/data/` → on Linux `~/.opencpn/plugins/ais_ids_pi/data/`. `local-build-package.sh` copies `ais_ids_pi/data/` here (`DATA_DEST`), so the two paths match.
+
+### Deploying a trained model to the plugin
+
+Training exports `model_{name}.onnx` / `scaler_{name}.json` / `threshold_{name}.txt`, but the plugin loads **fixed names** (fallback when no `ensemble_config.json`): `model.onnx` / `scaler.json` / `threshold.txt` (`ais_ids.cpp` `LoadMLFromConfig`). So the files must be **renamed** into the runtime load location:
+
+```bash
+DEST="$HOME/.opencpn/plugins/ais_ids_pi/data"
+mkdir -p "$DEST"
+cp model_{name}.onnx     "$DEST/model.onnx"
+cp scaler_{name}.json    "$DEST/scaler.json"
+cp threshold_{name}.txt  "$DEST/threshold.txt"
+```
+
+The orchestrator's `stage_build_plugin` does this rename-copy into `ais_ids_pi/data/`, and run-release notes embed the same `$HOME/.opencpn/...` deploy snippet. `local-build-package.sh` then installs `ais_ids_pi/data/` to the runtime location on a native-Linux build.
 
 ---
 
