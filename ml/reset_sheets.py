@@ -1,25 +1,35 @@
-"""일회용: Google Sheets 모든 파이프라인 탭의 데이터 행을 비움 (헤더만 유지)."""
-import sys
-from ml.integrations.sheets import (
-    PipelineSheets, from_config, FIXED_TABS, MODEL_HEADERS,
-)
+"""일회용: 마스터 시트의 모델별 탭 데이터를 비움 (헤더 유지).
 
-MODEL = sys.argv[1] if len(sys.argv) > 1 else "dcdetect"
+사용:
+  python -m ml.reset_sheets            # 허브에 등록된 모든 모델 탭 비움
+  python -m ml.reset_sheets conv1d     # 특정 모델 탭만 비움
+"""
+import sys
+from ml.integrations.sheets import from_config, FIXED_TABS
 
 ps = from_config()
-sh = ps.sh
+only = sys.argv[1] if len(sys.argv) > 1 else None
 
-targets = list(FIXED_TABS.keys()) + [MODEL]
-for title in targets:
-    try:
-        ws = sh.worksheet(title)
-    except Exception:
-        print(f"  (없음) {title}")
-        continue
-    header = ws.row_values(1)
-    ws.clear()
-    if header:
-        ws.update("A1", [header])
-    print(f"  비움: {title} (헤더 {len(header)}열 유지)")
+# 허브(모델목록)에 등록된 모델 목록
+models = sorted(ps._inited) if not only else [only]
+models = [m for m in models if m and m != "model"]
+if not models:
+    print("등록된 모델 없음 (허브 비어있음)")
+    sys.exit(0)
+
+m = ps.master
+for model in models:
+    print(f"[{model}]")
+    # 모델별 탭: {model}_{base} (고정 4탭) + {model} (상세)
+    for title in [f"{model}_{b}" for b in FIXED_TABS] + [model]:
+        try:
+            ws = m.worksheet(title)
+        except Exception:
+            continue
+        header = ws.row_values(1)
+        ws.clear()
+        if header:
+            ws.update(values=[header], range_name="A1")
+        print(f"  비움: {title}")
 
 print("Sheets 리셋 완료")
