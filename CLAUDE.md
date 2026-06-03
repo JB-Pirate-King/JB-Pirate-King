@@ -258,6 +258,15 @@ orchestrator.py defaults:
 - `--data_file`: `D:/ais_data/preprocessed/2025/ais_preprocessed_2025.csv`
 - `--base_dir`: `D:/`
 - `--min_gain`: `3.0` (Greedy 채택 임계 목적점수 향상량)
+- `--max_runs`: `50` (브랜치 체이닝 안전 상한 — 수렴 전 무한 반복 방지)
+- `--build_plugin`: off (지정 시 WSL 로 tar.gz 빌드. **기본 off** — 정본 빌드는 native Linux. 미지정 시 C++패치+모델만 커밋)
+
+### 브랜치 체이닝 동작 (중요)
+
+- `dcdetect_NNN` 브랜치는 **직전 run 브랜치 위에 누적 분기** (예: `_002`의 base = `_001`).
+  최초 run 또는 직전 브랜치 없으면 `develop` 에서 분기.
+- 채택 피처 이력은 `ml/fe_state.json` 에 저장 + **매 run 커밋** → git 히스토리로 누적 (uncommitted 워킹트리 의존 제거).
+- main 루프는 정상/중단/크래시 어느 경로든 `finally` 로 **develop 으로 복구**.
 
 ---
 

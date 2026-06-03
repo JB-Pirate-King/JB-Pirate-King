@@ -10,6 +10,7 @@ import sys
 import threading
 import json
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -26,44 +27,51 @@ class SlackPipelineBot:
         self.channel = channel
         self._decision = None
         self._event = threading.Event()
+        self._active_token = None   # 현재 대기 중인 승인 메시지 토큰 (스테일 클릭 차단용)
         self._setup_handlers()
         self._start_socket()
+
+    @staticmethod
+    def _action_token(body) -> str:
+        """클릭된 버튼의 value(토큰) 추출."""
+        try:
+            return body["actions"][0].get("value") or ""
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+    def _resolve(self, body, ack, label: str, decision: str):
+        """버튼 클릭 처리. 활성 토큰과 일치할 때만 결정 반영, 옛 메시지는 무시."""
+        ack()
+        token = self._action_token(body)
+        if self._active_token is None or token != self._active_token:
+            # 스테일(이전 단계) 버튼 — 메시지만 만료 표시, 결정 무시
+            self._update_buttons(body, "⏱ 만료된 버튼 (현재 단계 아님)")
+            return
+        self._update_buttons(body, label)
+        self._active_token = None
+        self._decision = decision
+        self._event.set()
 
     def _setup_handlers(self):
         @self.app.action("approve")
         def handle_approve(ack, body):
-            ack()
-            self._update_buttons(body, "✅ 승인됨")
-            self._decision = "approve"
-            self._event.set()
+            self._resolve(body, ack, "✅ 승인됨", "approve")
 
         @self.app.action("retry")
         def handle_retry(ack, body):
-            ack()
-            self._update_buttons(body, "🔄 재실행 요청")
-            self._decision = "retry"
-            self._event.set()
+            self._resolve(body, ack, "🔄 재실행 요청", "retry")
 
         @self.app.action("stop")
         def handle_stop(ack, body):
-            ack()
-            self._update_buttons(body, "❌ 중단됨")
-            self._decision = "stop"
-            self._event.set()
+            self._resolve(body, ack, "❌ 중단됨", "stop")
 
         @self.app.action("next_candidate")
         def handle_next_candidate(ack, body):
-            ack()
-            self._update_buttons(body, "▶ 다음 후보")
-            self._decision = "next"
-            self._event.set()
+            self._resolve(body, ack, "▶ 다음 후보", "next")
 
         @self.app.action("stop_step")
         def handle_stop_step(ack, body):
-            ack()
-            self._update_buttons(body, "■ 스텝 종료")
-            self._decision = "stop_step"
-            self._event.set()
+            self._resolve(body, ack, "■ 스텝 종료", "stop_step")
 
         @self.app.event("message")
         def handle_message(event, say):
@@ -129,22 +137,27 @@ class SlackPipelineBot:
         )
 
     def _start_socket(self):
-        import signal as _signal
+        """Socket Mode 연결.
+
+        handler.start() 대신 connect() 사용:
+          - start()는 메인 스레드에서 signal 핸들러를 설치하고 영구 블록 →
+            데몬 스레드에서 돌리려면 signal.signal 을 전역 no-op 으로 패치해야 했고,
+            그 패치가 블록 동안 복구되지 않아 메인 프로세스의 Ctrl+C 처리를 망가뜨림.
+          - connect()는 논블록으로 소켓만 열고 즉시 반환 (내부 백그라운드 스레드 유지).
+            signal 패치 불필요.
+        """
         self._handler = SocketModeHandler(self.app, self.app_token)
-        self._connected = threading.Event()
+        self._handler.connect()  # 논블록, signal 미설치
 
-        def _run():
-            orig = _signal.signal
-            _signal.signal = lambda *a, **kw: None
-            try:
-                self._handler.start()
-            finally:
-                _signal.signal = orig
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        time.sleep(3)  # 소켓 연결 대기
-        print("[SlackBot] Socket Mode 연결 완료")
+        # 실제 WebSocket 연결 수립 확인 (최대 ~10초 폴링, sleep(3) 추측 제거)
+        client = self._handler.client
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if getattr(client, "is_connected", lambda: False)():
+                print("[SlackBot] Socket Mode 연결 완료")
+                return
+            time.sleep(0.2)
+        print("[SlackBot] ⚠ Socket Mode 연결 확인 실패 (계속 진행)")
 
     STAGE_EMOJI = {
         "전처리": "🔄", "학습": "🧠", "평가": "📊", "피처개선": "🔬",
@@ -222,10 +235,16 @@ class SlackPipelineBot:
             }]
         )
 
+    # 승인 대기 최대 시간 (초). 초과 시 안전하게 'stop' (자동 배포 방지).
+    APPROVAL_TIMEOUT = 3600
+
     def wait_approval(self, stage: str, summary_lines: list[str]) -> str:
-        """승인 버튼 메시지 전송 후 클릭 대기. 반환값: 'approve' | 'retry' | 'stop'"""
+        """승인 버튼 메시지 전송 후 클릭 대기. 반환값: 'approve' | 'retry' | 'stop'.
+        APPROVAL_TIMEOUT 초 내 응답 없으면 'stop' 반환 (영구 행 방지)."""
         self._decision = None
         self._event.clear()
+        token = uuid.uuid4().hex
+        self._active_token = token
 
         body = "\n".join(f">  • {l}" for l in summary_lines)
         self.app.client.chat_postMessage(
@@ -243,18 +262,21 @@ class SlackPipelineBot:
                             "type": "button",
                             "text": {"type": "plain_text", "text": "✅ 다음 단계"},
                             "style": "primary",
-                            "action_id": "approve"
+                            "action_id": "approve",
+                            "value": token
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "🔄 다시 실행"},
-                            "action_id": "retry"
+                            "action_id": "retry",
+                            "value": token
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "❌ 중단"},
                             "style": "danger",
-                            "action_id": "stop"
+                            "action_id": "stop",
+                            "value": token
                         }
                     ]
                 },
@@ -262,7 +284,9 @@ class SlackPipelineBot:
             ]
         )
 
-        self._event.wait()
+        if not self._event.wait(timeout=self.APPROVAL_TIMEOUT):
+            self.log(f"⏱ [{stage}] 승인 타임아웃 ({self.APPROVAL_TIMEOUT}s) → stop", "warning")
+            return "stop"
         return self._decision
 
 
@@ -275,6 +299,8 @@ class SlackPipelineBot:
         """
         self._decision = None
         self._event.clear()
+        token = uuid.uuid4().hex
+        self._active_token = token
 
         arrow = "▲" if obj_gain > 0 else ("▼" if obj_gain < 0 else "─")
         status_emoji = "✅" if obj_gain >= 3.0 else ("⚠️" if obj_gain > 0 else "❌")
@@ -302,19 +328,23 @@ class SlackPipelineBot:
                             "type": "button",
                             "text": {"type": "plain_text", "text": "▶ 다음 후보"},
                             "style": "primary",
-                            "action_id": "next_candidate"
+                            "action_id": "next_candidate",
+                            "value": token
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "■ 스텝 종료"},
                             "style": "danger",
-                            "action_id": "stop_step"
+                            "action_id": "stop_step",
+                            "value": token
                         }
                     ]
                 }
             ]
         )
-        self._event.wait()
+        if not self._event.wait(timeout=self.APPROVAL_TIMEOUT):
+            self.log(f"⏱ 후보 #{candidate_num} 승인 타임아웃 → stop_step", "warning")
+            return "stop_step"
         return self._decision
 
 

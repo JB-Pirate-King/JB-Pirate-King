@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -91,14 +92,15 @@ def run_cmd(cmd: list[str], progress_cb=None, interactive=False) -> tuple[int, s
         stdin=subprocess.PIPE if interactive else None,
         text=True, encoding="utf-8", errors="replace", env=env
     )
-    output_lines = []
+    # 파싱은 후보표/중요도/마지막 N줄만 필요 → 상한 buffer 로 메모리 폭주 방지.
+    # tqdm progress 줄은 live progress_cb 가 처리하므로 buffer 에 적재하지 않음.
+    output_lines = deque(maxlen=20000)
     for line in proc.stdout:
         line = line.rstrip()
-        # tqdm progress bar lines are handled by progress_cb; skip printing to avoid flooding stdout
         is_tqdm = bool(re.search(r"Epoch\s+\d+/\s*\d+:\s+[\d.]+%\|", line))
         if not is_tqdm:
             print(line, flush=True)
-        output_lines.append(line)
+            output_lines.append(line)
         if progress_cb:
             progress_cb(line, proc)
     proc.wait()
@@ -311,7 +313,7 @@ def stage_preprocess(bot, sheet, branch, args, step_info: tuple):
             f"{_step_header(cur, total, '전처리', next_name)}\n{args.raw_dir}")
         t0 = time.time()
         ret, out = run_cmd(
-            ["python", "ml/core/preprocess.py", args.raw_dir, "--output", args.data_file]
+            [sys.executable, "ml/core/preprocess.py", args.raw_dir, "--output", args.data_file]
         )
         elapsed = time.time() - t0
         details  = _parse_preprocess(out)
@@ -407,7 +409,18 @@ def stage_build_plugin(bot, args, scaler_path: str) -> list[str]:
         return [f for f in cpp_files + data_files if Path(f).exists()]
     bot.log("✅ 모델 파일 복사 완료 → ais_ids_pi/data/", "플러그인빌드")
 
-    # ── 3. WSL 빌드 ──────────────────────────────────────────────────
+    # ── 3. (선택) WSL 빌드 ───────────────────────────────────────────
+    #   정책상 플러그인 빌드/배포는 native Linux 가 정본 (CLAUDE.md).
+    #   Windows 운용 중 tar.gz 가 필요할 때만 --build_plugin 으로 WSL 빌드 시도.
+    #   기본 off → C++ 패치 + 모델 파일만 커밋, tar.gz 는 native Linux 에서 빌드.
+    if not getattr(args, "build_plugin", False):
+        bot.log(
+            "ℹ️ WSL 빌드 생략 (--build_plugin 미지정) — C++패치+모델만 커밋. "
+            "tar.gz 는 native Linux 에서 `./local-build-package.sh` 로 빌드.",
+            "플러그인빌드",
+        )
+        return [f for f in cpp_files + data_files if Path(f).exists()]
+
     bot.log("🔨 WSL 플러그인 빌드 시작 (cmake+make)...", "플러그인빌드")
     repo_abs   = str(Path(".").resolve())
     wsl_repo   = _win_to_wsl(repo_abs)
@@ -484,7 +497,7 @@ def stage_release(bot, args, branch: str, run_num: int,
 
     n_feat    = len(BASE_FEATURES) + len(full_extra)
     feat_list = ", ".join(full_extra) if full_extra else "-"
-    det_str   = f"{det_rate:.1f}" if det_rate else "?"
+    det_str   = f"{det_rate:.1f}" if det_rate is not None else "?"
 
     notes = (
         f"## 모델\n- {args.model}  (epochs={args.epochs})\n\n"
@@ -710,7 +723,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
                     )
 
     ret, out = run_cmd(
-        ["python", "ml/core/feature_engineer.py",
+        [sys.executable, "ml/core/feature_engineer.py",
          "--input", args.data_file,
          "--base_dir", args.base_dir,
          "--epochs", str(args.epochs),
@@ -765,14 +778,16 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
     candidates     = _parse_greedy_candidates(out)
     importance     = _parse_permutation_importance(out)
 
-    gain_pp = (det_rate - baseline_det) if (det_rate and baseline_det) else 0.0
+    gain_pp = ((det_rate - baseline_det)
+               if (det_rate is not None and baseline_det is not None) else 0.0)
     result_title = (f"✅ 채택 {len(newly_adopted)}개: {', '.join(newly_adopted)}"
                     if newly_adopted else "수렴 — 신규 채택 없음")
 
     summary = (
         [
             result_title,
-            f"FP=1% 탐지율: {baseline_det:.1f}% → {det_rate:.1f}%  ({gain_pp:+.1f}pp)" if det_rate else "탐지율: -",
+            (f"FP=1% 탐지율: {baseline_det:.1f}% → {det_rate:.1f}%  ({gain_pp:+.1f}pp)"
+             if (det_rate is not None and baseline_det is not None) else "탐지율: -"),
             f"총 피처 수: {n_feat}개  |  소요: {elapsed:.0f}s",
         ]
         + adopted_detail
@@ -829,7 +844,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
         sheet.log_scenarios(branch, args.model, "FP=1%", scenario_fp1)
 
     if newly_adopted:
-        det_str  = f"{det_rate:.1f}" if det_rate else "?"
+        det_str  = f"{det_rate:.1f}" if det_rate is not None else "?"
         n_feat_s = str(n_feat) if n_feat else "?"
 
         # ── 게이트 ①: FE 평가 결과 → 배포(빌드·커밋·릴리즈) 진행 여부 ──
@@ -937,6 +952,10 @@ def main():
                         help="Greedy 후보 수 제한 (앞 N개만 탐색, 속도용)")
     parser.add_argument("--auto_approve",    action="store_true",
                         help="Slack 승인 대기 없이 모든 단계 자동 approve (테스트용)")
+    parser.add_argument("--max_runs",        type=int, default=50,
+                        help="브랜치 체이닝 안전 상한 (수렴 전 무한 반복 방지, 기본 50)")
+    parser.add_argument("--build_plugin",    action="store_true",
+                        help="WSL 로 플러그인 tar.gz 빌드 시도 (기본 off — 정본 빌드는 native Linux)")
     args = parser.parse_args()
 
     global _AUTO_APPROVE
@@ -958,68 +977,83 @@ def main():
     #   (dcdetect_001→002→...) → 수렴(채택 없음)하면 종료.
     #   베이스라인 학습+평가는 FE 내부에서 수행. 전처리는 첫 브랜치에서만(--skip_preprocess 아니면).
     first_iter = True
-    while True:
-        run_num = git.get_next_run_num(args.model)
-        branch  = git.create_branch(args.model, run_num)
+    iters = 0
+    try:
+        while iters < args.max_runs:
+            iters += 1
+            run_num = git.get_next_run_num(args.model)
+            branch  = git.create_branch(args.model, run_num)
 
-        sheet.log_run_start(branch, args.model, args.epochs, args.max_mmsi,
-                            data_file=args.data_file)
-        bot.log_run_start(branch, {
-            "모델": args.model,
-            "epochs": args.epochs,
-            "max_mmsi": args.max_mmsi,
-            "데이터": args.data_file,
-            "base_dir": args.base_dir,
-            "베이스 피처": f"{len(BASE_FEATURES)}개",
-            "출발 피처": f"{len(_load_fe_initial_extra())}개 (기채택)",
-        })
+            sheet.log_run_start(branch, args.model, args.epochs, args.max_mmsi,
+                                data_file=args.data_file)
+            bot.log_run_start(branch, {
+                "모델": args.model,
+                "epochs": args.epochs,
+                "max_mmsi": args.max_mmsi,
+                "데이터": args.data_file,
+                "base_dir": args.base_dir,
+                "베이스 피처": f"{len(BASE_FEATURES)}개",
+                "출발 피처": f"{len(_load_fe_initial_extra())}개 (기채택)",
+            })
 
-        run_preprocess = first_iter and not args.skip_preprocess
-        stages = (["전처리"] if run_preprocess else []) + ["피처 엔지니어링 학습"]
-        total_steps = len(stages)
+            run_preprocess = first_iter and not args.skip_preprocess
+            stages = (["전처리"] if run_preprocess else []) + ["피처 엔지니어링 학습"]
+            total_steps = len(stages)
 
-        def make_step_info(name: str) -> tuple:
-            idx = stages.index(name)
-            nxt = stages[idx + 1] if idx + 1 < total_steps else "파이프라인 종료"
-            return (idx + 1, total_steps, nxt)
+            def make_step_info(name: str) -> tuple:
+                idx = stages.index(name)
+                nxt = stages[idx + 1] if idx + 1 < total_steps else "파이프라인 종료"
+                return (idx + 1, total_steps, nxt)
 
-        if run_preprocess:
-            if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
+            if run_preprocess:
+                if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
+                    bot.log("파이프라인 중단", "warning")
+                    return
+            first_iter = False
+
+            fe_result = stage_fe(bot, sheet, branch, args, run_num,
+                                 make_step_info("피처 엔지니어링 학습"))
+
+            sheet.log_run_done(branch, args.model, success=(fe_result is not None))
+
+            if fe_result is None:
+                # 사용자 중단
                 bot.log("파이프라인 중단", "warning")
-                git.checkout("develop")
                 return
-        first_iter = False
-
-        fe_result = stage_fe(bot, sheet, branch, args, run_num,
-                             make_step_info("피처 엔지니어링 학습"))
-
-        sheet.log_run_done(branch, args.model, success=(fe_result is not None))
-
-        if fe_result is None:
-            # 사용자 중단
-            bot.log("파이프라인 중단", "warning")
-            git.checkout("develop")
-            return
-        elif fe_result:
-            # 채택 발생 → fe_state 저장 후 새 브랜치로 재시작
-            _save_fe_initial_extra(fe_result)
-            next_run = git.get_next_run_num(args.model)
-            bot.log(
-                f"🔁 채택 완료 ({', '.join(fe_result)}) → "
-                f"{args.model}_{next_run:03d} 브랜치로 자동 재시작",
-                "피처개선"
-            )
-            git.checkout("develop")
-            continue
+            elif fe_result:
+                # 채택 발생 → fe_state 저장 + 이 브랜치에 커밋(체이닝이 git 히스토리로 누적되도록)
+                #   → 다음 브랜치는 이 run 브랜치를 base 로 분기 (create_branch 기본 동작).
+                _save_fe_initial_extra(fe_result)
+                git.commit_results(
+                    [FE_STATE_FILE],
+                    f"chore(fe): {branch} fe_state 갱신 ({len(fe_result)}피처 누적)",
+                    branch=branch,
+                )
+                next_run = git.get_next_run_num(args.model)
+                bot.log(
+                    f"🔁 채택 완료 ({', '.join(fe_result)}) → "
+                    f"{args.model}_{next_run:03d} 브랜치로 자동 재시작 (base={branch})",
+                    "피처개선"
+                )
+                continue
+            else:
+                # 수렴 — 더 이상 채택 피처 없음 → 종료
+                bot.log_stage_result(
+                    "파이프라인 완료 — 수렴",
+                    [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
+                    success=True
+                )
+                return
         else:
-            # 수렴 — 더 이상 채택 피처 없음 → 종료
-            bot.log_stage_result(
-                "파이프라인 완료 — 수렴",
-                [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
-                success=True
-            )
+            # max_runs 도달 (수렴 전 안전 상한)
+            bot.log(f"⚠️ 안전 상한 도달: {args.max_runs} run 실행 후 종료 (--max_runs 로 조정)",
+                    "warning")
+    finally:
+        # 크래시/정상/중단 어느 경로든 작업 브랜치를 develop 으로 복구
+        try:
             git.checkout("develop")
-            return
+        except Exception as e:
+            print(f"[develop 복구 실패] {e}")
 
 
 if __name__ == "__main__":

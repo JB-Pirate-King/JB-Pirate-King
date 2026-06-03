@@ -20,7 +20,15 @@ def _run(cmd: list[str]) -> str:
 
 
 def get_next_run_num(model: str) -> int:
-    """기존 브랜치에서 다음 번호 계산. dcdetect_001 → 다음은 002"""
+    """기존 브랜치에서 다음 번호 계산. dcdetect_001 → 다음은 002.
+
+    원격에만 있는 run 브랜치 번호를 놓치지 않도록 best-effort fetch 선행
+    (오프라인/실패 시 무시하고 로컬+캐시된 원격 ref 로 계산)."""
+    subprocess.run(
+        ["git", "fetch", "--quiet", PUSH_REMOTE, "--prune"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30,
+    )
     branches = _run(["git", "branch", "-a"]).splitlines()
     pattern = re.compile(rf"^\s*(?:remotes/(?:origin|upstream)/)?{re.escape(model)}_(\d+)$")
     nums = []
@@ -31,12 +39,30 @@ def get_next_run_num(model: str) -> int:
     return max(nums, default=0) + 1
 
 
-def create_branch(model: str, run_num: int) -> str:
-    """브랜치 생성, 체크아웃, project(upstream) 푸시. 반환값: 브랜치명"""
-    branch = f"{model}_{run_num:03d}"
-    current = _run(["git", "branch", "--show-current"])
+def _local_branches() -> list[str]:
+    """로컬 브랜치명 목록 (정확 매칭용, 현재 브랜치 '* ' 마커 제거)."""
+    out = _run(["git", "branch", "--format=%(refname:short)"])
+    return [b.strip() for b in out.splitlines() if b.strip()]
 
-    base = "develop" if "develop" in _run(["git", "branch"]) else current
+
+def create_branch(model: str, run_num: int, base: str = None) -> str:
+    """브랜치 생성, 체크아웃, project(upstream) 푸시. 반환값: 브랜치명.
+
+    base 미지정 시: 직전 run 브랜치(model_{run_num-1:03d})가 있으면 그 위에,
+    없으면 develop(없으면 현재)에서 분기 → run 간 커밋 누적이 git 히스토리로 이어짐.
+    """
+    branch  = f"{model}_{run_num:03d}"
+    current = _run(["git", "branch", "--show-current"])
+    locals_ = _local_branches()
+
+    if base is None:
+        prev = f"{model}_{run_num - 1:03d}"
+        if run_num > 1 and prev in locals_:
+            base = prev
+        elif "develop" in locals_:
+            base = "develop"
+        else:
+            base = current
     _run(["git", "checkout", "-b", branch, base])
 
     result = subprocess.run(
