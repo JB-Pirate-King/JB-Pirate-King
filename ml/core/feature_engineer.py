@@ -46,7 +46,6 @@ sys.argv = [sys.argv[0]]
 try:
     from eval_anomaly import (
         SCENARIO_MAKERS,
-        _build_derived,
         make_normal_seq,
     )
 finally:
@@ -542,11 +541,6 @@ def train_recon_model(
     train_loader, val_loader = make_loaders(tensor, batch_size)
     train_standard(model, train_loader, val_loader, device, epochs, lr, patience)
     return model, val_loader
-
-
-def train_dcdetect(tensor, n_feat, epochs, **kw):
-    """하위호환 래퍼 — dcdetect 고정 (기존 호출부 보존용)."""
-    return train_recon_model("dcdetect", tensor, n_feat, epochs, **kw)
 
 
 # ── 임계값 계산 (실제 정상 시퀀스 기준 목표 FP) ──────────────────────
