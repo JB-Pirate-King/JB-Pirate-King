@@ -110,6 +110,58 @@ def send_discord(content: str = "", embeds: Optional[list] = None,
     return ok
 
 
+# ── Slack ─────────────────────────────────────────────────────────
+def send_slack(text: str, cfg: Optional[dict] = None) -> bool:
+    """Slack Bot Token으로 메시지 전송. 성공 시 True.
+
+    설정 키: notify_config.json 의 slack_bot_token, slack_channel
+    (채널은 이름 권장 — e.g. "ais-training-alerts")
+    """
+    cfg = cfg or load_config()
+    token   = cfg.get("slack_bot_token", "").strip()
+    channel = cfg.get("slack_channel", "").strip()
+    if not token or not channel:
+        print("[notify] slack_bot_token / slack_channel 미설정 — 건너뜀")
+        return False
+
+    # Slack text 제한 3000자
+    if len(text) > 2900:
+        text = text[:2900] + "\n…(생략)"
+
+    status, resp = _http_json(
+        "https://slack.com/api/chat.postMessage",
+        {"channel": channel, "text": text},
+        {"Content-Type": "application/json",
+         "Authorization": f"Bearer {token}"},
+    )
+    ok = status == 200 and bool(resp and resp.get("ok"))
+    if not ok:
+        err = resp.get("error", "") if resp else ""
+        print(f"[notify] Slack 전송 실패 (HTTP {status}, {err})")
+    else:
+        print(f"[notify] Slack 전송 성공")
+    return ok
+
+
+# ── 파이프라인 통합 알림 ────────────────────────────────────────────
+def notify_pipeline(event: str, detail: str = "", cfg: Optional[dict] = None) -> dict:
+    """ML 파이프라인 이벤트를 Discord + Slack 동시 전송.
+
+    event 예시: "🚀 run 시작", "✅ 피처 채택", "🏁 수렴 완료", "🎉 릴리즈 생성"
+    detail: 핵심 수치 1-2줄 (탐지율, 피처 수 등)
+
+    반환: {"discord": bool, "slack": bool}
+    """
+    cfg = cfg or load_config()
+    text = f"*[AIS-IDS]* {event}"
+    if detail:
+        text += f"\n{detail}"
+
+    d_ok = send_discord(content=text, cfg=cfg)
+    s_ok = send_slack(text=text, cfg=cfg)
+    return {"discord": d_ok, "slack": s_ok}
+
+
 def discord_embed(title: str, summary: str, fields: Optional[list] = None,
                   color: int = 0x2ECC71) -> dict:
     """Discord 임베드 카드 생성 헬퍼."""
