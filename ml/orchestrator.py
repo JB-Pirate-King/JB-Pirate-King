@@ -985,7 +985,8 @@ def main():
     )
     sheet = _sh.PipelineSheets(
         cfg["google_sheets"]["credentials_file"],
-        cfg["google_sheets"]["sheet_id"]
+        cfg["google_sheets"]["sheet_id"],
+        share_email=cfg["google_sheets"].get("share_email"),
     )
 
     # FE-only 체이닝: 브랜치마다 Greedy 1피처 채택 → fe_state 갱신 → 새 브랜치

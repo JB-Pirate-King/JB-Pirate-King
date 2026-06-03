@@ -362,7 +362,11 @@ Goal: find derived features that raise the DCdetect detection rate, then export 
 
 ## Google Sheets Tab Structure
 
-5 tabs auto-logged to Google Sheets. Config in `ml/pipeline_config.json` (gitignored). Tab titles are kept in Korean for continuity with the existing sheet; columns are described below.
+**Per-model tabs in a single master spreadsheet.** Each model gets its own set of tabs prefixed by model name: `{model}_실행요약`, `{model}_상세로그`, `{model}_시나리오결과`, `{model}_피처중요도`, plus a `{model}` detail tab. A `모델목록` (hub) tab lists every model with `=HYPERLINK` jump links to its tabs (click model → jump). Tabs are auto-created on first run for that model (`sheets.py` `_use`).
+
+> Why per-tab, not per-spreadsheet: a service account on personal Gmail has **0 Drive quota** and cannot `gc.create()` new spreadsheets, so model separation is done by tab prefix inside the one master sheet (which is shared to the service account). Config in `ml/pipeline_config.json` (gitignored); `share_email` is accepted but unused in this single-sheet mode.
+
+Column layout per tab (titles kept Korean for continuity):
 
 ### 1. `dcdetect` tab — per-run detail log
 

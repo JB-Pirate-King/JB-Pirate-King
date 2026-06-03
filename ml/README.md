@@ -230,15 +230,18 @@ Best detection rate: dcdetect_011 → **83.5% (FP=1%, 23 features)**
 
 ## Google Sheets Tab Structure
 
-| Tab | Content |
-|---|---|
-| `dcdetect` | Per-run stage detail log (det_change, n_features, adopted, threshold, elapsed_s) |
-| `실행요약` (Run Summary) | One line per run (fe_baseline, fe_det_fp1/fp5/fp10, fe_threshold, fe_features) |
-| `상세로그` (Detail Log) | Raw log of every stage |
-| `시나리오결과` (Scenario Results) | Per-scenario detection rate (FP=1%, 32 scenarios) |
-| `피처중요도` (Feature Importance) | Per-feature permutation importance (importance_pp, more negative = more important) |
+**Per-model tabs in one master spreadsheet** (prefixed by model name):
 
-Tab titles stay Korean to match the existing sheet. Full column descriptions in `CLAUDE.md`.
+| Tab (per model `m`) | Content |
+|---|---|
+| `m` | Per-run stage detail log (det_change, n_features, adopted, threshold, elapsed_s) |
+| `m_실행요약` (Run Summary) | One line per run (fe_baseline, fe_det_fp1/fp5/fp10, fe_threshold, fe_features) |
+| `m_상세로그` (Detail Log) | Raw log of every stage |
+| `m_시나리오결과` (Scenario Results) | Per-scenario detection rate (FP=1%, 32 scenarios) |
+| `m_피처중요도` (Feature Importance) | Per-feature permutation importance (importance_pp, more negative = more important) |
+| `모델목록` (Hub) | Index of all models with `=HYPERLINK` jump links to each model's tabs |
+
+Tabs are auto-created on a model's first run. A service account on personal Gmail can't create new spreadsheets (0 Drive quota), so models are separated by tab prefix within the single shared master sheet, not separate files. Full column descriptions in `CLAUDE.md`.
 
 ---
 
