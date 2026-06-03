@@ -11,8 +11,7 @@ ps = from_config()
 only = sys.argv[1] if len(sys.argv) > 1 else None
 
 # 허브(모델목록)에 등록된 모델 목록
-models = sorted(ps._inited) if not only else [only]
-models = [m for m in models if m and m != "model"]
+models = [only] if only else sorted(m for m in ps._inited if m)
 if not models:
     print("등록된 모델 없음 (허브 비어있음)")
     sys.exit(0)

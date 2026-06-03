@@ -106,7 +106,3 @@ def commit_results(files: list[str], message: str, branch: str = None):
 
 def checkout(branch: str):
     _run(["git", "checkout", branch])
-
-
-def current_branch() -> str:
-    return _run(["git", "branch", "--show-current"])
