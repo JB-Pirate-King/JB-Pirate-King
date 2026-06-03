@@ -54,11 +54,19 @@ finally:
 
 from train_benchmark import (
     DCdetector,
+    Conv1DAE,
+    LSTMAutoencoder,
+    TCNAE,
     make_loaders,
     train_standard,
     SEED,
     VAL_RATIO,
 )
+
+# FE 지원 모델 (모두 단일 재구성 AE → 점수 ((out-x)^2).mean() / 제네릭 ONNX export 호환).
+# usad/tranad/anomtrans 는 forward 가 튜플 반환 → 점수 로직 변경 필요해 제외.
+# iforest/ocsvm 은 sklearn → 제외.
+FE_SUPPORTED_MODELS = ["dcdetect", "conv1d", "lstm", "tcn"]
 
 # ── 고정 상수 ──────────────────────────────────────────────────────
 SEQ_LEN         = 10
@@ -500,26 +508,45 @@ def prepare_tensor(raw_seqs: list, extra_names: list):
 
 
 # ── DCdetector 학습 ───────────────────────────────────────────────
-def train_dcdetect(
+def _build_model(model_name: str, n_feat: int, d_model: int = 64, nhead_max: int = 8):
+    """모델명 → nn.Module 생성. 모두 (B, SEQ_LEN, n_feat) → 동형 재구성 출력.
+
+    DCdetector 만 nhead 자동 조정 필요 (n_feat·d_model 공통 약수 중 최댓값).
+    conv1d/lstm/tcn 은 채널 수만 받으므로 n_feat 만 전달."""
+    if model_name == "dcdetect":
+        nhead = max(h for h in range(1, nhead_max + 1)
+                    if n_feat % h == 0 and d_model % h == 0)
+        return DCdetector(SEQ_LEN, n_feat, patch_size=2, d_model=d_model, nhead=nhead)
+    if model_name == "conv1d":
+        return Conv1DAE(n_feat, hidden_ch=32)
+    if model_name == "lstm":
+        return LSTMAutoencoder(input_size=n_feat, hidden_size=64, num_layers=2)
+    if model_name == "tcn":
+        return TCNAE(n_feat, hidden_ch=32, kernel_size=3, dilations=[1, 2, 4])
+    raise ValueError(f"FE 미지원 모델: {model_name} (지원: {FE_SUPPORTED_MODELS})")
+
+
+def train_recon_model(
+    model_name: str,
     tensor: torch.Tensor,
     n_feat: int,
     epochs: int,
     lr: float = 1e-3,
     batch_size: int = 256,
     patience: int = 5,
-    nhead_max: int = 8,
 ):
-    """DCdetector 학습 후 (model, val_loader) 반환.
-    nhead 는 n_feat 의 약수 중 nhead_max 이하 최댓값으로 자동 조정.
-    16피처 → nhead=8, 14피처 → nhead=2, 12피처 → nhead=4 등."""
+    """재구성 AE 학습 후 (model, val_loader) 반환. model_name 으로 아키텍처 분기.
+    학습 루프(train_standard)·로더·점수·export 는 모델 공통 (설계 무변경)."""
     device = torch.device("cpu")
-    d_model = 64
-    # n_feat % nhead == 0  AND  d_model % nhead == 0 을 동시에 만족하는 최대 nhead
-    nhead = max(h for h in range(1, nhead_max + 1) if n_feat % h == 0 and d_model % h == 0)
-    model = DCdetector(SEQ_LEN, n_feat, patch_size=2, d_model=d_model, nhead=nhead).to(device)
+    model = _build_model(model_name, n_feat).to(device)
     train_loader, val_loader = make_loaders(tensor, batch_size)
     train_standard(model, train_loader, val_loader, device, epochs, lr, patience)
     return model, val_loader
+
+
+def train_dcdetect(tensor, n_feat, epochs, **kw):
+    """하위호환 래퍼 — dcdetect 고정 (기존 호출부 보존용)."""
+    return train_recon_model("dcdetect", tensor, n_feat, epochs, **kw)
 
 
 # ── 임계값 계산 (실제 정상 시퀀스 기준 목표 FP) ──────────────────────
@@ -803,7 +830,7 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     print(f"{'─'*W}")
     t0 = time.time()
     tensor, scaler = prepare_tensor(train_seqs, current_extra)
-    model, val_loader = train_dcdetect(tensor, n_base_total, args.epochs)
+    model, val_loader = train_recon_model(args.model, tensor, n_base_total, args.epochs)
     det0, sc0, _, _ = evaluate(model, scaler, current_extra, args.n_anom,
                                raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
     elapsed = time.time() - t0
@@ -851,7 +878,7 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
                   end="", flush=True)
             t0 = time.time()
             tensor, scaler = prepare_tensor(train_seqs, trial_extra)
-            model, val_loader = train_dcdetect(tensor, n_feat, args.epochs)
+            model, val_loader = train_recon_model(args.model, tensor, n_feat, args.epochs)
             det, sc, _, _ = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=eval_seqs)
             elapsed = time.time() - t0
             score = _objective(sc, weak_names, weak_weight)
@@ -1060,6 +1087,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="DCdetect 피처 엔지니어링 자동화 (Greedy Forward Selection)"
     )
+    ap.add_argument("--model",    default="dcdetect", choices=FE_SUPPORTED_MODELS,
+                    help=f"FE 학습 모델 (기본: dcdetect, 지원: {FE_SUPPORTED_MODELS})")
     ap.add_argument("--input",    required=True,
                     help="전처리 CSV 경로")
     ap.add_argument("--base_dir", default=r"C:\Users\imcas",
@@ -1118,7 +1147,7 @@ def main():
     best_extra = best.get("extra", [])
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
     tensor_best, scaler_best = prepare_tensor(train_seqs, best_extra)
-    model_best, _ = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
+    model_best, _ = train_recon_model(args.model, tensor_best, best["n_feat"], args.epochs)
     perm_results = permutation_importance(
         model_best, scaler_best, best_extra, eval_normal_seqs, n_anom=args.n_anom
     )
@@ -1220,9 +1249,9 @@ def main():
             os.makedirs(args.export_dir, exist_ok=True)
             all_feat_names = BASE_FEATURES + best_extra
             n_feat         = best["n_feat"]
-            onnx_path      = os.path.join(args.export_dir, "model_dcdetect.onnx")
-            scaler_path    = os.path.join(args.export_dir, "scaler_dcdetect.json")
-            threshold_path = os.path.join(args.export_dir, "threshold_dcdetect.txt")
+            onnx_path      = os.path.join(args.export_dir, f"model_{args.model}.onnx")
+            scaler_path    = os.path.join(args.export_dir, f"scaler_{args.model}.json")
+            threshold_path = os.path.join(args.export_dir, f"threshold_{args.model}.txt")
 
             # ONNX (input "x", shape (1, SEQ_LEN, n_feat))
             model_best.eval()
