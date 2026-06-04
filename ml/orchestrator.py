@@ -817,6 +817,22 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
     })
     bot.log("\n".join(analysis), "피처개선")
 
+    # Ralph 닫힌 루프용: Claude 분석 + 약세 시나리오를 파일로 저장.
+    #   ralph_feature_invention.md 가 이 파일을 읽어 진단된 약세를 정조준해 새 피처 발명.
+    weak_line = next((l.strip() for l in out.splitlines()
+                      if "약세 시나리오(" in l), "")
+    try:
+        (WORK_DIR / "claude_fe_analysis.md").write_text(
+            f"# Claude FE 분석 (branch {branch}, iter {run_num:03d})\n\n"
+            f"채택: {', '.join(newly_adopted) or '없음'} | "
+            f"탐지율 {baseline_det}→{det_rate} | 총 {n_feat}피처\n\n"
+            f"## 약세 시나리오\n{weak_line}\n\n"
+            f"## Claude 분석\n" + "\n".join(analysis) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[claude_fe_analysis 저장 실패] {e}")
+
     if candidates:
         baseline_info = ""
         if baseline_det is not None and baseline_score is not None:

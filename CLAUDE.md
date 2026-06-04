@@ -250,6 +250,7 @@ Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
 Orchestrator only **selects** from the fixed `CANDIDATE_FEATURES` pool; never writes new feature code. The `ralph-loop` plugin closes the gap: re-feeds a prompt file each iteration so Claude **invents new candidate features**, growing the pool until convergence.
 
 - **Prompt file**: `ml/ralph_feature_invention.md` (English). Per iteration: pick weak scenario (<50%) → physical hypothesis → add ONE `(desc, lambda)` to `CANDIDATE_FEATURES` → validate via standalone FE → keep+commit if objective gain ≥ +3.0pp, revert if < 0 → log to `ml/.ralph_fe_log.md`. Done at 3 adopted features with `<promise>RALPH_FE_DONE</promise>`.
+- **Closed loop with orchestrator**: each FE run writes its Claude analysis (weak-scenario diagnosis + suggested feature *kinds*) to `ml/.pipeline_tmp/claude_fe_analysis.md` (`orchestrator._fe_run`). Ralph reads it as the primary invention direction → new candidates are grounded in the run's own data, not static guesses. Workflow: orchestrator converges → Ralph invents candidates targeting the diagnosed weaknesses → rerun orchestrator with the grown pool.
 - **Launch** (English prompt):
   ```
   /ralph-loop Execute the mission in ml/ralph_feature_invention.md exactly. Re-read that file at the start of every iteration and follow the procedure. --max-iterations 30 --completion-promise "RALPH_FE_DONE"

@@ -9,14 +9,17 @@ code that is not in the pool**.
 1. **Check past work**: read `ml/.ralph_fe_log.md` to see hypotheses/features already tried.
    Never repeat the same idea. If the file is empty, this is the first iteration.
 
-2. **Pick a weak scenario**: from the most recent FE output (`feat_eng_iter*.json` in
-   `ml/.pipeline_tmp/`, or a direct run's stdout), choose ONE scenario with detection
-   rate < 50%. If no record exists, target these known weak ones:
-   `D1-LowSlow`, `FN3-COG경계`, `G3-PhantomHDG`.
+2. **Read the run's own diagnosis (primary direction)**: read
+   `ml/.pipeline_tmp/claude_fe_analysis.md` — the orchestrator's Claude analysis from the
+   last converged run. Use its **weak-scenario list** and its **suggested feature *kinds***
+   (analysis item 4) as the primary target. This grounds invention in real run data, not a
+   guess. If the file is absent, fall back to the latest `feat_eng_iter*.json` weak
+   scenarios, or these known weak ones: `D1-LowSlow`, `FN3-COG경계`, `G3-PhantomHDG`.
 
-3. **Form a physical hypothesis**: 1-2 sentences on how this attack differs physically
-   from normal navigation. (e.g. "at low speed, heading-vs-course mismatch is normal, so a
-   linear feature can't catch it -> needs low-speed weighting".)
+3. **Form a physical hypothesis**: pick ONE weak scenario (<50%) from step 2 and write 1-2
+   sentences on how that attack differs physically from normal navigation, aligned with the
+   feature *kind* the analysis suggested. (e.g. "at low speed, heading-vs-course mismatch is
+   normal, so a linear feature can't catch it -> needs low-speed weighting".)
 
 4. **Write ONE feature**: add exactly ONE `(description, lambda seq, t: ...)` entry to the
    `CANDIDATE_FEATURES` dict in `ml/core/feature_engineer.py`. Rules:
