@@ -748,6 +748,8 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
          "--initial_extra"] + current_initial_extra + [
          "--export_dir", str(WORK_DIR / "model"),
          "--min_gain", str(args.min_gain),
+         "--overall_tol", str(args.overall_tol),
+         "--n_anom", str(args.n_anom if args.n_anom else args.max_mmsi),
          "--scan_ratio", str(args.scan_ratio)]
         + (["--max_candidates", str(args.max_candidates)] if args.max_candidates else [])
         + (["--candidates"] + args.candidates if args.candidates else [])
@@ -987,6 +989,10 @@ def main():
                         help="후보 스캔 학습 표본 비율 (예 0.4, 채택본은 풀 재학습). 1.0=풀")
     parser.add_argument("--candidates",      nargs="*", default=None,
                         help="탐색 후보 피처 명시 (Ralph/큐레이션 추천 10개 등). 미지정=전체 20개")
+    parser.add_argument("--n_anom",          type=int, default=None,
+                        help="시나리오당 이상 시퀀스 수. 미지정 시 max_mmsi 와 동일 (노이즈↓)")
+    parser.add_argument("--overall_tol",     type=float, default=1.0,
+                        help="채택 회귀 가드: 전체 FP1 이 이 값(pp) 넘게 하락하면 채택 거부")
     parser.add_argument("--auto_approve",    action="store_true",
                         help="Slack 승인 대기 없이 모든 단계 자동 approve (테스트용)")
     parser.add_argument("--max_runs",        type=int, default=50,

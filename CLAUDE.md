@@ -300,6 +300,12 @@ orchestrator.py defaults:
 - `--max_runs`: `50` (branch-chaining safety cap — prevents infinite looping before convergence)
 - `--build_plugin`: off (when set, builds the tar.gz via WSL. **Default off** — canonical build is native Linux. When off, only the C++ patch + model files are committed)
 - `--scan_ratio`: `1.0` (candidate-scan training subsample ratio, e.g. `0.4`. Baseline + all candidates train on the same seeded subsample for fair ranking; the adopted best is retrained on **full** data. ~2–3× faster scan, best pick usually unchanged.)
+- `--n_anom`: unset → equals `max_mmsi` (anomaly sequences per scenario; larger = less sampling noise in detection rates)
+- `--overall_tol`: `1.0` (adoption regression guard — reject a candidate whose objective rose but whose overall FP=1% detection drops > this many pp)
+
+### Objective function (stability)
+
+The Greedy objective is `mean_detection + 1.0 × weak_mean`, but detection per scenario is the **average over FP=1%/5%/10%** (`_combine_multifp`), not FP=1% alone. FP=1% is an extreme-tail (99th pct) threshold metric → tiny model changes cause large detection swings (the "들쑥날쑥"), which drives winner's curse and adopt-then-regress. Averaging across FP levels smooths the objective. A **regression guard** (`--overall_tol`) additionally rejects any adoption that improves the weak-weighted objective but drops overall FP=1% detection by more than the tolerance. Combined with per-call reseeding (`train_recon_model`), these stabilize selection.
 
 ### Branch chaining behavior (important)
 
