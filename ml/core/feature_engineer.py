@@ -279,6 +279,18 @@ CANDIDATE_FEATURES: dict = {
             if seq[t][_B["sog"]] < 3.0 else 0.0
         ),
     ),
+    # ── claude -p 발명 → 채택 승격 (dcdetect run, D1-LowSlow/드리프트, +17.1pp) ──
+    "drift_straightness": (
+        "누적 변위벡터 직진도 — |Σ속도벡터| / Σ|속도벡터| (곧장이동≈1, 표류<1)",
+        # 정상 직진: 속도벡터 합 크기 ≈ 경로 길이 → 1.0
+        # 저속 표류/배회: 벡터 상쇄 → 합 크기 << 경로 길이 → 0에 근접. D1-LowSlow 타겟.
+        lambda seq, t: (
+            math.hypot(sum(seq[k][_B["lon_speed"]] for k in range(t + 1)),
+                       sum(seq[k][_B["lat_speed"]] for k in range(t + 1)))
+            / max(sum(math.hypot(seq[k][_B["lon_speed"]], seq[k][_B["lat_speed"]])
+                      for k in range(t + 1)), 1e-6)
+        ),
+    ),
 }
 
 
