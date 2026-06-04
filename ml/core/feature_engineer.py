@@ -535,7 +535,15 @@ def train_recon_model(
     patience: int = 5,
 ):
     """재구성 AE 학습 후 (model, val_loader) 반환. model_name 으로 아키텍처 분기.
-    학습 루프(train_standard)·로더·점수·export 는 모델 공통 (설계 무변경)."""
+    학습 루프(train_standard)·로더·점수·export 는 모델 공통 (설계 무변경).
+
+    호출마다 고정 SEED 로 재시드 → 모든 후보가 동일 init 에서 학습되어
+    Greedy 비교가 공정(학습 노이즈 제거)하고, 채택 후 재학습 점수가 스캔 점수와
+    재현됨. (재시드 없으면 RNG 드리프트로 winner's curse — 운 좋은 후보를 채택한
+    뒤 재학습 시 회귀해 탐지율이 하락함.)"""
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
     device = torch.device("cpu")
     model = _build_model(model_name, n_feat).to(device)
     train_loader, val_loader = make_loaders(tensor, batch_size)
