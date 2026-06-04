@@ -346,7 +346,7 @@ def claude_invent_features(analysis_text: str, weak_line: str, n: int,
     with open(DYNAMIC_CAND_PATH, "w", encoding="utf-8") as f:
         f.write(header + code + "\n")
     print(f"[발명] {len(valid)}개 발명 → {DYNAMIC_CAND_PATH}: {list(valid)}")
-    return list(valid)
+    return [(name, desc) for name, (desc, fn) in valid.items()]
 
 
 def fe_adopted_analysis(out: str, adopted: list[str], det_rate,
@@ -1150,13 +1150,15 @@ def stage_invent(bot, args, analysis: list, weak_line: str,
     failed: 이전 라운드 실패 피처 이름 → 회피. round_n: 현재 라운드(로그)."""
     bot.log(f"🧬 *발명 라운드 {round_n}* — claude 가 약세 정조준 {args.invent}개 생성"
             + (f" (이전 실패 {len(failed)}개 회피)" if failed else ""), "피처개선")
-    invented = claude_invent_features("\n".join(analysis), weak_line, args.invent, failed=failed)
-    if invented:
-        bot.log(f"🧬 *발명 완료* {len(invented)}개: {', '.join(invented)}  → FE 진행",
-                "피처개선")
+    pairs = claude_invent_features("\n".join(analysis), weak_line, args.invent, failed=failed)
+    if pairs:
+        lines = [f"🧬 *발명 완료* {len(pairs)}개 (계산식):"]
+        for nm, ds in pairs:
+            lines.append(f"  • `{nm}` — {ds}")
+        bot.log("\n".join(lines), "피처개선")
     else:
         bot.log("⚠️ 발명 실패", "warning")
-    return invented
+    return [nm for nm, _ in pairs]
 
 
 # ─────────────────────────────────────────────
