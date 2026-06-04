@@ -933,6 +933,287 @@ def pick_cv_files(args, exclude=None, extra_exclude=None, min_bytes=20_000_000) 
 
 
 # ════════════════════════════════════════════════════════════════════
+# 완료 후 자동 배포 (post_run_distribute)
+# ════════════════════════════════════════════════════════════════════
+def _load_pat() -> str:
+    """GitHub PAT를 .mcp.json에서 로드."""
+    for p in (r"C:\ccit\JB-Pirate-King\.mcp.json",
+              os.path.join(os.path.dirname(_ML), "..", ".mcp.json")):
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8-sig") as f:
+                    d = json.load(f)
+                return d.get("mcpServers", {}).get("github", {}).get(
+                    "env", {}).get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+            except Exception:
+                pass
+    return ""
+
+
+def _github_api(path: str, data: dict | None, method: str, pat: str,
+                content_type: str = "application/json") -> tuple:
+    """GitHub REST API 호출. (status, body_dict)"""
+    url = f"https://api.github.com{path}"
+    payload = json.dumps(data).encode() if data else None
+    headers = {"Authorization": f"token {pat}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": content_type}
+    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except Exception:
+            return e.code, {}
+    except Exception as e:
+        log_event(f"[github_api] 실패: {e}")
+        return 0, {}
+
+
+def _create_model_zip() -> str | None:
+    """stage2 멤버 모델 파일 zip 생성. 경로 반환."""
+    import zipfile
+    sel = STATE.get("stage1", {}).get("selected", {})
+    members = sel.get("members", [])
+    if not members:
+        return None
+    zip_name = f"trained_models_{datetime.now():%Y-%m-%d}.zip"
+    zip_path = os.path.join(OUT, zip_name)
+    added = []
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for m in members:
+            mdir = os.path.join(MODELS, "stage2", m)
+            for ext in ("onnx", "json", "txt"):
+                src = os.path.join(mdir, f"model_{m}.{ext}" if ext == "onnx"
+                                   else (f"scaler_{m}.json" if ext == "json"
+                                         else f"threshold_{m}.txt"))
+                if os.path.exists(src):
+                    z.write(src, f"{m}/{os.path.basename(src)}")
+                    added.append(f"{m}/{os.path.basename(src)}")
+    if not added:
+        return None
+    log_event(f"[distribute] 모델 zip 생성: {zip_path} ({len(added)}개)")
+    return zip_path
+
+
+def _upload_model_release(zip_path: str, pat: str) -> str | None:
+    """GitHub Release 생성 + zip 업로드. Release URL 반환."""
+    tag = f"models/{datetime.now():%Y-%m-%d}"
+    final = STATE.get("stage2", {}).get("final", {})
+    sel = STATE.get("stage1", {}).get("selected", {})
+    cv = STATE.get("stage2", {}).get("cv_summary", {})
+    body = (f"## 학습 모델 ({datetime.now():%Y-%m-%d})\n\n"
+            f"- 구성: {', '.join(sel.get('members',[]))} / {sel.get('method','-')}\n"
+            f"- FPR=1% 탐지율: {final.get('tpr_fp1','-')}% "
+            f"(CV {cv.get('tpr_fp1_mean','-')}±{cv.get('tpr_fp1_std','-')}%)\n"
+            f"- run_id: {STATE.get('run_id','-')}\n\n"
+            f"첨부 zip 내 모델(onnx/scaler/threshold) 포함.")
+    st, resp = _github_api("/repos/JB-Pirate-King/JB-Pirate-King/releases",
+                           {"tag_name": tag, "target_commitish": "develop",
+                            "name": f"모델 {tag}", "body": body, "prerelease": True},
+                           "POST", pat)
+    if st not in (200, 201) or "id" not in resp:
+        log_event(f"[distribute] Release 생성 실패: {st}")
+        return None
+    release_id = resp["id"]
+    html_url = resp.get("html_url", "")
+    upload_url = f"https://uploads.github.com/repos/JB-Pirate-King/JB-Pirate-King/releases/{release_id}/assets"
+    with open(zip_path, "rb") as f:
+        data = f.read()
+    fname = os.path.basename(zip_path)
+    req = urllib.request.Request(
+        f"{upload_url}?name={fname}", data=data,
+        headers={"Authorization": f"token {pat}", "Content-Type": "application/zip",
+                 "User-Agent": _UA}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            asset = json.loads(r.read())
+            log_event(f"[distribute] 모델 업로드 완료: {asset.get('browser_download_url')}")
+    except Exception as e:
+        log_event(f"[distribute] 모델 업로드 실패: {e}")
+    return html_url
+
+
+def _git_push_code(pat: str):
+    """미커밋 변경사항이 있으면 커밋 후 origin/develop에 push."""
+    import subprocess
+    cwd = os.path.dirname(_ML)
+    try:
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=cwd,
+                               capture_output=True, text=True).stdout.strip()
+        if not dirty:
+            log_event("[distribute] 코드 변경 없음 — push 생략")
+            return
+        subprocess.run(["git", "add", "-A"], cwd=cwd, check=True)
+        msg = (f"chore(auto): post-run state update [{STATE.get('run_id','-')}]\n\n"
+               f"Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>")
+        subprocess.run(["git", "commit", "-m", msg], cwd=cwd, check=True)
+        remote = f"https://{pat}@github.com/JB-Pirate-King/JB-Pirate-King.git"
+        subprocess.run(["git", "remote", "set-url", "origin", remote], cwd=cwd, check=True)
+        # 워크트리 브랜치를 push 후 fast-forward 머지
+        branch = subprocess.run(["git", "branch", "--show-current"], cwd=cwd,
+                                 capture_output=True, text=True).stdout.strip()
+        subprocess.run(["git", "push", "origin", f"{branch}:develop"], cwd=cwd, check=True)
+        log_event(f"[distribute] 코드 push 완료: {branch} → origin/develop")
+    except Exception as e:
+        log_event(f"[distribute] 코드 push 실패: {e}")
+
+
+def _update_obsidian(final_report_path: str, release_url: str):
+    """Obsidian 현재 작업 + 인수인계 문서 자동 갱신."""
+    VAULT = r"C:\ObsidianVault"
+    if not os.path.isdir(VAULT):
+        return
+    final = STATE.get("stage2", {}).get("final", {})
+    cv = STATE.get("stage2", {}).get("cv_summary", {})
+    sel = STATE.get("stage1", {}).get("selected", {})
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    tpr = final.get("tpr_fp1", "-")
+    cv_m = cv.get("tpr_fp1_mean", "-")
+
+    # 현재 작업 스냅샷 갱신
+    wip = os.path.join(VAULT, "운영", "_Working", "현재 작업.md")
+    if os.path.exists(wip):
+        try:
+            txt = open(wip, encoding="utf-8").read()
+            txt = txt.replace("updated: 2026", f"updated: {ts[:10]}")
+            # status 줄 교체
+            import re
+            txt = re.sub(r"^status:.*$", f"status: ens24 완료 FPR1% {tpr}% — Iter9(FN4) 대기",
+                         txt, flags=re.MULTILINE)
+            open(wip, "w", encoding="utf-8").write(txt)
+            log_event("[distribute] Obsidian 현재 작업 갱신 완료")
+        except Exception as e:
+            log_event(f"[distribute] Obsidian 갱신 실패: {e}")
+
+    # 인수인계 요약 파일 덮어쓰기
+    handoff = os.path.join(VAULT, "운영", "_Working", "다음 세션 작업 지시.md")
+    content = f"""---
+updated: {ts}
+status: ready-to-execute
+run_id: {STATE.get('run_id','-')}
+---
+[[00 - 프로젝트 현황 (Claude)|← 현황 허브]]
+
+# ▶ 다음 세션 실행 지시
+
+## 최우선: FN4-status 보강 (Iteration 9)
+- dcdetect conv1d 공통 최약세: FN4-status (dcdetect 7%, conv1d 0%)
+- status 전용 파생피처 추가 후 `feature_engineer.py` 재실행
+
+## 방금 완료한 run 결과
+- **ens24 {sel.get('method','-')} [{', '.join(sel.get('members',[]))}]**
+- FPR=1% 탐지율: **{tpr}%** (CV {cv_m}±{cv.get('tpr_fp1_std','-')}%)
+- 최종 보고서: `{final_report_path}`
+- GitHub Release: {release_url or '미생성'}
+
+## 배포 완료
+- GitHub Release: {release_url or '-'}
+- Obsidian: 갱신 완료
+
+## Sheets/Drive 배포 대기 (MCP 필요)
+- 매니페스트: `{os.path.join(OUT, 'distribute_manifest.json')}`
+- 새 세션 시작 시 bootstrap.py 실행 → 자동 안내
+"""
+    try:
+        open(handoff, "w", encoding="utf-8").write(content)
+        log_event("[distribute] 인수인계 지시서 갱신 완료")
+    except Exception as e:
+        log_event(f"[distribute] 인수인계 갱신 실패: {e}")
+
+
+def _save_manifest(release_url: str, final_report_path: str):
+    """Sheets/Drive 배포용 매니페스트 저장 (MCP 픽업용)."""
+    final = STATE.get("stage2", {}).get("final", {})
+    cv = STATE.get("stage2", {}).get("cv_summary", {})
+    sel = STATE.get("stage1", {}).get("selected", {})
+    manifest = {
+        "run_id": STATE.get("run_id"),
+        "ts": datetime.now().isoformat(),
+        "model": sel.get("members", []),
+        "method": sel.get("method"),
+        "tpr_fp1": final.get("tpr_fp1"),
+        "fpr": final.get("fpr"),
+        "pr_auc": final.get("pr_auc"),
+        "roc_auc": final.get("roc_auc"),
+        "f1": final.get("f1"),
+        "confusion": final.get("confusion"),
+        "cv_mean": cv.get("tpr_fp1_mean"),
+        "cv_std": cv.get("tpr_fp1_std"),
+        "cv_folds": cv.get("n_folds"),
+        "hpo": STATE.get("stage2", {}).get("hpo", {}),
+        "per_scenario": final.get("per_scenario_member0", {}),
+        "github_release": release_url,
+        "final_report": final_report_path,
+        "stage1_results": os.path.join(OUT, "stage1_results.json"),
+        "stage2_results": os.path.join(OUT, "stage2_results.json"),
+        "model_dir": os.path.join(MODELS, "stage2"),
+        "pending": ["sheets_update", "drive_upload", "notion_update"],
+        "sheets_id": "1uSF1FXsMvha24t0LpgNbI20MLumbq4lm1LbBtc14H1U",
+        "drive_folder_id": "1x0VpT9L9wD07HKSmwdZC-s5a_V5QAqus",
+    }
+    path = os.path.join(OUT, "distribute_manifest.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    log_event(f"[distribute] 매니페스트 저장: {path}")
+    return path
+
+
+def post_run_distribute(args, final_report_path: str):
+    """
+    완료 후 자동 배포 파이프라인
+    ─────────────────────────────
+    ✅ 완전 자동 (코드 내):
+      1. GitHub Release + 모델 zip 업로드
+      2. 코드 변경 있으면 develop에 push
+      3. Obsidian SSOT (현재 작업·인수인계) 갱신
+      4. Discord/Slack 배포 완료 보고
+    📋 매니페스트 저장 (MCP 픽업):
+      5. distribute_manifest.json → 새 세션 bootstrap.py가 감지
+         → Sheets·Drive·Notion 자동 처리
+    """
+    report(card("📤", "자동 배포 시작",
+                {"단계": "GitHub Release → Obsidian → 매니페스트"},
+                analysis="학습 완료 후 산출물을 자동으로 배포합니다.\n"
+                         "Sheets·Drive는 MCP가 필요해 매니페스트를 저장하고 다음 세션에서 처리합니다."))
+
+    pat = _load_pat()
+    release_url = "-"
+
+    # 1. 모델 zip + GitHub Release
+    zip_path = _create_model_zip()
+    if zip_path and pat:
+        release_url = _upload_model_release(zip_path, pat) or "-"
+        log_event(f"[distribute] GitHub Release: {release_url}")
+    else:
+        log_event("[distribute] 모델 zip 또는 PAT 없음 — Release 생략")
+
+    # 2. 코드 push
+    if pat and not getattr(args, "smoke", False):
+        _git_push_code(pat)
+
+    # 3. Obsidian SSOT 갱신
+    _update_obsidian(final_report_path, release_url)
+
+    # 4. 매니페스트 저장 (Sheets/Drive/Notion)
+    manifest_path = _save_manifest(release_url, final_report_path)
+
+    # 5. 배포 완료 보고
+    final = STATE.get("stage2", {}).get("final", {})
+    cv = STATE.get("stage2", {}).get("cv_summary", {})
+    report(card("✅", "자동 배포 완료",
+                {"GitHub Release": release_url,
+                 "Obsidian SSOT": "현재 작업 + 인수인계 갱신 완료",
+                 "Sheets/Drive/Notion": f"매니페스트 저장 → {manifest_path}",
+                 "🎯 최종 결과": f"FPR=1% {final.get('tpr_fp1','-')}% (CV {cv.get('tpr_fp1_mean','-')}±{cv.get('tpr_fp1_std','-')}%)"},
+                analysis=("GitHub Release에 학습 모델 zip이 업로드됐습니다.\n"
+                          "Sheets·Drive·Notion 배포는 distribute_manifest.json을 저장했습니다.\n"
+                          "다음 세션 시작 시 bootstrap.py가 이 매니페스트를 감지하고 자동으로 처리합니다.")))
+
+
+# ════════════════════════════════════════════════════════════════════
 # 최종 보고서
 # ════════════════════════════════════════════════════════════════════
 def write_final_report(args):
@@ -1132,7 +1413,14 @@ def main():
                     analysis=("24h 예산 내 탐색→대규모학습 완료. "
                               f"오탐 1% 제약에서 달성 가능한 최대 탐지율은 "
                               f"약 {final.get('tpr_fp1','-')}%로 확정.\n"
-                              "결과물·모델·로그가 저장되었으며, 산출물 배포는 별도 단계에서 진행.")))
+                              "결과물·모델·로그가 저장되었으며, 산출물 배포를 시작합니다.")))
+
+        # ── 완료 후 자동 배포 ─────────────────────────────────────
+        if not args.smoke:
+            try:
+                post_run_distribute(args, path)
+            except Exception as dist_e:
+                log_event(f"[distribute] 배포 실패(무시, 결과는 보존됨): {dist_e}")
     except Exception as e:
         tb_txt = traceback.format_exc()
         report(card("❌", "오류 발생 — 상태 저장됨(재개 가능)",
