@@ -73,3 +73,6 @@ build/
 # 민감한 설정 파일
 ml/pipeline_config.json
 ml/google_credentials.json
+
+# caveman-compress backups
+*.original.md
