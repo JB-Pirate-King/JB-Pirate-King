@@ -2,14 +2,14 @@
 
 ## Pre-Push Checklist
 
-Whenever code or structure changes, keep ALL docs in sync. Before pushing code or when asked to push, always check and update the following first:
+On code/structure change, keep ALL docs in sync. Before push (or when asked to push), check + update first:
 
-1. **README.md / ml/README.md** — Verify that any changed features, paths, or options are reflected in the docs.
-2. **CLAUDE.md (this file)** — Update so a fresh session can immediately understand the current state.
-3. **Notion** — Update the methodology/results pages. Use `python ml/integrations/notify.py` helpers (token in `ml/notify_config.json`, gitignored).
-4. **Source code comments** — Verify that comments in modified functions/classes match current behavior.
+1. **README.md / ml/README.md** — reflect changed features, paths, options.
+2. **CLAUDE.md (this file)** — update so a fresh session grasps current state.
+3. **Notion** — update methodology/results pages via `python ml/integrations/notify.py` (token in `ml/notify_config.json`, gitignored).
+4. **Source code comments** — match current behavior of modified functions/classes.
 
-> Rule of thumb: a code/structure change is not "done" until README + CLAUDE.md + Notion reflect it.
+> Rule: a code/structure change isn't "done" until README + CLAUDE.md + Notion reflect it.
 
 > **Docs language: English.** All Markdown docs and any prompt-as-file (e.g. `ml/ralph_feature_invention.md`) are written in English.
 
@@ -17,7 +17,7 @@ Whenever code or structure changes, keep ALL docs in sync. Before pushing code o
 
 ## Project Overview
 
-AIS anomaly detection system for ships. Consists of an OpenCPN plugin (C++), an ML pipeline (Python), and a local server (Python/Docker).
+AIS ship anomaly detection. OpenCPN plugin (C++) + ML pipeline (Python) + local server (Python/Docker).
 
 ---
 
@@ -186,17 +186,17 @@ dcdetect_002: previous features + Greedy adopt 1 feature → ...
 
 ### Stability fixes (commit 723368a — 11 issues)
 
-The autonomous chaining path was hardened. Key items a fresh session must know:
+Autonomous chaining hardened. Fresh session must know:
 
-- **Branch chaining accumulates in git history** (`git_manager.create_branch`): `dcdetect_NNN` branches **off the previous run branch** (`_002` base = `_001`), not always `develop`. First run (or missing previous) branches off `develop`.
-- **fe_state.json is committed every run** (orchestrator): adoption history travels in git history, not via an uncommitted working-tree file.
-- **develop is always restored** via `try/finally` in `main()` (normal exit, user stop, or crash).
-- **Slack `connect()` (not `start()`)**: avoids a global `signal.signal` monkeypatch leak that broke Ctrl+C; real connection is polled (not a blind `sleep`).
-- **Approval timeout** (`SlackPipelineBot.APPROVAL_TIMEOUT`, 3600s) → returns `stop` to avoid hanging forever.
-- **Stale-button guard**: each approval message carries a uuid token; clicks on old messages are ignored.
-- **`--max_runs`** (default 50) safety cap to prevent infinite chaining before convergence.
-- **`--build_plugin`** gate (default off): the WSL `tar.gz` build is opt-in; the canonical build is native Linux. When off, only the C++ patch + model files are committed.
-- Subprocesses use `sys.executable` (not bare `python`); `det_rate == 0.0` no longer renders as `?`; `run_cmd` buffers output with a bounded `deque`.
+- **Branch chaining accumulates in git history** (`git_manager.create_branch`): `dcdetect_NNN` branches **off the previous run branch** (`_002` base = `_001`), not `develop`. First run (or missing previous) branches off `develop`.
+- **fe_state.json committed every run** (orchestrator): adoption history in git history, not an uncommitted working-tree file.
+- **develop always restored** via `try/finally` in `main()` (exit, user stop, crash).
+- **Slack `connect()` (not `start()`)**: avoids a global `signal.signal` monkeypatch leak breaking Ctrl+C; connection polled, not blind `sleep`.
+- **Approval timeout** (`SlackPipelineBot.APPROVAL_TIMEOUT`, 3600s) → returns `stop`, no infinite hang.
+- **Stale-button guard**: each approval carries a uuid token; old-message clicks ignored.
+- **`--max_runs`** (default 50): cap against infinite chaining before convergence.
+- **`--build_plugin`** gate (default off): WSL `tar.gz` build opt-in; canonical build is native Linux. Off → only C++ patch + model files committed.
+- Subprocesses use `sys.executable` (not bare `python`); `det_rate == 0.0` no longer renders `?`; `run_cmd` buffers output with a bounded `deque`.
 
 ### Auxiliary systems
 
@@ -247,9 +247,9 @@ Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
 
 ## Ralph Loop: Autonomous Feature Invention
 
-The orchestrator only **selects** from the fixed `CANDIDATE_FEATURES` pool; it never writes new feature code. The `ralph-loop` plugin closes that gap: it re-feeds a prompt file each iteration so Claude **invents new candidate features** and grows the pool until convergence.
+Orchestrator only **selects** from the fixed `CANDIDATE_FEATURES` pool; never writes new feature code. The `ralph-loop` plugin closes the gap: re-feeds a prompt file each iteration so Claude **invents new candidate features**, growing the pool until convergence.
 
-- **Prompt file**: `ml/ralph_feature_invention.md` (English). Per iteration: pick a weak scenario (<50%) → form a physical hypothesis → add ONE `(desc, lambda)` to `CANDIDATE_FEATURES` → validate via standalone FE → keep (commit) if objective gain ≥ +3.0pp, revert if < 0 → log to `ml/.ralph_fe_log.md`. Completes at 3 adopted features with `<promise>RALPH_FE_DONE</promise>`.
+- **Prompt file**: `ml/ralph_feature_invention.md` (English). Per iteration: pick weak scenario (<50%) → physical hypothesis → add ONE `(desc, lambda)` to `CANDIDATE_FEATURES` → validate via standalone FE → keep+commit if objective gain ≥ +3.0pp, revert if < 0 → log to `ml/.ralph_fe_log.md`. Done at 3 adopted features with `<promise>RALPH_FE_DONE</promise>`.
 - **Launch** (English prompt):
   ```
   /ralph-loop Execute the mission in ml/ralph_feature_invention.md exactly. Re-read that file at the start of every iteration and follow the procedure. --max-iterations 30 --completion-promise "RALPH_FE_DONE"
@@ -461,7 +461,7 @@ Column layout per tab (titles kept Korean for continuity):
 
 ### Deploying a trained model to the plugin
 
-Training exports `model_{name}.onnx` / `scaler_{name}.json` / `threshold_{name}.txt`, but the plugin loads **fixed names** (fallback when no `ensemble_config.json`): `model.onnx` / `scaler.json` / `threshold.txt` (`ais_ids.cpp` `LoadMLFromConfig`). So the files must be **renamed** into the runtime load location:
+Training exports `model_{name}.onnx` / `scaler_{name}.json` / `threshold_{name}.txt`, but the plugin loads **fixed names** (fallback when no `ensemble_config.json`): `model.onnx` / `scaler.json` / `threshold.txt` (`ais_ids.cpp` `LoadMLFromConfig`). Rename into the runtime load location:
 
 ```bash
 DEST="$HOME/.opencpn/plugins/ais_ids_pi/data"
