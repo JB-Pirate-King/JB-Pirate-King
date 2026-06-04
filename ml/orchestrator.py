@@ -1304,7 +1304,10 @@ def main():
                                           invent["failed"], invent["round"])
                     if re_inv:
                         args.candidates = re_inv
-                        git.checkout("develop")   # 실패 브랜치 버리고 새 브랜치로
+                        # 재발명은 같은 run 번호 유지 → 실패 브랜치 삭제 후 재생성.
+                        #   (채택돼야 번호 증가; 실패 라운드는 번호 안 먹음)
+                        git.delete_branch(branch)
+                        iters -= 1   # 이 run 은 재시도라 카운트 미반영
                         continue
                 # 재발명 불가/실패 또는 비발명 모드 → 종료
                 note = (f"발명 {invent['round']}라운드 시도, 채택 없음"
