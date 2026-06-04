@@ -809,6 +809,15 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     current_extra: list = list(INITIAL_EXTRA)
     # accel 등 INITIAL_EXTRA에 포함된 항목은 다시 탐색하지 않음
     remaining: list = [k for k in CANDIDATE_FEATURES.keys() if k not in INITIAL_EXTRA]
+    # 후보 명시 (--candidates): 지정한 이름만 탐색 (Ralph/큐레이션 추천 풀).
+    #   CANDIDATE_FEATURES 에 있고 INITIAL_EXTRA(기채택) 아닌 것만 유효.
+    cand_list = getattr(args, "candidates", None)
+    if cand_list:
+        remaining = [k for k in cand_list
+                     if k in CANDIDATE_FEATURES and k not in INITIAL_EXTRA]
+        unknown = [k for k in cand_list if k not in CANDIDATE_FEATURES]
+        if unknown:
+            print(f"  [경고] CANDIDATE_FEATURES 에 없는 후보 무시: {unknown}")
     # 후보 수 제한 (--max_candidates): 정의 순서대로 앞 N개만 탐색 (속도)
     max_cand = getattr(args, "max_candidates", None)
     if max_cand is not None and max_cand > 0:
@@ -1127,6 +1136,9 @@ def main():
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
     ap.add_argument("--max_candidates", type=int, default=None,
                     help="Greedy 후보 수 제한 (정의 순서 앞 N개만, 속도용)")
+    ap.add_argument("--candidates", nargs="*", default=None,
+                    help="탐색할 후보 피처 이름 명시 (Ralph/큐레이션 추천 풀). "
+                         "미지정 시 CANDIDATE_FEATURES 전체")
     ap.add_argument("--scan_ratio", type=float, default=1.0,
                     help="후보 스캔 학습 표본 비율 (예 0.4 = 40%%만, 채택본은 풀 재학습). "
                          "1.0=풀(기본). 순위만 보므로 best 선택은 보통 동일, 스캔 2~3배 빠름")
