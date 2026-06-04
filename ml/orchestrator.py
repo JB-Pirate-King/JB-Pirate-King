@@ -1109,6 +1109,7 @@ def stage_invent(bot, args) -> list:
          "--n_anom", str(args.n_anom if args.n_anom else args.max_mmsi),
          "--initial_extra",                    # 빈값 = 순수 베이스 12피처
          "--candidates",                       # 빈값 = 후보 0 (베이스전용 진단)
+         "--diagnose_only",                    # 약세 진단까지만 (재학습/순열중요도 생략)
          "--out_json", out_json]
         + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
         progress_cb=diag_progress,
