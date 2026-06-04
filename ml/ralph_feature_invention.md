@@ -33,15 +33,19 @@ code that is not in the pool**.
      materially from existing features.
    - In a comment, state the target scenario + physical rationale.
 
-5. **Validate**: run FE standalone (small data, fast):
+5. **Validate** at the same scale as the main run (trustworthy gain). Isolate your new
+   feature with `--candidates` so FE only trains baseline + your one feature (not the whole
+   pool):
    ```
    python ml/core/feature_engineer.py \
-     --input D:/ais_data/preprocessed/ais_preprocessed_3yr.csv \
-     --base_dir D:/ --max_mmsi 50 --epochs 1 --max_steps 1 \
+     --input C:/ais_data/preprocessed/ais_preprocessed_3yr.csv \
+     --base_dir C:/ --max_mmsi 6000 --epochs 10 --max_steps 1 \
+     --candidates <YOUR_NEW_FEATURE_NAME> \
      --out_json ml/.ralph_tmp.json
    ```
-   In the candidate evaluation table, read the objective-score gain (the number after
-   `▲`/`▼`) on **the row for the feature you added**.
+   (~40 min: one baseline + one candidate at 6000 MMSI, full data — no scan subsample, so the
+   gain is reliable.) In the candidate evaluation table, read the objective-score gain (the
+   number after `▲`/`▼`) on **the row for the feature you added**.
 
 6. **Decide + act**:
    - gain **>= +3.0pp**: success. Keep the feature.
