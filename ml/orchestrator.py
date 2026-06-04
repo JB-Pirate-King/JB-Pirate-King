@@ -747,7 +747,8 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
          "--max_steps", "1",
          "--initial_extra"] + current_initial_extra + [
          "--export_dir", str(WORK_DIR / "model"),
-         "--min_gain", str(args.min_gain)]
+         "--min_gain", str(args.min_gain),
+         "--scan_ratio", str(args.scan_ratio)]
         + (["--max_candidates", str(args.max_candidates)] if args.max_candidates else [])
         + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
         progress_cb=fe_progress
@@ -981,6 +982,8 @@ def main():
                         help="FE 채택 임계 목적점수 향상량 (기본: 3.0, 테스트 시 0.1)")
     parser.add_argument("--max_candidates",  type=int, default=None,
                         help="Greedy 후보 수 제한 (앞 N개만 탐색, 속도용)")
+    parser.add_argument("--scan_ratio",      type=float, default=1.0,
+                        help="후보 스캔 학습 표본 비율 (예 0.4, 채택본은 풀 재학습). 1.0=풀")
     parser.add_argument("--auto_approve",    action="store_true",
                         help="Slack 승인 대기 없이 모든 단계 자동 approve (테스트용)")
     parser.add_argument("--max_runs",        type=int, default=50,
