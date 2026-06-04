@@ -106,3 +106,14 @@ def commit_results(files: list[str], message: str, branch: str = None):
 
 def checkout(branch: str):
     _run(["git", "checkout", branch])
+
+
+def delete_branch(branch: str, base: str = "develop"):
+    """브랜치 삭제 (로컬 + PUSH_REMOTE). 현재 브랜치면 먼저 base 로 이동.
+    재발명 실패 라운드 정리용 — 같은 run 번호 재사용 위해."""
+    cur = _run(["git", "branch", "--show-current"])
+    if cur == branch:
+        _run(["git", "checkout", base])
+    _run(["git", "branch", "-D", branch])
+    subprocess.run(["git", "push", PUSH_REMOTE, "--delete", branch],
+                   capture_output=True, text=True, encoding="utf-8", errors="replace")

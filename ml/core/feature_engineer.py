@@ -686,9 +686,10 @@ def evaluate(
                 sum(1 for s in anom_scores if s > thr) / len(anom_scores) * 100.0
             )
 
-    # extra_fp 출력
+    # extra_fp 출력 (FP=1% 도 같은 [FP≈N%] 형식으로 함께 표기 → Slack 일관성)
     if extra_fp:
         W = 52
+        print(f"\n  [FP≈1%] 평균 탐지율 {float(np.mean(all_dets)):.1f}%")
         for fp in sorted(extra_fp):
             sc_dets = extra_results[fp]
             avg = float(np.mean(list(sc_dets.values())))
