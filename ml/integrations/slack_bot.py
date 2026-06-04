@@ -165,10 +165,13 @@ class SlackPipelineBot:
     }
 
     def log(self, message: str, level: str = "info"):
-        emoji = self.STAGE_EMOJI.get(level, "ℹ️")
+        # 메시지가 이미 이모지/기호로 시작하면 level 이모지를 덧붙이지 않음 (이중 이모지 방지)
+        first = message.lstrip()[:1]
+        has_lead_emoji = bool(first) and ord(first) > 0x2000
+        prefix = "" if has_lead_emoji else self.STAGE_EMOJI.get(level, "ℹ️") + " "
         self.app.client.chat_postMessage(
             channel=self.channel,
-            text=f"{emoji} {message}"
+            text=f"{prefix}{message}"
         )
 
     def log_run_start(self, branch: str, params: dict):
