@@ -1079,7 +1079,8 @@ def stage_invent(bot, args) -> list:
          "--epochs", str(args.epochs),
          "--max_mmsi", str(args.max_mmsi),
          "--n_anom", str(args.n_anom if args.n_anom else args.max_mmsi),
-         "--candidates",                       # 빈값 = 베이스전용 진단
+         "--initial_extra",                    # 빈값 = 순수 베이스 12피처
+         "--candidates",                       # 빈값 = 후보 0 (베이스전용 진단)
          "--out_json", out_json]
         + (["--holdout_file", args.holdout_file] if args.holdout_file else [])
     )
