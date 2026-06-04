@@ -1071,6 +1071,34 @@ def stage_invent(bot, args) -> list:
     out_json = str(WORK_DIR / "baseline_diag.json")
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+
+    _diag_done = {"phase2": False}
+
+    def diag_progress(line, proc=None):
+        """진단 단계 Slack 라이브 보고 (마일스톤만, 스팸 방지)."""
+        s = line.strip()
+        m = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*val=([\d.]+)", line)
+        if m:
+            ep, tot = int(m.group(1)), int(m.group(2))
+            if ep == 1 or ep == tot or ep == max(1, tot // 2):
+                label = "재학습" if _diag_done["phase2"] else "베이스 진단"
+                bot.log(f"🧠 {label} 학습 Epoch {ep}/{tot} (val={m.group(3)})  "
+                        f"[{(time.time()-t0)/60:.0f}분]", "피처개선")
+            return
+        if "전체 평균 탐지율" in s:
+            bot.log(f"📊 베이스라인(12피처): {s}", "피처개선"); return
+        if "약세 시나리오(" in s:
+            bot.log(f"⚠️ {s}", "피처개선"); return
+        if "최적 피처셋" in s and "재학습" in s:
+            _diag_done["phase2"] = True
+            bot.log("🔁 진단 모델 재학습 + 순열중요도 계산...", "피처개선"); return
+        if "Permutation Importance 계산" in s:
+            bot.log("🔑 순열 중요도 계산 중...", "피처개선"); return
+        mfp = re.search(r"FP=1%:\s*([\d.]+)%\s+FP=5%:\s*([\d.]+)%\s+FP=10%:\s*([\d.]+)%", s)
+        if mfp:
+            bot.log(f"📈 진단 최종 — FP1 {mfp.group(1)}% / FP5 {mfp.group(2)}% / "
+                    f"FP10 {mfp.group(3)}%", "피처개선"); return
+
     ret, out = run_cmd(
         [sys.executable, "ml/core/feature_engineer.py",
          "--model", args.model,
@@ -1082,7 +1110,8 @@ def stage_invent(bot, args) -> list:
          "--initial_extra",                    # 빈값 = 순수 베이스 12피처
          "--candidates",                       # 빈값 = 후보 0 (베이스전용 진단)
          "--out_json", out_json]
-        + (["--holdout_file", args.holdout_file] if args.holdout_file else [])
+        + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
+        progress_cb=diag_progress,
     )
     elapsed = time.time() - t0
     if ret != 0:
