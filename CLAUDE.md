@@ -299,6 +299,7 @@ orchestrator.py defaults:
 - `--min_gain`: `3.0` (Greedy adoption threshold, objective-score gain)
 - `--max_runs`: `50` (branch-chaining safety cap — prevents infinite looping before convergence)
 - `--build_plugin`: off (when set, builds the tar.gz via WSL. **Default off** — canonical build is native Linux. When off, only the C++ patch + model files are committed)
+- `--scan_ratio`: `1.0` (candidate-scan training subsample ratio, e.g. `0.4`. Baseline + all candidates train on the same seeded subsample for fair ranking; the adopted best is retrained on **full** data. ~2–3× faster scan, best pick usually unchanged.)
 
 ### Branch chaining behavior (important)
 

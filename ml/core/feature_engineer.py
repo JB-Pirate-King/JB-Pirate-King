@@ -815,6 +815,18 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
         remaining = remaining[:max_cand]
     history: list = []
 
+    # 스캔 서브샘플(--scan_ratio): 후보 평가(베이스+후보)만 부분표본으로 빠르게.
+    #   채택 best 1개는 main 에서 풀 train_seqs 로 재학습 → 배포 정확도 유지.
+    #   eval(탐지율)은 항상 풀 홀드아웃 → 순위 비교 공정. 고정 SEED 로 동일 표본.
+    scan_ratio = getattr(args, "scan_ratio", 1.0)
+    if scan_ratio < 1.0 and len(train_seqs) > 1:
+        n_scan = max(1, int(len(train_seqs) * scan_ratio))
+        scan_seqs = random.Random(SEED).sample(train_seqs, n_scan)
+        print(f"  [스캔 서브샘플] 후보 평가 {n_scan:,}/{len(train_seqs):,} 시퀀스 "
+              f"({scan_ratio:.0%}) — 채택본은 풀 데이터 재학습")
+    else:
+        scan_seqs = train_seqs
+
     n_base_total = len(BASE_FEATURES) + len(current_extra)
     W = 65
     print("\n" + "=" * W)
@@ -831,7 +843,7 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     print(f"[베이스라인]  피처 {n_base_total}개: {BASE_FEATURES + current_extra}")
     print(f"{'─'*W}")
     t0 = time.time()
-    tensor, scaler = prepare_tensor(train_seqs, current_extra)
+    tensor, scaler = prepare_tensor(scan_seqs, current_extra)
     model, val_loader = train_recon_model(args.model, tensor, n_base_total, args.epochs)
     det0, sc0, _, _ = evaluate(model, scaler, current_extra, args.n_anom,
                                raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
@@ -879,7 +891,7 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
             print(f"  + {cand:<20s}  ({desc})  →  {n_feat}개 학습 중...",
                   end="", flush=True)
             t0 = time.time()
-            tensor, scaler = prepare_tensor(train_seqs, trial_extra)
+            tensor, scaler = prepare_tensor(scan_seqs, trial_extra)
             model, val_loader = train_recon_model(args.model, tensor, n_feat, args.epochs)
             det, sc, _, _ = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=eval_seqs)
             elapsed = time.time() - t0
@@ -1115,6 +1127,9 @@ def main():
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
     ap.add_argument("--max_candidates", type=int, default=None,
                     help="Greedy 후보 수 제한 (정의 순서 앞 N개만, 속도용)")
+    ap.add_argument("--scan_ratio", type=float, default=1.0,
+                    help="후보 스캔 학습 표본 비율 (예 0.4 = 40%%만, 채택본은 풀 재학습). "
+                         "1.0=풀(기본). 순위만 보므로 best 선택은 보통 동일, 스캔 2~3배 빠름")
     ap.add_argument("--max_steps", type=int, default=None,
                     help="Greedy 최대 채택 스텝 수 (orchestrator에서 1로 지정해 1회 채택 후 종료)")
     ap.add_argument("--export_dir", default=None,
