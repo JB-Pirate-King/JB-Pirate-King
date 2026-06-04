@@ -260,14 +260,26 @@ def _extract_python_block(text: str) -> str:
     return text[i:].strip() if i >= 0 else ""
 
 
-def claude_invent_features(analysis_text: str, weak_line: str, n: int) -> list:
+def claude_invent_features(analysis_text: str, weak_line: str, n: int,
+                           failed: list = None) -> list:
     """약세 진단 → claude -p 로 새 피처 N개 발명 → DYNAMIC_CAND_PATH 저장 → 이름 목록 반환.
 
+    failed: 이전 라운드에서 효과 없던 피처(이름,설명) 목록 → 회피 + 다른 접근 유도.
     실패(코드 없음/exec 오류) 시 빈 목록. 생성 코드는 exec 으로 검증 후 저장."""
+    fail_block = ""
+    if failed:
+        items = "\n".join(f"  - {nm}" for nm in failed)
+        fail_block = (
+            "\n=== 이전에 시도했으나 탐지율을 못 올린 피처 (회피 + 다른 접근 필수) ===\n"
+            f"{items}\n"
+            "위와 **같은 발상/수식 계열은 금지**. 약세를 전혀 다른 각도(예: 시퀀스 "
+            "통계·분포·비율·상호작용항)에서 포착하는 새 피처를 만드세요.\n"
+        )
     prompt = (
         "당신은 AIS 선박 이상탐지 DCdetect 모델의 피처 엔지니어입니다. 아래 약세 진단을 "
         f"바탕으로 현재 모델이 못 잡는 시나리오를 포착할 **새 파생 피처 {n}개**를 발명하세요.\n\n"
-        f"=== 약세 시나리오 ===\n{weak_line}\n\n=== Claude 분석 ===\n{analysis_text}\n\n"
+        f"=== 약세 시나리오 ===\n{weak_line}\n\n=== Claude 분석 ===\n{analysis_text}\n"
+        f"{fail_block}\n"
         "출력 규칙 (엄수):\n"
         "- 오직 **하나의 파이썬 코드블록**만 출력. 설명 산문 금지.\n"
         "- 코드블록은 `DYNAMIC_FEATURES` 라는 dict 하나. 형식:\n"
@@ -796,7 +808,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
                 passed = False
             verdict = f"✅ 기준충족(≥+{args.min_gain})" if passed else "⬜ 미달"
             bot.log(
-                f"   └ `{feat_name}`: 탐지율 {det}% ({det_g}pp)  ·  "
+                f"   └ `{feat_name}`: FP=1% 탐지율 {det}% ({det_g}pp)  ·  "
                 f"목적점수 {score} ({obj_g})  →  {verdict}",
                 "피처개선"
             )
@@ -1059,15 +1071,9 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
         return new_extra if new_extra is not None else []
 
 
-def stage_invent(bot, args) -> list:
-    """베이스라인 진단 → claude -p 자동 피처 발명. 발명된 피처 이름 목록 반환.
-
-    1) 베이스(12피처)만 학습/평가 (--candidates 빈값) → 약세 시나리오 진단
-    2) claude_analyze 로 분석 → claude_invent_features 로 약세 정조준 피처 N개 발명
-    3) ml/dynamic_candidates.py 저장 (다음 FE 가 자동 로드) → 이름 반환
-    """
-    bot.log(f"🧪 *자동 피처 발명* — 베이스라인 진단 후 claude 가 약세 정조준 {args.invent}개 발명",
-            "피처개선")
+def diagnose_baseline(bot, args) -> tuple:
+    """베이스(12피처)만 학습/평가 → (analysis_lines, weak_line, base_det) 반환. 라운드 무관 1회."""
+    bot.log("🧪 *자동 피처 발명* — 베이스라인 진단 (12피처)", "피처개선")
     out_json = str(WORK_DIR / "baseline_diag.json")
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -1086,7 +1092,13 @@ def stage_invent(bot, args) -> list:
                         f"[{(time.time()-t0)/60:.0f}분]", "피처개선")
             return
         if "전체 평균 탐지율" in s:
-            bot.log(f"📊 베이스라인(12피처): {s}", "피처개선"); return
+            m2 = re.search(r"탐지율\s+([\d.]+)%.*목적점수\s+([\d.]+)", s)
+            if m2:
+                bot.log(f"📊 베이스라인(12피처): *FP=1% 탐지율 {m2.group(1)}%*  ·  "
+                        f"목적점수 {m2.group(2)}", "피처개선")
+            else:
+                bot.log(f"📊 베이스라인(12피처): {s}", "피처개선")
+            return
         if "약세 시나리오(" in s:
             bot.log(f"⚠️ {s}", "피처개선"); return
         if "최적 피처셋" in s and "재학습" in s:
@@ -1129,13 +1141,21 @@ def stage_invent(bot, args) -> list:
     analysis = claude_analyze("피처개선", out, True, elapsed,
                               {"baseline_det": base_det, "phase": "invent_diagnosis"})
     bot.log("🤖 *발명 근거 분석*\n" + "\n".join(analysis), "피처개선")
+    return analysis, weak_line, base_det
 
-    invented = claude_invent_features("\n".join(analysis), weak_line, args.invent)
+
+def stage_invent(bot, args, analysis: list, weak_line: str,
+                 failed: list, round_n: int) -> list:
+    """진단(analysis/weak_line) 기반 claude -p 피처 발명 (라운드별). 발명 이름 목록 반환.
+    failed: 이전 라운드 실패 피처 이름 → 회피. round_n: 현재 라운드(로그)."""
+    bot.log(f"🧬 *발명 라운드 {round_n}* — claude 가 약세 정조준 {args.invent}개 생성"
+            + (f" (이전 실패 {len(failed)}개 회피)" if failed else ""), "피처개선")
+    invented = claude_invent_features("\n".join(analysis), weak_line, args.invent, failed=failed)
     if invented:
-        bot.log(f"🧬 *발명 완료* {len(invented)}개: {', '.join(invented)}\n"
-                f"  → 이 피처들로 FE 진행", "피처개선")
+        bot.log(f"🧬 *발명 완료* {len(invented)}개: {', '.join(invented)}  → FE 진행",
+                "피처개선")
     else:
-        bot.log("⚠️ 발명 실패 — 기존 후보로 진행", "warning")
+        bot.log("⚠️ 발명 실패", "warning")
     return invented
 
 
@@ -1165,6 +1185,8 @@ def main():
     parser.add_argument("--invent",          type=int, default=0,
                         help="첫 브랜치 전 베이스라인 진단 → claude -p 로 약세 정조준 피처 N개 "
                              "자동 발명 후 그 N개를 후보로 사용 (0=비활성)")
+    parser.add_argument("--invent_rounds",   type=int, default=1,
+                        help="발명 라운드 상한. 채택 0이면 실패 피드백으로 재발명 (기본 1)")
     parser.add_argument("--n_anom",          type=int, default=None,
                         help="시나리오당 이상 시퀀스 수. 미지정 시 max_mmsi 와 동일 (노이즈↓)")
     parser.add_argument("--overall_tol",     type=float, default=1.0,
@@ -1195,12 +1217,19 @@ def main():
     # FE-only 체이닝: 브랜치마다 Greedy 1피처 채택 → fe_state 갱신 → 새 브랜치
     #   (dcdetect_001→002→...) → 수렴(채택 없음)하면 종료.
     #   베이스라인 학습+평가는 FE 내부에서 수행. 전처리는 첫 브랜치에서만(--skip_preprocess 아니면).
-    # 자동 피처 발명: 첫 브랜치 전 베이스라인 진단 → claude -p 로 약세 정조준 피처 N개 발명
-    #   → 그 N개를 후보로 사용 (분석→약세판단→자동 피처추가→엔지니어링 완전 자동 흐름).
-    if args.invent and args.invent > 0:
-        invented = stage_invent(bot, args)
+    # 자동 피처 발명 (다라운드): 베이스 진단(1회) → 발명 → FE → 채택 0 이면 실패 피드백으로
+    #   재발명(invent_rounds 까지). 채택되면 그 피처셋으로 정상 체이닝.
+    invent = {"on": bool(args.invent and args.invent > 0),
+              "analysis": None, "weak": "", "failed": [], "round": 0}
+    if invent["on"]:
+        invent["analysis"], invent["weak"], _ = diagnose_baseline(bot, args)
+        invent["round"] = 1
+        invented = stage_invent(bot, args, invent["analysis"], invent["weak"],
+                                invent["failed"], invent["round"])
         if invented:
-            args.candidates = invented   # 발명 피처를 탐색 후보로
+            args.candidates = invented
+        else:
+            invent["on"] = False   # 발명 실패 → 발명 모드 끔
 
     first_iter = True
     iters = 0
@@ -1263,10 +1292,24 @@ def main():
                 )
                 continue
             else:
-                # 수렴 — 더 이상 채택 피처 없음 → 종료
+                # 수렴 — 채택 없음. 발명 모드면 실패 피드백으로 재발명(라운드 상한까지) 후 재시도.
+                if invent["on"] and invent["round"] < args.invent_rounds:
+                    invent["failed"] += (args.candidates or [])
+                    invent["round"] += 1
+                    bot.log(f"🔁 채택 0 → *재발명 라운드 {invent['round']}* "
+                            f"(실패 {len(invent['failed'])}개 회피)", "피처개선")
+                    re_inv = stage_invent(bot, args, invent["analysis"], invent["weak"],
+                                          invent["failed"], invent["round"])
+                    if re_inv:
+                        args.candidates = re_inv
+                        git.checkout("develop")   # 실패 브랜치 버리고 새 브랜치로
+                        continue
+                # 재발명 불가/실패 또는 비발명 모드 → 종료
+                note = (f"발명 {invent['round']}라운드 시도, 채택 없음"
+                        if invent["on"] else "모든 후보 탐색 완료 — 추가 채택 없음")
                 bot.log_stage_result(
                     "파이프라인 완료 — 수렴",
-                    [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
+                    [f"브랜치: {branch}", note],
                     success=True
                 )
                 return
