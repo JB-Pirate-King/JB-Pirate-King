@@ -282,6 +282,23 @@ CANDIDATE_FEATURES: dict = {
 }
 
 
+# ── 동적 후보 (claude -p 자동 발명분) ───────────────────────────────
+# orchestrator 의 발명 stage 가 약세 진단 → claude -p 로 새 피처 lambda 를
+# ml/dynamic_candidates.py 에 DYNAMIC_FEATURES dict 로 써넣는다. 여기서 이 파일을
+# 이 모듈 네임스페이스에서 exec → lambda 가 _B / _ang_diff / math 를 그대로 참조,
+# CANDIDATE_FEATURES 에 병합한다. 파일 없으면 무시(기본 동작 불변).
+_DYN_PATH = os.path.join(os.path.dirname(__file__), "..", "dynamic_candidates.py")
+if os.path.exists(_DYN_PATH):
+    try:
+        with open(_DYN_PATH, encoding="utf-8") as _df:
+            exec(_df.read(), globals())          # DYNAMIC_FEATURES 정의
+        _dyn = globals().get("DYNAMIC_FEATURES", {})
+        CANDIDATE_FEATURES.update(_dyn)
+        print(f"[동적후보] {len(_dyn)}개 로드: {list(_dyn)}")
+    except Exception as _e:
+        print(f"[동적후보] 로드 실패(무시): {_e}")
+
+
 # ── 편향 제거용 스케일러 ─────────────────────────────────────────
 class ClippedMinMaxScaler:
     """1~99 퍼센타일 클리핑 후 MinMaxScaling.
@@ -839,12 +856,14 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     # 후보 명시 (--candidates): 지정한 이름만 탐색 (Ralph/큐레이션 추천 풀).
     #   CANDIDATE_FEATURES 에 있고 INITIAL_EXTRA(기채택) 아닌 것만 유효.
     cand_list = getattr(args, "candidates", None)
-    if cand_list:
+    if cand_list is not None:   # 명시됨 (빈 리스트면 베이스전용 = 후보 0)
         remaining = [k for k in cand_list
                      if k in CANDIDATE_FEATURES and k not in INITIAL_EXTRA]
         unknown = [k for k in cand_list if k not in CANDIDATE_FEATURES]
         if unknown:
             print(f"  [경고] CANDIDATE_FEATURES 에 없는 후보 무시: {unknown}")
+        if not remaining:
+            print("  [베이스전용] 후보 0개 — 베이스라인만 학습/평가 (진단용)")
     # 후보 수 제한 (--max_candidates): 정의 순서대로 앞 N개만 탐색 (속도)
     max_cand = getattr(args, "max_candidates", None)
     if max_cand is not None and max_cand > 0:
