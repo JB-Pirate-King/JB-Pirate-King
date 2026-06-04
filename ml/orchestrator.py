@@ -244,6 +244,99 @@ def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
     return ["🤖 Claude 분석 불가 (수동 확인 필요)"]
 
 
+# ─────────────────────────────────────────────
+# Claude 자동 피처 발명 (claude -p → 동적 후보)
+# ─────────────────────────────────────────────
+
+DYNAMIC_CAND_PATH = "ml/dynamic_candidates.py"
+
+
+def _extract_python_block(text: str) -> str:
+    """응답에서 ```python ... ``` 코드블록 추출 (없으면 DYNAMIC_FEATURES 줄부터)."""
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    i = text.find("DYNAMIC_FEATURES")
+    return text[i:].strip() if i >= 0 else ""
+
+
+def claude_invent_features(analysis_text: str, weak_line: str, n: int) -> list:
+    """약세 진단 → claude -p 로 새 피처 N개 발명 → DYNAMIC_CAND_PATH 저장 → 이름 목록 반환.
+
+    실패(코드 없음/exec 오류) 시 빈 목록. 생성 코드는 exec 으로 검증 후 저장."""
+    prompt = (
+        "당신은 AIS 선박 이상탐지 DCdetect 모델의 피처 엔지니어입니다. 아래 약세 진단을 "
+        f"바탕으로 현재 모델이 못 잡는 시나리오를 포착할 **새 파생 피처 {n}개**를 발명하세요.\n\n"
+        f"=== 약세 시나리오 ===\n{weak_line}\n\n=== Claude 분석 ===\n{analysis_text}\n\n"
+        "출력 규칙 (엄수):\n"
+        "- 오직 **하나의 파이썬 코드블록**만 출력. 설명 산문 금지.\n"
+        "- 코드블록은 `DYNAMIC_FEATURES` 라는 dict 하나. 형식:\n"
+        "    DYNAMIC_FEATURES = {\n"
+        '        "feature_name": ("한 줄 설명", lambda seq, t: <식>),\n'
+        "    }\n"
+        "- 컬럼 접근은 `seq[t][_B[\"sog\"]]`. BASE 12: sog, cog, heading, status, dt, "
+        "dist_km, cog_hdg_diff, sog_change, cog_hdg_change, speed_consistency, lat_speed, "
+        "lon_speed\n"
+        "- 이전 행 `seq[t-1]`, 반드시 `if t > 0 else 0.0` 가드. 0나눗셈 방지 `max(x,1e-6)`.\n"
+        "- `_ang_diff(a,b)` 와 `math` 사용 가능. 순수함수(부작용 없음).\n"
+        "- 기존 피처와 **수식이 실질적으로 다른** 새 신호. 주석으로 타겟 시나리오 명시.\n"
+        f"- 정확히 {n}개. 이름은 영문 snake_case, 서로 달라야 함.\n"
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--output-format", "text"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=240,
+        )
+    except Exception as e:
+        print(f"[발명] claude 호출 실패: {e}")
+        return []
+    if result.returncode != 0 or not result.stdout.strip():
+        print("[발명] claude 응답 없음")
+        return []
+
+    code = _extract_python_block(result.stdout)
+    if "DYNAMIC_FEATURES" not in code:
+        print("[발명] DYNAMIC_FEATURES 코드 없음")
+        return []
+
+    # exec 검증: feature_engineer 와 같은 헬퍼(_ang_diff, math, _B) 컨텍스트로 안전 확인
+    import math as _math
+    ns = {"math": _math, "_ang_diff": lambda a, b: abs((a - b + 180) % 360 - 180)}
+    # _B 더미 (이름→인덱스) — BASE 12
+    base = ["sog", "cog", "heading", "status", "dt", "dist_km", "cog_hdg_diff",
+            "sog_change", "cog_hdg_change", "speed_consistency", "lat_speed", "lon_speed"]
+    ns["_B"] = {k: i for i, k in enumerate(base)}
+    try:
+        exec(code, ns)
+        feats = ns.get("DYNAMIC_FEATURES", {})
+        # 더미 시퀀스로 각 lambda 실행 가능 검증
+        dummy = [[0.0] * 12 for _ in range(10)]
+        valid = {}
+        for name, (desc, fn) in feats.items():
+            try:
+                float(fn(dummy, 5))
+                valid[name] = (desc, fn)
+            except Exception as fe:
+                print(f"[발명] '{name}' 실행 실패 제외: {fe}")
+        if not valid:
+            print("[발명] 유효 피처 0개")
+            return []
+    except Exception as e:
+        print(f"[발명] 코드 검증 실패: {e}")
+        return []
+
+    # 동적 후보 파일 저장 (feature_engineer 가 import; _B/_ang_diff/math 는 그쪽 globals)
+    header = (
+        "# 자동 생성: orchestrator claude_invent_features (claude -p)\n"
+        "# feature_engineer 네임스페이스에서 exec 됨 → _B / _ang_diff / math 사용 가능\n\n"
+    )
+    with open(DYNAMIC_CAND_PATH, "w", encoding="utf-8") as f:
+        f.write(header + code + "\n")
+    print(f"[발명] {len(valid)}개 발명 → {DYNAMIC_CAND_PATH}: {list(valid)}")
+    return list(valid)
+
+
 def fe_adopted_analysis(out: str, adopted: list[str], det_rate,
                         baseline_det, weak_names: list[str]) -> list[str]:
     """FE 채택 피처 상세 분석 (claude_analyze 보완용)"""
@@ -966,6 +1059,55 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
         return new_extra if new_extra is not None else []
 
 
+def stage_invent(bot, args) -> list:
+    """베이스라인 진단 → claude -p 자동 피처 발명. 발명된 피처 이름 목록 반환.
+
+    1) 베이스(12피처)만 학습/평가 (--candidates 빈값) → 약세 시나리오 진단
+    2) claude_analyze 로 분석 → claude_invent_features 로 약세 정조준 피처 N개 발명
+    3) ml/dynamic_candidates.py 저장 (다음 FE 가 자동 로드) → 이름 반환
+    """
+    bot.log(f"🧪 *자동 피처 발명* — 베이스라인 진단 후 claude 가 약세 정조준 {args.invent}개 발명",
+            "피처개선")
+    out_json = str(WORK_DIR / "baseline_diag.json")
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    ret, out = run_cmd(
+        [sys.executable, "ml/core/feature_engineer.py",
+         "--model", args.model,
+         "--input", args.data_file,
+         "--base_dir", args.base_dir,
+         "--epochs", str(args.epochs),
+         "--max_mmsi", str(args.max_mmsi),
+         "--n_anom", str(args.n_anom if args.n_anom else args.max_mmsi),
+         "--candidates",                       # 빈값 = 베이스전용 진단
+         "--out_json", out_json]
+        + (["--holdout_file", args.holdout_file] if args.holdout_file else [])
+    )
+    elapsed = time.time() - t0
+    if ret != 0:
+        bot.log("❌ 베이스라인 진단 실패 — 발명 생략", "warning")
+        return []
+
+    weak_line = next((l.strip() for l in out.splitlines() if "약세 시나리오(" in l), "")
+    base_det = None
+    m = re.search(r"전체 평균 탐지율\s+([\d.]+)%", out)
+    if m:
+        base_det = float(m.group(1))
+    bot.log(f"📊 베이스라인 진단: 탐지율 {base_det}%\n{weak_line}", "피처개선")
+
+    analysis = claude_analyze("피처개선", out, True, elapsed,
+                              {"baseline_det": base_det, "phase": "invent_diagnosis"})
+    bot.log("🤖 *발명 근거 분석*\n" + "\n".join(analysis), "피처개선")
+
+    invented = claude_invent_features("\n".join(analysis), weak_line, args.invent)
+    if invented:
+        bot.log(f"🧬 *발명 완료* {len(invented)}개: {', '.join(invented)}\n"
+                f"  → 이 피처들로 FE 진행", "피처개선")
+    else:
+        bot.log("⚠️ 발명 실패 — 기존 후보로 진행", "warning")
+    return invented
+
+
 # ─────────────────────────────────────────────
 # 메인
 # ─────────────────────────────────────────────
@@ -989,6 +1131,9 @@ def main():
                         help="후보 스캔 학습 표본 비율 (예 0.4, 채택본은 풀 재학습). 1.0=풀")
     parser.add_argument("--candidates",      nargs="*", default=None,
                         help="탐색 후보 피처 명시 (Ralph/큐레이션 추천 10개 등). 미지정=전체 20개")
+    parser.add_argument("--invent",          type=int, default=0,
+                        help="첫 브랜치 전 베이스라인 진단 → claude -p 로 약세 정조준 피처 N개 "
+                             "자동 발명 후 그 N개를 후보로 사용 (0=비활성)")
     parser.add_argument("--n_anom",          type=int, default=None,
                         help="시나리오당 이상 시퀀스 수. 미지정 시 max_mmsi 와 동일 (노이즈↓)")
     parser.add_argument("--overall_tol",     type=float, default=1.0,
@@ -1019,6 +1164,13 @@ def main():
     # FE-only 체이닝: 브랜치마다 Greedy 1피처 채택 → fe_state 갱신 → 새 브랜치
     #   (dcdetect_001→002→...) → 수렴(채택 없음)하면 종료.
     #   베이스라인 학습+평가는 FE 내부에서 수행. 전처리는 첫 브랜치에서만(--skip_preprocess 아니면).
+    # 자동 피처 발명: 첫 브랜치 전 베이스라인 진단 → claude -p 로 약세 정조준 피처 N개 발명
+    #   → 그 N개를 후보로 사용 (분석→약세판단→자동 피처추가→엔지니어링 완전 자동 흐름).
+    if args.invent and args.invent > 0:
+        invented = stage_invent(bot, args)
+        if invented:
+            args.candidates = invented   # 발명 피처를 탐색 후보로
+
     first_iter = True
     iters = 0
     try:

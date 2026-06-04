@@ -76,3 +76,7 @@ ml/google_credentials.json
 
 # caveman-compress backups
 *.original.md
+
+# auto-generated dynamic candidates (claude -p invention)
+ml/dynamic_candidates.py
+ml/.baseline_diag*
