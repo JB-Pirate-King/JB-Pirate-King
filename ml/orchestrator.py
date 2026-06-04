@@ -750,6 +750,7 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
          "--min_gain", str(args.min_gain),
          "--scan_ratio", str(args.scan_ratio)]
         + (["--max_candidates", str(args.max_candidates)] if args.max_candidates else [])
+        + (["--candidates"] + args.candidates if args.candidates else [])
         + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
         progress_cb=fe_progress
     )
@@ -984,6 +985,8 @@ def main():
                         help="Greedy 후보 수 제한 (앞 N개만 탐색, 속도용)")
     parser.add_argument("--scan_ratio",      type=float, default=1.0,
                         help="후보 스캔 학습 표본 비율 (예 0.4, 채택본은 풀 재학습). 1.0=풀")
+    parser.add_argument("--candidates",      nargs="*", default=None,
+                        help="탐색 후보 피처 명시 (Ralph/큐레이션 추천 10개 등). 미지정=전체 20개")
     parser.add_argument("--auto_approve",    action="store_true",
                         help="Slack 승인 대기 없이 모든 단계 자동 approve (테스트용)")
     parser.add_argument("--max_runs",        type=int, default=50,
