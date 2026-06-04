@@ -1222,7 +1222,8 @@ def main():
     # 자동 피처 발명 (다라운드): 베이스 진단(1회) → 발명 → FE → 채택 0 이면 실패 피드백으로
     #   재발명(invent_rounds 까지). 채택되면 그 피처셋으로 정상 체이닝.
     invent = {"on": bool(args.invent and args.invent > 0),
-              "analysis": None, "weak": "", "failed": [], "round": 0}
+              "analysis": None, "weak": "", "failed": [], "round": 0,
+              "adopted_any": False}
     if invent["on"]:
         invent["analysis"], invent["weak"], _ = diagnose_baseline(bot, args)
         invent["round"] = 1
@@ -1278,7 +1279,11 @@ def main():
                 bot.log("파이프라인 중단", "warning")
                 return
             elif fe_result:
-                # 채택 발생 → fe_state 저장 + 이 브랜치에 커밋(체이닝이 git 히스토리로 누적되도록)
+                # 채택 발생 → 발명모드 충족 표시(이후 수렴은 진짜 종료, 재발명 안 함).
+                #   재발명은 '한 번도 채택 안 됐을 때'만 → 채택된 발명피처가 dynamic 에서
+                #   사라지는 KeyError 방지.
+                invent["adopted_any"] = True
+                # fe_state 저장 + 이 브랜치에 커밋(체이닝이 git 히스토리로 누적되도록)
                 #   → 다음 브랜치는 이 run 브랜치를 base 로 분기 (create_branch 기본 동작).
                 _save_fe_initial_extra(fe_result)
                 git.commit_results(
@@ -1294,8 +1299,10 @@ def main():
                 )
                 continue
             else:
-                # 수렴 — 채택 없음. 발명 모드면 실패 피드백으로 재발명(라운드 상한까지) 후 재시도.
-                if invent["on"] and invent["round"] < args.invent_rounds:
+                # 수렴 — 채택 없음. 발명 모드 + **아직 한 번도 채택 안 됨** + 라운드 남음 →
+                #   실패 피드백으로 재발명 후 재시도. (한 번이라도 채택됐으면 진짜 수렴 종료.)
+                if (invent["on"] and not invent["adopted_any"]
+                        and invent["round"] < args.invent_rounds):
                     invent["failed"] += (args.candidates or [])
                     invent["round"] += 1
                     bot.log(f"🔁 채택 0 → *재발명 라운드 {invent['round']}* "
