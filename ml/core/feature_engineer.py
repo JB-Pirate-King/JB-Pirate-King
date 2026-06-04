@@ -1198,6 +1198,8 @@ def main():
     ap.add_argument("--candidates", nargs="*", default=None,
                     help="탐색할 후보 피처 이름 명시 (Ralph/큐레이션 추천 풀). "
                          "미지정 시 CANDIDATE_FEATURES 전체")
+    ap.add_argument("--diagnose_only", action="store_true",
+                    help="베이스라인 학습+평가(약세 진단)까지만, 재학습/순열중요도/export 생략")
     ap.add_argument("--scan_ratio", type=float, default=1.0,
                     help="후보 스캔 학습 표본 비율 (예 0.4 = 40%%만, 채택본은 풀 재학습). "
                          "1.0=풀(기본). 순위만 보므로 best 선택은 보통 동일, 스캔 2~3배 빠름")
@@ -1228,6 +1230,19 @@ def main():
         args.input, args.max_mmsi, args.eval_ratio)
     history, best_extra = greedy_forward_selection(train_seqs, eval_normal_seqs, args)
     print_report(history)
+
+    # 진단 전용(--diagnose_only): 약세 시나리오만 필요 → 재학습/순열중요도/export 생략.
+    #   orchestrator stage_invent 가 약세 진단만 쓰므로 ③단계(낭비) 건너뜀.
+    if getattr(args, "diagnose_only", False):
+        base_h = history[0]
+        scen = {n: d for n, d, _ in base_h.get("scenarios", [])}
+        if args.out_json:
+            with open(args.out_json, "w", encoding="utf-8") as jf:
+                json.dump({"baseline_det": base_h["det"], "scenario_fp1": scen},
+                          jf, ensure_ascii=False, indent=2)
+        print(f"\n[진단전용] 재학습/순열중요도/export 생략 — 약세 진단 완료 "
+              f"(베이스 탐지율 {base_h['det']:.1f}%)")
+        return
 
     # ── 최적 피처셋으로 재학습 → Permutation Importance ──────────────
     # 학습은 train_seqs, FP(오탐)·중요도 평가는 홀드아웃 eval_normal_seqs 사용
