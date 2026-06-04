@@ -267,6 +267,18 @@ CANDIDATE_FEATURES: dict = {
             1.0 for row in seq if int(round(row[_B["status"]])) not in (0, 1, 5)
         ) / len(seq),
     ),
+    # ── Ralph 발명 (claude_fe_analysis item4-① 기반, D1-LowSlow 0% 타겟) ──
+    "lowspeed_micro_var": (
+        "저속 미세변동 누적 (sog<3kn에서 COG 누적변화/길이)",
+        # D1-LowSlow: 느린데 비정상적으로 꿈틀대는 궤적. 저속 정상선(정박/계류)은
+        # COG 안정 → ≈0. 저속 위장 표류는 미세 COG 변동 누적 → 큼. dist/sog 가
+        # 정상범위라 단일스텝 피처엔 안 잡히는 걸 '누적'으로 증폭.
+        lambda seq, t: (
+            sum(_ang_diff(seq[i][_B["cog"]], seq[i - 1][_B["cog"]])
+                for i in range(1, t + 1)) / max(t, 1)
+            if seq[t][_B["sog"]] < 3.0 else 0.0
+        ),
+    ),
 }
 
 
@@ -799,6 +811,21 @@ def _objective(sc: list, weak_names: set, weak_weight: float) -> float:
     return overall + weak_weight * weak_mean
 
 
+def _combine_multifp(sc: list, extra: dict) -> list:
+    """FP1 시나리오 결과 + extra{fp:{name:det}} → 시나리오별 FP1/5/10 평균 detection.
+
+    단일 임계(FP=1%, 99퍼센타일 꼬리)는 모델 미세변화에 출렁임이 큼.
+    여러 FP 임계(1/5/10) 탐지율을 평균하면 목적함수가 부드러워져
+    들쑥날쑥·winner's curse·채택후 회귀가 완화됨. extra 없으면 sc 그대로."""
+    if not extra:
+        return sc
+    out = []
+    for name, d1, hold in sc:
+        ds = [d1] + [extra[fp].get(name, d1) for fp in extra]
+        out.append((name, float(np.mean(ds)), hold))
+    return out
+
+
 # ── Greedy Forward Selection 메인 루프 ────────────────────────────
 def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     weak_floor  = getattr(args, "weak_floor",  WEAK_FLOOR_DEFAULT)
@@ -854,13 +881,14 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     t0 = time.time()
     tensor, scaler = prepare_tensor(scan_seqs, current_extra)
     model, val_loader = train_recon_model(args.model, tensor, n_base_total, args.epochs)
-    det0, sc0, _, _ = evaluate(model, scaler, current_extra, args.n_anom,
-                               raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
+    det0, sc0, extra0, _ = evaluate(model, scaler, current_extra, args.n_anom,
+                                    raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
     elapsed = time.time() - t0
 
-    # 약세 시나리오 집합 = 베이스라인 탐지율 < weak_floor (전 과정 고정)
+    # 약세 시나리오 집합 = 베이스라인 FP=1% 탐지율 < weak_floor (전 과정 고정)
     weak_names = {n for n, d, _ in sc0 if d < weak_floor}
-    best_score = _objective(sc0, weak_names, weak_weight)
+    # 목적점수는 FP1/5/10 평균(부드러운 지표)으로 계산 → 출렁임/회귀 완화
+    best_score = _objective(_combine_multifp(sc0, extra0), weak_names, weak_weight)
     best_det   = det0
     print(f"  → 전체 평균 탐지율 {det0:.1f}%  (목적점수 {best_score:.1f})  [{elapsed/60:.1f}분]")
     if weak_names:
@@ -902,11 +930,12 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
             t0 = time.time()
             tensor, scaler = prepare_tensor(scan_seqs, trial_extra)
             model, val_loader = train_recon_model(args.model, tensor, n_feat, args.epochs)
-            det, sc, _, _ = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=eval_seqs)
+            det, sc, extra, _ = evaluate(model, scaler, trial_extra, args.n_anom,
+                                         raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
             elapsed = time.time() - t0
-            score = _objective(sc, weak_names, weak_weight)
-            gain  = score - best_score          # 목적 점수 기준 향상
-            det_gain = det - best_det           # 참고용 전체평균 변화
+            score = _objective(_combine_multifp(sc, extra), weak_names, weak_weight)
+            gain  = score - best_score          # 목적 점수 기준 향상 (FP1/5/10 평균)
+            det_gain = det - best_det           # 참고용 전체평균(FP1) 변화
             arrow = "▲" if gain > min_gain else ("▼" if gain < -min_gain else "─")
             print(
                 f"  전체평균 {det:5.1f}%({det_gain:+.1f})"
@@ -917,8 +946,13 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
                 step_best_feat = cand
                 step_best_result = (det, trial_extra, tensor, scaler, model, sc, score)
 
-        # 목적 점수 min_gain 이상 향상 시 채택
-        if step_best_gain > min_gain:
+        # 채택 조건: 목적점수 min_gain 이상 향상 AND 전체 FP1 탐지율이 회귀(>tol 하락) 아님.
+        #   회귀 가드: 약세 가중으로 목적점수는 올라도 전체 FP1 이 크게 깎이는 피처는 거부
+        #   (예전 anchor_suspicion 채택 후 -3.1pp 같은 회귀 방지).
+        overall_tol = getattr(args, "overall_tol", 1.0)
+        cand_det = step_best_result[0]
+        regressed = cand_det < best_det - overall_tol
+        if step_best_gain > min_gain and not regressed:
             current_extra = step_best_result[1]
             best_det   = step_best_result[0]
             best_score = step_best_result[6]
@@ -934,6 +968,9 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
                      extra=list(current_extra),
                      scenarios=step_best_result[5])
             )
+        elif step_best_gain > min_gain and regressed:
+            print(f"\n  ✗ 채택 거부: [{step_best_feat}] 목적점수 +{step_best_gain:.1f}나 "
+                  f"전체 FP1 {best_det:.1f}%→{cand_det:.1f}% 회귀(>{overall_tol}pp) → 종료")
         else:
             best_cand = step_best_feat
             print(f"\n  ✗ 개선 없음 (최고 후보: {best_cand}  목적점수 {step_best_gain:+.1f})"
@@ -1132,6 +1169,9 @@ def main():
                     help=f"약세 시나리오 평균 가중치 (기본: {WEAK_WEIGHT_DEFAULT})")
     ap.add_argument("--min_gain", type=float, default=MIN_GAIN_DEFAULT,
                     help=f"목적점수 채택 임계 (기본: {MIN_GAIN_DEFAULT})")
+    ap.add_argument("--overall_tol", type=float, default=1.0,
+                    help="채택 회귀 가드: 전체 FP1 탐지율이 이 값(pp) 넘게 하락하면 "
+                         "목적점수 올라도 채택 거부 (기본 1.0)")
     ap.add_argument("--max_feat", type=int, default=None,
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
     ap.add_argument("--max_candidates", type=int, default=None,
