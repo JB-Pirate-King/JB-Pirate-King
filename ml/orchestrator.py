@@ -629,6 +629,9 @@ def stage_release(bot, args, branch: str, run_num: int,
 
     assets = (([tarball] if tarball else []) + model_files)
 
+    # 기존 동일 태그 릴리즈가 있으면 먼저 삭제(+태그) → 재실행 시 덮어쓰기 (충돌로 누락 방지).
+    run_cmd(["gh", "release", "delete", tag, "--yes", "--cleanup-tag"])
+
     cmd = ["gh", "release", "create", tag,
            "--title", f"{tag} — {args.model} iter{run_num:03d}",
            "--notes", notes,
