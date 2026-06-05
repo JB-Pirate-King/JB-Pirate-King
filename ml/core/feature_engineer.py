@@ -279,6 +279,18 @@ CANDIDATE_FEATURES: dict = {
             if seq[t][_B["sog"]] < 3.0 else 0.0
         ),
     ),
+    # ── claude -p 발명 → 채택 승격 (dcdetect run, D1-LowSlow/드리프트, +17.1pp) ──
+    "drift_straightness": (
+        "누적 변위벡터 직진도 — |Σ속도벡터| / Σ|속도벡터| (곧장이동≈1, 표류<1)",
+        # 정상 직진: 속도벡터 합 크기 ≈ 경로 길이 → 1.0
+        # 저속 표류/배회: 벡터 상쇄 → 합 크기 << 경로 길이 → 0에 근접. D1-LowSlow 타겟.
+        lambda seq, t: (
+            math.hypot(sum(seq[k][_B["lon_speed"]] for k in range(t + 1)),
+                       sum(seq[k][_B["lat_speed"]] for k in range(t + 1)))
+            / max(sum(math.hypot(seq[k][_B["lon_speed"]], seq[k][_B["lat_speed"]])
+                      for k in range(t + 1)), 1e-6)
+        ),
+    ),
 }
 
 
@@ -686,9 +698,10 @@ def evaluate(
                 sum(1 for s in anom_scores if s > thr) / len(anom_scores) * 100.0
             )
 
-    # extra_fp 출력
+    # extra_fp 출력 (FP=1% 도 같은 [FP≈N%] 형식으로 함께 표기 → Slack 일관성)
     if extra_fp:
         W = 52
+        print(f"\n  [FP≈1%] 평균 탐지율 {float(np.mean(all_dets)):.1f}%")
         for fp in sorted(extra_fp):
             sc_dets = extra_results[fp]
             avg = float(np.mean(list(sc_dets.values())))
@@ -1198,6 +1211,8 @@ def main():
     ap.add_argument("--candidates", nargs="*", default=None,
                     help="탐색할 후보 피처 이름 명시 (Ralph/큐레이션 추천 풀). "
                          "미지정 시 CANDIDATE_FEATURES 전체")
+    ap.add_argument("--diagnose_only", action="store_true",
+                    help="베이스라인 학습+평가(약세 진단)까지만, 재학습/순열중요도/export 생략")
     ap.add_argument("--scan_ratio", type=float, default=1.0,
                     help="후보 스캔 학습 표본 비율 (예 0.4 = 40%%만, 채택본은 풀 재학습). "
                          "1.0=풀(기본). 순위만 보므로 best 선택은 보통 동일, 스캔 2~3배 빠름")
@@ -1229,10 +1244,39 @@ def main():
     history, best_extra = greedy_forward_selection(train_seqs, eval_normal_seqs, args)
     print_report(history)
 
+    # 진단 전용(--diagnose_only): 약세 시나리오만 필요 → 재학습/순열중요도/export 생략.
+    #   orchestrator stage_invent 가 약세 진단만 쓰므로 ③단계(낭비) 건너뜀.
+    if getattr(args, "diagnose_only", False):
+        base_h = history[0]
+        scen = {n: d for n, d, _ in base_h.get("scenarios", [])}
+        if args.out_json:
+            with open(args.out_json, "w", encoding="utf-8") as jf:
+                json.dump({"baseline_det": base_h["det"], "scenario_fp1": scen},
+                          jf, ensure_ascii=False, indent=2)
+        print(f"\n[진단전용] 재학습/순열중요도/export 생략 — 약세 진단 완료 "
+              f"(베이스 탐지율 {base_h['det']:.1f}%)")
+        return
+
     # ── 최적 피처셋으로 재학습 → Permutation Importance ──────────────
     # 학습은 train_seqs, FP(오탐)·중요도 평가는 홀드아웃 eval_normal_seqs 사용
     best = max(history, key=lambda x: x.get("score", x["det"]))
     best_extra = best.get("extra", [])
+
+    # 채택 0 (수렴): best == 시작셋(INITIAL_EXTRA). 동일 피처셋 재학습/순열중요도/export 는
+    #   무의미(새 모델 없음, 배포본은 직전 채택 브랜치 모델). → 생략하고 수렴 보고만.
+    newly_adopted = [f for f in best_extra if f not in INITIAL_EXTRA]
+    if not newly_adopted:
+        base_h = history[0]
+        scen = {n: d for n, d, _ in base_h.get("scenarios", [])}
+        if args.out_json:
+            with open(args.out_json, "w", encoding="utf-8") as jf:
+                json.dump({"best_extra": list(best_extra), "best_det": base_h["det"],
+                           "baseline_det": base_h["det"], "scenario_fp1": scen},
+                          jf, ensure_ascii=False, indent=2)
+        print(f"\n[수렴] 신규 채택 0 — 동일 피처셋({best['n_feat']}개) 재학습/순열중요도/"
+              f"export 생략 (탐지율 {base_h['det']:.1f}%)")
+        return
+
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
     tensor_best, scaler_best = prepare_tensor(train_seqs, best_extra)
     model_best, _ = train_recon_model(args.model, tensor_best, best["n_feat"], args.epochs)
