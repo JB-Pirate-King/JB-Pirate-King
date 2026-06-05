@@ -1122,8 +1122,10 @@ def diagnose_baseline(bot, args) -> tuple:
          "--epochs", str(args.epochs),
          "--max_mmsi", str(args.max_mmsi),
          "--n_anom", str(args.n_anom if args.n_anom else args.max_mmsi),
-         "--initial_extra",                    # 빈값 = 순수 베이스 12피처
-         "--candidates",                       # 빈값 = 후보 0 (베이스전용 진단)
+         # 누적: 현 채택셋(fe_state)을 시작점으로 진단 → 이미 채택된 피처가 가린 약세 말고
+         #   '아직 남은' 약세를 정조준해 발명 (순수 베이스 아님). fe_state 비면 베이스 12.
+         "--initial_extra"] + _load_fe_initial_extra() + [
+         "--candidates",                       # 빈값 = 후보 0 (진단만)
          "--diagnose_only",                    # 약세 진단까지만 (재학습/순열중요도 생략)
          "--out_json", out_json]
         + (["--holdout_file", args.holdout_file] if args.holdout_file else []),

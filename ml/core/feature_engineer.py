@@ -291,6 +291,15 @@ CANDIDATE_FEATURES: dict = {
                       for k in range(t + 1)), 1e-6)
         ),
     ),
+    # ── claude -p 발명 → 채택 승격 (dcdetect run, D1-LowSlow/정박이동, +13.7pp) ──
+    "lowspeed_drift_accum": (
+        "저속(sog<2kn) 마스크 하 t까지 dist_km 누적합 — 정박 0, 미세표류 양수",
+        # 정박/계류: 이동 0 → 누적 0. 저속 위장표류: 미세 dist 누적 → 양수. D1 타겟.
+        lambda seq, t: sum(
+            seq[k][_B["dist_km"]] for k in range(t + 1)
+            if seq[k][_B["sog"]] < 2.0
+        ),
+    ),
 }
 
 
