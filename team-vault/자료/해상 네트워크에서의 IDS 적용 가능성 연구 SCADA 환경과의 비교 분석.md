@@ -1,6 +1,6 @@
 ---
 source_file: 해상 네트워크에서의 IDS 적용 가능성 연구 SCADA 환경과의 비교 분석.pdf
-last_synced: 2026-06-07 23:33
+last_synced: 2026-06-07 23:36
 tags: [notion-sync, attachment]
 ---
 
@@ -380,6 +380,8 @@ IDS 적용의 현실적 제약과 기술적 요구조건을
 
 공유를 통한 위협 인텔리전스 허브 구축, 경량
 
+[참고문헌]
+
 탐지 알고리즘 개발, 그리고 탐지 결과의 중요
 
 도와 대응 방안을 명확히 제시하는 사용자 중
@@ -390,9 +392,6 @@ IDS 적용의 현실적 제약과 기술적 요구조건을
 
 는 핵심 기반이 될 수 있다.
 
-VI.결론
-
-[참고문헌]
 [1] Stouffer, K., Lightman, S., Pillitteri, V.,
 
 Abrams, M., & Hahn, A. (2015). Guide to
@@ -412,6 +411,8 @@ Standards
 and
 
 Technology.
+
+VI.결론
 
 [2] 강남선, 이창식, 유성상, 이종민, & 손금준.
 
