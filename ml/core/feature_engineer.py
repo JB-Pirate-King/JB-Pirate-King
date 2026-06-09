@@ -67,8 +67,11 @@ from train_benchmark import (
 # iforest/ocsvm 은 sklearn → 제외.
 FE_SUPPORTED_MODELS = ["dcdetect", "conv1d", "lstm", "tcn"]
 
-# ── 고정 상수 ──────────────────────────────────────────────────────
-SEQ_LEN         = 10
+# ── 고정 상수 (SEQ_LEN/BASE_FEATURES 는 ml/core/constants.py 가 단일 출처) ──
+try:
+    from ml.core.constants import SEQ_LEN
+except ModuleNotFoundError:
+    from constants import SEQ_LEN
 SEQ_BREAK       = 600   # dt 임계값 (초) — 시퀀스 분리
 MAX_SEQ_PER_MMSI = 500  # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
 EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 비율 (학습 풀에서 분리)
@@ -82,13 +85,10 @@ WEAK_WEIGHT_DEFAULT = 1.0    # 약세 시나리오 평균에 곱할 가중치
 MIN_GAIN_DEFAULT    = 3.0    # 목적 점수 채택 임계 (노이즈 오채택 방지)
 
 # ── 베이스 피처 (현재 12개) ────────────────────────────────────────
-BASE_FEATURES = [
-    "sog", "cog", "heading", "status",
-    "dt", "dist_km",
-    "cog_hdg_diff", "sog_change", "cog_hdg_change",
-    "speed_consistency", "lat_speed", "lon_speed",
-]
-_B = {name: i for i, name in enumerate(BASE_FEATURES)}
+try:
+    from ml.core.constants import BASE_FEATURES, BASE_INDEX as _B
+except ModuleNotFoundError:                      # `python ml/core/feature_engineer.py`
+    from constants import BASE_FEATURES, BASE_INDEX as _B
 
 # ── 이전 반복에서 검증·채택된 피처 (Greedy 탐색의 출발점) ──────────────
 # Iteration 1: accel (+12.0pp)
