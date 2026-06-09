@@ -21,7 +21,7 @@ ml/
 │   ├── notify.py            # Discord + Notion reports
 │   └── git_manager.py       # Auto branch creation / commit
 ├── orchestrator.py          # Full pipeline entry point ★
-├── ralph_feature_invention.md # Ralph Loop prompt: autonomous feature invention (English)
+├── orchestrator_lg.py       # LangGraph port (interrupt-gated HITL) ★
 ├── reset_sheets.py          # Utility: clear all Google Sheets tabs (keep headers)
 ├── fe_state.json            # FE starting features (initial_extra)
 ├── auto_feat_eng.py         # FE automation loop
@@ -82,14 +82,13 @@ dcdetect_002 → 003 → ... → converge & stop when nothing is adopted
 
 ---
 
-## Ralph Loop — Autonomous Feature Invention
+## LangGraph Port (`orchestrator_lg.py`)
 
-The orchestrator only **selects** from the fixed `CANDIDATE_FEATURES` pool. To **invent new
-candidates**, use the `ralph-loop` plugin with the English prompt file
-`ml/ralph_feature_invention.md`. Each iteration: pick a weak scenario (<50%) → hypothesize →
-add one `(desc, lambda)` to `CANDIDATE_FEATURES` → validate via standalone FE → keep+commit if
-gain ≥ +3.0pp, else revert → log to `ml/.ralph_fe_log.md`. Stops at 3 adopted features.
-Run Ralph only when no orchestrator test is running (shared working tree). Details in `CLAUDE.md`.
+A LangGraph reimplementation of the orchestrator's control flow with the same behavior. The
+pipeline is a `StateGraph`; the 3 HITL gates (FE-eval / build / converge) + fail gate are
+independent nodes using `interrupt()`, so a crash while awaiting Slack approval resumes without
+retraining. Branch chaining is a graph cycle (`release → chain → new_branch`). Same CLI flags as
+`orchestrator.py` — run with `python -m ml.orchestrator_lg`. Details in `CLAUDE.md`.
 
 ---
 
@@ -195,7 +194,7 @@ SEQ_LEN = 10
 Base 12 + extra 12 = **24 features**
 Best detection rate: dcdetect_011 → **83.5% (FP=1%, 23 features)**
 
-> The candidate pool is not fixed — see the Ralph Loop section for autonomous expansion.
+> The candidate pool is the fixed `CANDIDATE_FEATURES` dict in `feature_engineer.py`; add new candidates by editing it.
 
 ---
 

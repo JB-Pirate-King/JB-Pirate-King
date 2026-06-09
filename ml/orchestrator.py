@@ -244,111 +244,6 @@ def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
     return ["🤖 Claude 분석 불가 (수동 확인 필요)"]
 
 
-# ─────────────────────────────────────────────
-# Claude 자동 피처 발명 (claude -p → 동적 후보)
-# ─────────────────────────────────────────────
-
-DYNAMIC_CAND_PATH = "ml/dynamic_candidates.py"
-
-
-def _extract_python_block(text: str) -> str:
-    """응답에서 ```python ... ``` 코드블록 추출 (없으면 DYNAMIC_FEATURES 줄부터)."""
-    m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    i = text.find("DYNAMIC_FEATURES")
-    return text[i:].strip() if i >= 0 else ""
-
-
-def claude_invent_features(analysis_text: str, weak_line: str, n: int,
-                           failed: list = None) -> list:
-    """약세 진단 → claude -p 로 새 피처 N개 발명 → DYNAMIC_CAND_PATH 저장 → 이름 목록 반환.
-
-    failed: 이전 라운드에서 효과 없던 피처(이름,설명) 목록 → 회피 + 다른 접근 유도.
-    실패(코드 없음/exec 오류) 시 빈 목록. 생성 코드는 exec 으로 검증 후 저장."""
-    fail_block = ""
-    if failed:
-        items = "\n".join(f"  - {nm}" for nm in failed)
-        fail_block = (
-            "\n=== 이전에 시도했으나 탐지율을 못 올린 피처 (회피 + 다른 접근 필수) ===\n"
-            f"{items}\n"
-            "위와 **같은 발상/수식 계열은 금지**. 약세를 전혀 다른 각도(예: 시퀀스 "
-            "통계·분포·비율·상호작용항)에서 포착하는 새 피처를 만드세요.\n"
-        )
-    prompt = (
-        "당신은 AIS 선박 이상탐지 DCdetect 모델의 피처 엔지니어입니다. 아래 약세 진단을 "
-        f"바탕으로 현재 모델이 못 잡는 시나리오를 포착할 **새 파생 피처 {n}개**를 발명하세요.\n\n"
-        f"=== 약세 시나리오 ===\n{weak_line}\n\n=== Claude 분석 ===\n{analysis_text}\n"
-        f"{fail_block}\n"
-        "출력 규칙 (엄수):\n"
-        "- 오직 **하나의 파이썬 코드블록**만 출력. 설명 산문 금지.\n"
-        "- 코드블록은 `DYNAMIC_FEATURES` 라는 dict 하나. 형식:\n"
-        "    DYNAMIC_FEATURES = {\n"
-        '        "feature_name": ("한 줄 설명", lambda seq, t: <식>),\n'
-        "    }\n"
-        "- 컬럼 접근은 `seq[t][_B[\"sog\"]]`. BASE 12: sog, cog, heading, status, dt, "
-        "dist_km, cog_hdg_diff, sog_change, cog_hdg_change, speed_consistency, lat_speed, "
-        "lon_speed\n"
-        "- 이전 행 `seq[t-1]`, 반드시 `if t > 0 else 0.0` 가드. 0나눗셈 방지 `max(x,1e-6)`.\n"
-        "- `_ang_diff(a,b)` 와 `math` 사용 가능. 순수함수(부작용 없음).\n"
-        "- 기존 피처와 **수식이 실질적으로 다른** 새 신호. 주석으로 타겟 시나리오 명시.\n"
-        f"- 정확히 {n}개. 이름은 영문 snake_case, 서로 달라야 함.\n"
-    )
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=240,
-        )
-    except Exception as e:
-        print(f"[발명] claude 호출 실패: {e}")
-        return []
-    if result.returncode != 0 or not result.stdout.strip():
-        print("[발명] claude 응답 없음")
-        return []
-
-    code = _extract_python_block(result.stdout)
-    if "DYNAMIC_FEATURES" not in code:
-        print("[발명] DYNAMIC_FEATURES 코드 없음")
-        return []
-
-    # exec 검증: feature_engineer 와 같은 헬퍼(_ang_diff, math, _B) 컨텍스트로 안전 확인
-    import math as _math
-    ns = {"math": _math, "_ang_diff": lambda a, b: abs((a - b + 180) % 360 - 180)}
-    # _B 더미 (이름→인덱스) — BASE 12
-    base = ["sog", "cog", "heading", "status", "dt", "dist_km", "cog_hdg_diff",
-            "sog_change", "cog_hdg_change", "speed_consistency", "lat_speed", "lon_speed"]
-    ns["_B"] = {k: i for i, k in enumerate(base)}
-    try:
-        exec(code, ns)
-        feats = ns.get("DYNAMIC_FEATURES", {})
-        # 더미 시퀀스로 각 lambda 실행 가능 검증
-        dummy = [[0.0] * 12 for _ in range(10)]
-        valid = {}
-        for name, (desc, fn) in feats.items():
-            try:
-                float(fn(dummy, 5))
-                valid[name] = (desc, fn)
-            except Exception as fe:
-                print(f"[발명] '{name}' 실행 실패 제외: {fe}")
-        if not valid:
-            print("[발명] 유효 피처 0개")
-            return []
-    except Exception as e:
-        print(f"[발명] 코드 검증 실패: {e}")
-        return []
-
-    # 동적 후보 파일 저장 (feature_engineer 가 import; _B/_ang_diff/math 는 그쪽 globals)
-    header = (
-        "# 자동 생성: orchestrator claude_invent_features (claude -p)\n"
-        "# feature_engineer 네임스페이스에서 exec 됨 → _B / _ang_diff / math 사용 가능\n\n"
-    )
-    with open(DYNAMIC_CAND_PATH, "w", encoding="utf-8") as f:
-        f.write(header + code + "\n")
-    print(f"[발명] {len(valid)}개 발명 → {DYNAMIC_CAND_PATH}: {list(valid)}")
-    return [(name, desc) for name, (desc, fn) in valid.items()]
-
-
 def fe_adopted_analysis(out: str, adopted: list[str], det_rate,
                         baseline_det, weak_names: list[str]) -> list[str]:
     """FE 채택 피처 상세 분석 (claude_analyze 보완용)"""
@@ -666,9 +561,18 @@ def _save_fe_initial_extra(adopted: list[str]):
         json.dump({"initial_extra": adopted}, f, ensure_ascii=False, indent=2)
 
 
-def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, step_info):
-    """Greedy FE 수렴까지 전체 실행 + Slack 보고.
-    반환: ('approve' | 'retry' | 'stop', full_extra | None, fe_stats)
+def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, step_info):
+    """Greedy FE 1스텝: 학습 + 평가 + 파싱 + Slack/Sheets 로깅 (게이트/빌드/릴리즈 제외).
+
+    반환 dict:
+      ret           — feature_engineer 반환코드 (0=성공)
+      summary       — Slack 요약 라인 목록 (게이트에 그대로 전달)
+      fe_stats      — {baseline_det, det_rate, det_fp5, det_fp10, threshold}
+      newly_adopted — 이번 스텝 신규 채택 피처 (없으면 [])
+      full_extra    — 누적 extra 피처 전체 (성공 시) / None
+      det_rate,det_str,n_feat,n_feat_s,scaler_path — 빌드/릴리즈/게이트 메시지용
+
+    게이트(승인)는 호출측(_fe_run 래퍼 또는 LangGraph 게이트 노드)에서 수행한다.
     """
     cur, total, next_name = step_info
     fe_start_total = len(BASE_FEATURES) + len(current_initial_extra)
@@ -873,8 +777,10 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
                    + fe_details + ["─"] + analysis)
         bot.log_stage_result("피처개선", summary, success=False)
         sheet.log_fe(branch, run_num, "실패", elapsed_sec=elapsed)
-        decision = _wait(bot, "피처 엔지니어링 실패", summary)
-        return decision, None, {}
+        return {"ret": ret, "summary": summary, "fe_stats": {},
+                "newly_adopted": [], "full_extra": None,
+                "det_rate": None, "det_str": "?", "n_feat": None,
+                "n_feat_s": "?", "scaler_path": None}
 
     # 결과 파싱
     det_rate, det_fp5, det_fp10, n_feat, threshold = None, None, None, None, None
@@ -929,22 +835,6 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
     })
     bot.log("\n".join(analysis), "피처개선")
 
-    # Ralph 닫힌 루프용: Claude 분석 + 약세 시나리오를 파일로 저장.
-    #   ralph_feature_invention.md 가 이 파일을 읽어 진단된 약세를 정조준해 새 피처 발명.
-    weak_line = next((l.strip() for l in out.splitlines()
-                      if "약세 시나리오(" in l), "")
-    try:
-        (WORK_DIR / "claude_fe_analysis.md").write_text(
-            f"# Claude FE 분석 (branch {branch}, iter {run_num:03d})\n\n"
-            f"채택: {', '.join(newly_adopted) or '없음'} | "
-            f"탐지율 {baseline_det}→{det_rate} | 총 {n_feat}피처\n\n"
-            f"## 약세 시나리오\n{weak_line}\n\n"
-            f"## Claude 분석\n" + "\n".join(analysis) + "\n",
-            encoding="utf-8",
-        )
-    except Exception as e:
-        print(f"[claude_fe_analysis 저장 실패] {e}")
-
     if candidates:
         baseline_info = ""
         if baseline_det is not None and baseline_score is not None:
@@ -986,16 +876,69 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
     if scenario_fp1:
         sheet.log_scenarios(branch, args.model, "FP=1%", scenario_fp1)
 
-    if newly_adopted:
-        det_str  = f"{det_rate:.1f}" if det_rate is not None else "?"
-        n_feat_s = str(n_feat) if n_feat else "?"
+    det_str  = f"{det_rate:.1f}" if det_rate is not None else "?"
+    n_feat_s = str(n_feat) if n_feat else "?"
+    scaler_path = str(WORK_DIR / "model" / f"scaler_{args.model}.json")
+    return {
+        "ret": 0, "summary": summary, "fe_stats": fe_stats,
+        "newly_adopted": newly_adopted, "full_extra": full_extra,
+        "det_rate": det_rate, "det_str": det_str,
+        "n_feat": n_feat, "n_feat_s": n_feat_s, "scaler_path": scaler_path,
+    }
 
-        # ── 게이트 ①: FE 평가 결과 → 배포(빌드·커밋·릴리즈) 진행 여부 ──
-        #   summary 에 Claude 분석이 포함되어 있어, 승인 버튼과 함께 표시됨.
+
+def _fe_build_and_release(bot, sheet, branch, args, run_num, r: dict) -> bool:
+    """게이트① 통과 후: 플러그인 빌드 → (게이트② 호출측) → 커밋 + 릴리즈.
+
+    이 함수는 빌드만 수행하고 build_summary 를 bot 에 로깅한다. 커밋/릴리즈는
+    게이트②를 거쳐야 하므로 _fe_run 래퍼/LangGraph 노드에서 분리 호출한다.
+    반환: commit_files (빌드 산출 파일 목록).
+    """
+    commit_files = stage_build_plugin(bot, args, r["scaler_path"])
+    build_summary = [
+        "✅ 플러그인 빌드 완료" if commit_files else "⚠️ 빌드 산출 없음(부분 실패 가능)",
+        f"커밋 대상 파일 {len(commit_files)}개 (C++ 패치 + 모델)",
+        f"채택 피처셋 {r['n_feat_s']}개 · 탐지율 {r['det_str']}%",
+    ]
+    bot.log_stage_result("플러그인빌드", build_summary, success=bool(commit_files))
+    return commit_files, build_summary
+
+
+def _fe_commit_release(bot, sheet, branch, args, run_num, r: dict, commit_files: list):
+    """게이트② 통과 후: git 커밋 + GitHub 릴리즈."""
+    if commit_files:
+        git.commit_results(
+            commit_files,
+            f"feat(fe): {args.model} iter{run_num:03d} "
+            f"det={r['det_str']}% feat={r['n_feat_s']} ({len(r['newly_adopted'])}개 채택)",
+            branch=branch,
+        )
+    stage_release(bot, args, branch, run_num, r["full_extra"], r["det_rate"])
+
+
+def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, step_info):
+    """기존 동작 보존 래퍼: train_eval → 게이트① → 빌드 → 게이트② → 커밋/릴리즈.
+    반환: ('approve' | 'retry' | 'stop', full_extra | None, fe_stats)
+
+    분해 함수(_fe_train_eval/_fe_build_and_release/_fe_commit_release)를 blocking
+    게이트(_wait)로 엮는다. LangGraph(orchestrator_lg) 는 같은 분해 함수를
+    interrupt() 게이트 노드로 엮어 재구성한다.
+    """
+    r = _fe_train_eval(bot, sheet, branch, args, run_num,
+                       current_initial_extra, fe_dir, step_info)
+    fe_stats = r["fe_stats"]
+
+    if r["ret"] != 0:
+        decision = _wait(bot, "피처 엔지니어링 실패", r["summary"])
+        return decision, None, fe_stats
+
+    newly_adopted = r["newly_adopted"]
+    if newly_adopted:
+        # ── 게이트 ①: FE 평가 → 배포 진행 여부 ──
         gate1 = _wait(
             bot,
-            f"FE 평가 — `{', '.join(newly_adopted)}` 채택 (탐지율 {det_str}%) → 배포 진행?",
-            summary,
+            f"FE 평가 — `{', '.join(newly_adopted)}` 채택 (탐지율 {r['det_str']}%) → 배포 진행?",
+            r["summary"],
         )
         if gate1 == "retry":
             return "retry", None, fe_stats
@@ -1003,36 +946,18 @@ def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, st
             bot.log("⏹ 채택했으나 배포 중단 (사용자 stop) — 모델 미커밋", "피처개선")
             return "stop", None, fe_stats
 
-        # ── 배포 단계: 플러그인 빌드 ──
-        #   모델/JSON은 WORK_DIR(gitignore, 임시). 영구 보존: 모델→ais_ids_pi/data 커밋.
-        model_dir    = WORK_DIR / "model"
-        scaler_path  = str(model_dir / f"scaler_{args.model}.json")
-        commit_files = stage_build_plugin(bot, args, scaler_path)
+        commit_files, build_summary = _fe_build_and_release(bot, sheet, branch, args, run_num, r)
 
-        # ── 게이트 ②: 빌드 결과 → 커밋 + GitHub 릴리즈 진행 여부 ──
-        build_summary = [
-            "✅ 플러그인 빌드 완료" if commit_files else "⚠️ 빌드 산출 없음(부분 실패 가능)",
-            f"커밋 대상 파일 {len(commit_files)}개 (C++ 패치 + 모델)",
-            f"채택 피처셋 {n_feat_s}개 · 탐지율 {det_str}%",
-        ]
-        bot.log_stage_result("플러그인빌드", build_summary, success=bool(commit_files))
+        # ── 게이트 ②: 빌드 → 커밋 + 릴리즈 진행 여부 ──
         gate2 = _wait(bot, "배포 — git 커밋 + GitHub 릴리즈 진행?", build_summary)
         if gate2 == "stop":
             bot.log("⏹ 빌드까지 완료, 커밋/릴리즈 중단 (사용자 stop)", "피처개선")
             return "stop", None, fe_stats
 
-        if commit_files:
-            git.commit_results(
-                commit_files,
-                f"feat(fe): {args.model} iter{run_num:03d} "
-                f"det={det_str}% feat={n_feat_s} ({len(newly_adopted)}개 채택)",
-                branch=branch
-            )
-
-        stage_release(bot, args, branch, run_num, full_extra, det_rate)
-        return "approve", full_extra, fe_stats
+        _fe_commit_release(bot, sheet, branch, args, run_num, r, commit_files)
+        return "approve", r["full_extra"], fe_stats
     else:
-        decision = _wait(bot, "피처 엔지니어링 — 수렴 완료 → 파이프라인 종료?", summary)
+        decision = _wait(bot, "피처 엔지니어링 — 수렴 완료 → 파이프라인 종료?", r["summary"])
         return decision, None, fe_stats
 
 
@@ -1074,98 +999,6 @@ def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
         return new_extra if new_extra is not None else []
 
 
-def diagnose_baseline(bot, args) -> tuple:
-    """베이스(12피처)만 학습/평가 → (analysis_lines, weak_line, base_det) 반환. 라운드 무관 1회."""
-    bot.log("🧪 *자동 피처 발명* — 베이스라인 진단 (12피처)", "피처개선")
-    out_json = str(WORK_DIR / "baseline_diag.json")
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-
-    _diag_done = {"phase2": False}
-
-    def diag_progress(line, proc=None):
-        """진단 단계 Slack 라이브 보고 (마일스톤만, 스팸 방지)."""
-        s = line.strip()
-        m = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*val=([\d.]+)", line)
-        if m:
-            ep, tot = int(m.group(1)), int(m.group(2))
-            if ep == 1 or ep == tot or ep == max(1, tot // 2):
-                label = "재학습" if _diag_done["phase2"] else "베이스 진단"
-                bot.log(f"🧠 {label} 학습 Epoch {ep}/{tot} (val={m.group(3)})  "
-                        f"[{(time.time()-t0)/60:.0f}분]", "피처개선")
-            return
-        if "전체 평균 탐지율" in s:
-            m2 = re.search(r"탐지율\s+([\d.]+)%.*목적점수\s+([\d.]+)", s)
-            if m2:
-                bot.log(f"📊 베이스라인(12피처): *FP=1% 탐지율 {m2.group(1)}%*  ·  "
-                        f"목적점수 {m2.group(2)}", "피처개선")
-            else:
-                bot.log(f"📊 베이스라인(12피처): {s}", "피처개선")
-            return
-        if "약세 시나리오(" in s:
-            bot.log(f"⚠️ {s}", "피처개선"); return
-        if "최적 피처셋" in s and "재학습" in s:
-            _diag_done["phase2"] = True
-            bot.log("🔁 진단 모델 재학습 + 순열중요도 계산...", "피처개선"); return
-        if "Permutation Importance 계산" in s:
-            bot.log("🔑 순열 중요도 계산 중...", "피처개선"); return
-        mfp = re.search(r"FP=1%:\s*([\d.]+)%\s+FP=5%:\s*([\d.]+)%\s+FP=10%:\s*([\d.]+)%", s)
-        if mfp:
-            bot.log(f"📈 진단 최종 — FP1 {mfp.group(1)}% / FP5 {mfp.group(2)}% / "
-                    f"FP10 {mfp.group(3)}%", "피처개선"); return
-
-    ret, out = run_cmd(
-        [sys.executable, "ml/core/feature_engineer.py",
-         "--model", args.model,
-         "--input", args.data_file,
-         "--base_dir", args.base_dir,
-         "--epochs", str(args.epochs),
-         "--max_mmsi", str(args.max_mmsi),
-         "--n_anom", str(args.n_anom if args.n_anom else args.max_mmsi),
-         # 누적: 현 채택셋(fe_state)을 시작점으로 진단 → 이미 채택된 피처가 가린 약세 말고
-         #   '아직 남은' 약세를 정조준해 발명 (순수 베이스 아님). fe_state 비면 베이스 12.
-         "--initial_extra"] + _load_fe_initial_extra() + [
-         "--candidates",                       # 빈값 = 후보 0 (진단만)
-         "--diagnose_only",                    # 약세 진단까지만 (재학습/순열중요도 생략)
-         "--out_json", out_json]
-        + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
-        progress_cb=diag_progress,
-    )
-    elapsed = time.time() - t0
-    if ret != 0:
-        bot.log("❌ 베이스라인 진단 실패 — 발명 생략", "warning")
-        return []
-
-    weak_line = next((l.strip() for l in out.splitlines() if "약세 시나리오(" in l), "")
-    base_det = None
-    m = re.search(r"전체 평균 탐지율\s+([\d.]+)%", out)
-    if m:
-        base_det = float(m.group(1))
-    bot.log(f"📊 베이스라인 진단: 탐지율 {base_det}%\n{weak_line}", "피처개선")
-
-    analysis = claude_analyze("피처개선", out, True, elapsed,
-                              {"baseline_det": base_det, "phase": "invent_diagnosis"})
-    bot.log("🤖 *발명 근거 분석*\n" + "\n".join(analysis), "피처개선")
-    return analysis, weak_line, base_det
-
-
-def stage_invent(bot, args, analysis: list, weak_line: str,
-                 failed: list, round_n: int) -> list:
-    """진단(analysis/weak_line) 기반 claude -p 피처 발명 (라운드별). 발명 이름 목록 반환.
-    failed: 이전 라운드 실패 피처 이름 → 회피. round_n: 현재 라운드(로그)."""
-    bot.log(f"🧬 *발명 라운드 {round_n}* — claude 가 약세 정조준 {args.invent}개 생성"
-            + (f" (이전 실패 {len(failed)}개 회피)" if failed else ""), "피처개선")
-    pairs = claude_invent_features("\n".join(analysis), weak_line, args.invent, failed=failed)
-    if pairs:
-        lines = [f"🧬 *발명 완료* {len(pairs)}개 (계산식):"]
-        for nm, ds in pairs:
-            lines.append(f"  • `{nm}` — {ds}")
-        bot.log("\n".join(lines), "피처개선")
-    else:
-        bot.log("⚠️ 발명 실패", "warning")
-    return [nm for nm, _ in pairs]
-
-
 # ─────────────────────────────────────────────
 # 메인
 # ─────────────────────────────────────────────
@@ -1188,12 +1021,7 @@ def main():
     parser.add_argument("--scan_ratio",      type=float, default=1.0,
                         help="후보 스캔 학습 표본 비율 (예 0.4, 채택본은 풀 재학습). 1.0=풀")
     parser.add_argument("--candidates",      nargs="*", default=None,
-                        help="탐색 후보 피처 명시 (Ralph/큐레이션 추천 10개 등). 미지정=전체 20개")
-    parser.add_argument("--invent",          type=int, default=0,
-                        help="첫 브랜치 전 베이스라인 진단 → claude -p 로 약세 정조준 피처 N개 "
-                             "자동 발명 후 그 N개를 후보로 사용 (0=비활성)")
-    parser.add_argument("--invent_rounds",   type=int, default=1,
-                        help="발명 라운드 상한. 채택 0이면 실패 피드백으로 재발명 (기본 1)")
+                        help="탐색 후보 피처 명시 (큐레이션 추천 10개 등). 미지정=전체 20개")
     parser.add_argument("--n_anom",          type=int, default=None,
                         help="시나리오당 이상 시퀀스 수. 미지정 시 max_mmsi 와 동일 (노이즈↓)")
     parser.add_argument("--overall_tol",     type=float, default=1.0,
@@ -1224,21 +1052,6 @@ def main():
     # FE-only 체이닝: 브랜치마다 Greedy 1피처 채택 → fe_state 갱신 → 새 브랜치
     #   (dcdetect_001→002→...) → 수렴(채택 없음)하면 종료.
     #   베이스라인 학습+평가는 FE 내부에서 수행. 전처리는 첫 브랜치에서만(--skip_preprocess 아니면).
-    # 자동 피처 발명 (다라운드): 베이스 진단(1회) → 발명 → FE → 채택 0 이면 실패 피드백으로
-    #   재발명(invent_rounds 까지). 채택되면 그 피처셋으로 정상 체이닝.
-    invent = {"on": bool(args.invent and args.invent > 0),
-              "analysis": None, "weak": "", "failed": [], "round": 0,
-              "adopted_any": False}
-    if invent["on"]:
-        invent["analysis"], invent["weak"], _ = diagnose_baseline(bot, args)
-        invent["round"] = 1
-        invented = stage_invent(bot, args, invent["analysis"], invent["weak"],
-                                invent["failed"], invent["round"])
-        if invented:
-            args.candidates = invented
-        else:
-            invent["on"] = False   # 발명 실패 → 발명 모드 끔
-
     first_iter = True
     iters = 0
     try:
@@ -1284,12 +1097,8 @@ def main():
                 bot.log("파이프라인 중단", "warning")
                 return
             elif fe_result:
-                # 채택 발생 → 발명모드 충족 표시(이후 수렴은 진짜 종료, 재발명 안 함).
-                #   재발명은 '한 번도 채택 안 됐을 때'만 → 채택된 발명피처가 dynamic 에서
-                #   사라지는 KeyError 방지.
-                invent["adopted_any"] = True
-                # fe_state 저장 + 이 브랜치에 커밋(체이닝이 git 히스토리로 누적되도록)
-                #   → 다음 브랜치는 이 run 브랜치를 base 로 분기 (create_branch 기본 동작).
+                # 채택 발생 → fe_state 저장 + 이 브랜치에 커밋(체이닝이 git 히스토리로
+                #   누적되도록) → 다음 브랜치는 이 run 브랜치를 base 로 분기.
                 _save_fe_initial_extra(fe_result)
                 git.commit_results(
                     [FE_STATE_FILE],
@@ -1304,29 +1113,10 @@ def main():
                 )
                 continue
             else:
-                # 수렴 — 채택 없음. 발명 모드 + **아직 한 번도 채택 안 됨** + 라운드 남음 →
-                #   실패 피드백으로 재발명 후 재시도. (한 번이라도 채택됐으면 진짜 수렴 종료.)
-                if (invent["on"] and not invent["adopted_any"]
-                        and invent["round"] < args.invent_rounds):
-                    invent["failed"] += (args.candidates or [])
-                    invent["round"] += 1
-                    bot.log(f"🔁 채택 0 → *재발명 라운드 {invent['round']}* "
-                            f"(실패 {len(invent['failed'])}개 회피)", "피처개선")
-                    re_inv = stage_invent(bot, args, invent["analysis"], invent["weak"],
-                                          invent["failed"], invent["round"])
-                    if re_inv:
-                        args.candidates = re_inv
-                        # 재발명은 같은 run 번호 유지 → 실패 브랜치 삭제 후 재생성.
-                        #   (채택돼야 번호 증가; 실패 라운드는 번호 안 먹음)
-                        git.delete_branch(branch)
-                        iters -= 1   # 이 run 은 재시도라 카운트 미반영
-                        continue
-                # 재발명 불가/실패 또는 비발명 모드 → 종료
-                note = (f"발명 {invent['round']}라운드 시도, 채택 없음"
-                        if invent["on"] else "모든 후보 탐색 완료 — 추가 채택 없음")
+                # 수렴 — 채택 없음 → 종료
                 bot.log_stage_result(
                     "파이프라인 완료 — 수렴",
-                    [f"브랜치: {branch}", note],
+                    [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
                     success=True
                 )
                 return
