@@ -33,11 +33,7 @@ import ml.integrations.git_manager as git
 
 CONFIG_PATH = "ml/pipeline_config.json"
 
-BASE_FEATURES = [
-    "sog", "cog", "heading", "status", "dt", "dist_km",
-    "cog_hdg_diff", "sog_change", "cog_hdg_change",
-    "speed_consistency", "lat_speed", "lon_speed"
-]
+from ml.core.constants import BASE_FEATURES   # 단일 출처 (ml/core/constants.py)
 
 # feature_engineer.py 의 INITIAL_EXTRA 와 동기화
 FE_INITIAL_EXTRA = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
