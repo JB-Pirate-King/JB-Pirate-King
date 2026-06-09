@@ -43,8 +43,8 @@ python ml/core/feature_engineer.py --input D:/ais_data/preprocessed/ais_preproce
 
 The orchestrator auto-chains run branches (`dcdetect_001 → 002 → ...`), adopting one feature per
 run until convergence. See [`CLAUDE.md`](CLAUDE.md) for the full pipeline architecture, the
-`--max_runs` / `--build_plugin` flags, branch-chaining behavior, and the **Ralph Loop** for
-autonomous feature invention. More ML detail in [`ml/README.md`](ml/README.md).
+`--max_runs` / `--build_plugin` flags, branch-chaining behavior, and the **LangGraph port**
+(`ml/orchestrator_lg.py`). More ML detail in [`ml/README.md`](ml/README.md).
 
 ---
 

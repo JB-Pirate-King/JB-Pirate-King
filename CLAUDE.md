@@ -11,7 +11,7 @@ On code/structure change, keep ALL docs in sync. Before push (or when asked to p
 
 > Rule: a code/structure change isn't "done" until README + CLAUDE.md + Notion reflect it.
 
-> **Docs language: English.** All Markdown docs and any prompt-as-file (e.g. `ml/ralph_feature_invention.md`) are written in English.
+> **Docs language: English.** All Markdown docs are written in English.
 
 ---
 
@@ -39,7 +39,7 @@ JB-Pirate-King/
 │   │   ├── notify.py           # Discord webhook + Notion reports
 │   │   └── git_manager.py      # Auto branch creation / commit
 │   ├── orchestrator.py         # Full pipeline entry point (Slack + Sheets + git)
-│   ├── ralph_feature_invention.md # Ralph Loop prompt: autonomous feature invention (English)
+│   ├── orchestrator_lg.py      # LangGraph port of orchestrator (interrupt-gated HITL) ★
 │   ├── reset_sheets.py         # Utility: clear all Google Sheets tabs (keep headers)
 │   ├── fe_state.json           # FE starting features (initial_extra)
 │   ├── build_plugin_wsl.sh     # WSL (Ubuntu-24.04) cmake+make package auto-build ★
@@ -145,7 +145,7 @@ SEQ_LEN = 10
 | `heading_change` | Heading change — \|heading(t) - heading(t-1)\| |
 | `vec_sog_diff` | Vector-SOG diff — magnitude diff after vector decomposition |
 
-> The candidate pool is **not fixed** — see [Ralph Loop](#ralph-loop-autonomous-feature-invention) for autonomous invention of new candidates.
+> The candidate pool is the fixed `CANDIDATE_FEATURES` set in `feature_engineer.py`. New candidates are added by editing that dict directly.
 
 ### Current adoption status (as of dcdetect_012)
 
@@ -245,18 +245,28 @@ Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
 
 ---
 
-## Ralph Loop: Autonomous Feature Invention
+## LangGraph Port (`ml/orchestrator_lg.py`)
 
-Orchestrator only **selects** from the fixed `CANDIDATE_FEATURES` pool; never writes new feature code. The `ralph-loop` plugin closes the gap: re-feeds a prompt file each iteration so Claude **invents new candidate features**, growing the pool until convergence.
+A LangGraph reimplementation of `orchestrator.py`'s control flow. Same behavior, but the
+pipeline is a `StateGraph` instead of a hand-written `while` loop.
 
-- **Prompt file**: `ml/ralph_feature_invention.md` (English). Per iteration: pick weak scenario (<50%) → physical hypothesis → add ONE `(desc, lambda)` to `CANDIDATE_FEATURES` → validate via standalone FE → keep+commit if objective gain ≥ +3.0pp, revert if < 0 → log to `ml/.ralph_fe_log.md`. Done at 3 adopted features with `<promise>RALPH_FE_DONE</promise>`.
-- **Closed loop with orchestrator**: each FE run writes its Claude analysis (weak-scenario diagnosis + suggested feature *kinds*) to `ml/.pipeline_tmp/claude_fe_analysis.md` (`orchestrator._fe_run`). Ralph reads it as the primary invention direction → new candidates are grounded in the run's own data, not static guesses. Workflow: orchestrator converges → Ralph invents candidates targeting the diagnosed weaknesses → rerun orchestrator with the grown pool.
-- **Launch** (English prompt):
-  ```
-  /ralph-loop Execute the mission in ml/ralph_feature_invention.md exactly. Re-read that file at the start of every iteration and follow the procedure. --max-iterations 30 --completion-promise "RALPH_FE_DONE"
-  ```
-- **Windows hook**: the plugin Stop hook must use Git Bash (it needs `jq`/`perl`). The cached `hooks/hooks.json` is patched to `"C:/Program Files/Git/bin/bash.exe"`. **A hooks.json change requires a Claude Code restart** to take effect.
-- **Do NOT run Ralph while the orchestrator test is running** — both share one working tree and touch git; commits collide. Ralph uses **standalone FE only** (no orchestrator, no branch chaining).
+- **Decomposed FE**: `orchestrator.py`'s `_fe_run` is split into reusable pieces —
+  `_fe_train_eval` (greedy 1-feature train + eval + parse + logging), `_fe_build_and_release`
+  (plugin build), `_fe_commit_release` (git commit + GitHub release). The original `_fe_run`
+  is now a thin wrapper over these, so `orchestrator.py` behavior is unchanged.
+- **interrupt() gates**: the 3 HITL gates (FE-eval / build / converge) + fail gate are
+  independent nodes that call LangGraph `interrupt()`. Because gates sit at node boundaries
+  (not inside the heavy train node), a crash while awaiting Slack approval resumes **without
+  retraining** — the `_fe_train_eval` result is preserved in the checkpoint.
+- **Chaining = graph cycle**: `release → chain → new_branch`. Convergence (no adoption) →
+  `converge → END`. `--max_runs` is a state-counter guard; `recursion_limit = max_runs × 15`.
+- **Checkpointer**: `MemorySaver` (in-process). Swap to `SqliteSaver` for cross-restart resume.
+- **Runner**: `run_pipeline` polls `__interrupt__`, gets the Slack decision via
+  `bot.wait_approval`, resumes with `Command(resume=decision)`.
+- **Launch**: same flags as `orchestrator.py` (run with `python -m ml.orchestrator_lg`).
+
+> Both orchestrators share the same execution functions and integrations (slack/sheets/git).
+> `orchestrator.py` remains the canonical entry point; `orchestrator_lg.py` is the graph variant.
 
 ---
 

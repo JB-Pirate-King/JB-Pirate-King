@@ -267,7 +267,7 @@ CANDIDATE_FEATURES: dict = {
             1.0 for row in seq if int(round(row[_B["status"]])) not in (0, 1, 5)
         ) / len(seq),
     ),
-    # ── Ralph 발명 (claude_fe_analysis item4-① 기반, D1-LowSlow 0% 타겟) ──
+    # ── 채택 승격 (D1-LowSlow 0% 타겟) ──
     "lowspeed_micro_var": (
         "저속 미세변동 누적 (sog<3kn에서 COG 누적변화/길이)",
         # D1-LowSlow: 느린데 비정상적으로 꿈틀대는 궤적. 저속 정상선(정박/계류)은
@@ -301,23 +301,6 @@ CANDIDATE_FEATURES: dict = {
         ),
     ),
 }
-
-
-# ── 동적 후보 (claude -p 자동 발명분) ───────────────────────────────
-# orchestrator 의 발명 stage 가 약세 진단 → claude -p 로 새 피처 lambda 를
-# ml/dynamic_candidates.py 에 DYNAMIC_FEATURES dict 로 써넣는다. 여기서 이 파일을
-# 이 모듈 네임스페이스에서 exec → lambda 가 _B / _ang_diff / math 를 그대로 참조,
-# CANDIDATE_FEATURES 에 병합한다. 파일 없으면 무시(기본 동작 불변).
-_DYN_PATH = os.path.join(os.path.dirname(__file__), "..", "dynamic_candidates.py")
-if os.path.exists(_DYN_PATH):
-    try:
-        with open(_DYN_PATH, encoding="utf-8") as _df:
-            exec(_df.read(), globals())          # DYNAMIC_FEATURES 정의
-        _dyn = globals().get("DYNAMIC_FEATURES", {})
-        CANDIDATE_FEATURES.update(_dyn)
-        print(f"[동적후보] {len(_dyn)}개 로드: {list(_dyn)}")
-    except Exception as _e:
-        print(f"[동적후보] 로드 실패(무시): {_e}")
 
 
 # ── 편향 제거용 스케일러 ─────────────────────────────────────────
@@ -875,7 +858,7 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     current_extra: list = list(INITIAL_EXTRA)
     # accel 등 INITIAL_EXTRA에 포함된 항목은 다시 탐색하지 않음
     remaining: list = [k for k in CANDIDATE_FEATURES.keys() if k not in INITIAL_EXTRA]
-    # 후보 명시 (--candidates): 지정한 이름만 탐색 (Ralph/큐레이션 추천 풀).
+    # 후보 명시 (--candidates): 지정한 이름만 탐색 (큐레이션 추천 풀).
     #   CANDIDATE_FEATURES 에 있고 INITIAL_EXTRA(기채택) 아닌 것만 유효.
     cand_list = getattr(args, "candidates", None)
     if cand_list is not None:   # 명시됨 (빈 리스트면 베이스전용 = 후보 0)
@@ -1218,7 +1201,7 @@ def main():
     ap.add_argument("--max_candidates", type=int, default=None,
                     help="Greedy 후보 수 제한 (정의 순서 앞 N개만, 속도용)")
     ap.add_argument("--candidates", nargs="*", default=None,
-                    help="탐색할 후보 피처 이름 명시 (Ralph/큐레이션 추천 풀). "
+                    help="탐색할 후보 피처 이름 명시 (큐레이션 추천 풀). "
                          "미지정 시 CANDIDATE_FEATURES 전체")
     ap.add_argument("--diagnose_only", action="store_true",
                     help="베이스라인 학습+평가(약세 진단)까지만, 재학습/순열중요도/export 생략")
@@ -1254,7 +1237,7 @@ def main():
     print_report(history)
 
     # 진단 전용(--diagnose_only): 약세 시나리오만 필요 → 재학습/순열중요도/export 생략.
-    #   orchestrator stage_invent 가 약세 진단만 쓰므로 ③단계(낭비) 건너뜀.
+    #   약세 진단만 빠르게 보고 싶을 때 ③단계(낭비) 건너뜀.
     if getattr(args, "diagnose_only", False):
         base_h = history[0]
         scen = {n: d for n, d, _ in base_h.get("scenarios", [])}
