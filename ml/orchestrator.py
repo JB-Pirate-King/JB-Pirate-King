@@ -18,12 +18,22 @@ graph.md 구조도 반영:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Optional, TypedDict
 
 sys.stdout.reconfigure(encoding="utf-8")
+
+# .env 로드 (LANGCHAIN_* 등)
+_env_file = Path(__file__).parent.parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text(encoding="utf-8").splitlines():
+        if _line.strip() and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -259,8 +269,6 @@ def _reco_prompt(weak: str, tried: list, base_det) -> str:
 
 def n_recommend(state: PipelineState) -> dict:
     """claude 피처 추천 → 검증 → dynamic_candidates.py 기록 → 후보풀 확장."""
-    if not (RT.args.invent and RT.args.invent > 0):
-        return {"candidates": []}     # reco 비활성 → 기존 후보 사용
     weak = state.get("baseline", {}).get("weak", "")
     tried = state.get("tried_feats", [])
     arr = _claude_json(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")), timeout=240)
@@ -534,7 +542,7 @@ def main():
     p.add_argument("--max_candidates", type=int, default=None)
     p.add_argument("--scan_ratio", type=float, default=1.0)
     p.add_argument("--candidates", nargs="*", default=None)
-    p.add_argument("--invent", type=int, default=0, help="claude 피처 추천 N개 (0=비활성)")
+    p.add_argument("--invent", type=int, default=5, help="claude 피처 추천 N개")
     p.add_argument("--invent_rounds", type=int, default=1, help="수렴 시 재추천 라운드 상한")
     p.add_argument("--n_anom", type=int, default=None)
     p.add_argument("--overall_tol", type=float, default=1.0)

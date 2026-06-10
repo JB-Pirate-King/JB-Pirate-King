@@ -189,12 +189,15 @@ Deploy threshold = the FP=1% threshold → guarantees a ~1% false-positive rate 
 
 SEQ_LEN = 10
 
-### FE adoption status (as of dcdetect_012)
+### FE candidate pool — fully dynamic
 
-Base 12 + extra 12 = **24 features**
-Best detection rate: dcdetect_011 → **83.5% (FP=1%, 23 features)**
+`CANDIDATE_FEATURES` in `feature_engineer.py` is **empty** — there are no static candidates.
+All candidates are invented per run by the orchestrator's `recommend` node (`claude -p`,
+`--invent N`, default 5): weak-scenario diagnosis → N new lambda features → validated →
+written to `ml/dynamic_candidates.py` (gitignored) → loaded by `feature_engineer.py` via exec.
 
-> The candidate pool is the fixed `CANDIDATE_FEATURES` dict in `feature_engineer.py`; add new candidates by editing it.
+FE runs restarted from scratch (base 12 features, `fe_state.json` reset) after the
+LangGraph migration; prior adoption history lives in the `run/dcdetect_NNN` release tags.
 
 ---
 

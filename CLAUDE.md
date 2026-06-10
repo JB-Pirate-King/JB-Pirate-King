@@ -155,31 +155,20 @@ python ml/core/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed
 
 SEQ_LEN = 10
 
-### FE candidate features (CANDIDATE_FEATURES in feature_engineer.py)
+### FE candidate features — fully dynamic (no static pool)
 
-| Feature | Computation |
-|---|---|
-| `sog_vec_kn` | GPS-derived speed — lat/lon_speed → km/s → knots |
-| `lowspeed_crab` | Low-speed crab angle — cog_hdg_diff × max(0, 1-sog/3kn) |
-| `cog_change` | COG change — \|COG(t) - COG(t-1)\| (deg) |
-| `cog_move_diff` | COG vs actual heading-of-travel diff — error between AIS COG and lat/lon-derived travel angle |
-| `dist_speed_err` | Distance/speed mismatch — \|dist_km/dt×3600 - sog×1.852\| |
-| `dist_speed_ratio` | Distance/speed ratio — dist_km / (sog×dt converted) |
-| `anchor_suspicion` | Anchor suspicion — low-speed + heading-change composite indicator |
-| `speed_ratio` | Relative speed change rate — \|sog_change\| / max(sog, 0.5) |
-| `anchored_excess_speed` | Excess speed while anchored — status∈{1,5,6} × max(0, sog-1.5kn) |
-| `accel` | Acceleration — Δsog/dt (knots/s) |
-| `heading_rate` | Heading change rate — Δheading/dt (°/s) |
-| `heading_change` | Heading change — \|heading(t) - heading(t-1)\| |
-| `vec_sog_diff` | Vector-SOG diff — magnitude diff after vector decomposition |
+`CANDIDATE_FEATURES` in `feature_engineer.py` is **empty**. All candidates are invented
+per run by the orchestrator `recommend` node: weak-scenario diagnosis → `claude -p`
+proposes `--invent N` (default 5) new lambda features → validated (exec on dummy seq +
+dedup) → written to `ml/dynamic_candidates.py` (gitignored) → `feature_engineer.py`
+exec-loads them into the pool.
 
-> The candidate pool is the fixed `CANDIDATE_FEATURES` set in `feature_engineer.py`. New candidates are added by editing that dict directly.
+### Current adoption status
 
-### Current adoption status (as of dcdetect_012)
-
-Base 12 + extra 12 = **24 features**
-Extra: `sog_vec_kn, lowspeed_crab, cog_change, cog_move_diff, dist_speed_err, dist_speed_ratio, accel, anchor_suspicion, heading_rate, heading_change, speed_ratio, anchored_excess_speed`
-Best detection rate: dcdetect_011 → **83.5% (FP=1%, 23 features)**
+FE history reset after the LangGraph migration — runs restart from the base 12 features
+(`fe_state.json` `initial_extra: []`, branch numbering back to `dcdetect_001`).
+Prior runs (up to 24 features, best 83.5% FP=1%) are preserved in `run/dcdetect_NNN`
+release tags and git history.
 
 ---
 
@@ -287,7 +276,8 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md`
 - **claude feature recommendation (`n_recommend`)**: weak-scenario diagnosis → `claude -p` proposes
   N new candidate features (name + lambda) → validated (exec on dummy seq + dedup) → written to
   `ml/dynamic_candidates.py` (gitignored) → `feature_engineer` loads + scans them. Convergence
-  (no adoption) re-recommends from a different angle up to `--invent_rounds`. Enable with `--invent N`.
+  (no adoption) re-recommends from a different angle up to `--invent_rounds`. `--invent` defaults
+  to **5** and is the ONLY candidate source — `CANDIDATE_FEATURES` is empty (no static pool).
 - **per-node claude harness** (`claude_harness` factory): each compute node is followed by a harness
   node that runs `claude -p --output-format json` → `{assessment, verdict: continue|retry|stop, ...}`
   → routing. Toggle per node via `HARNESS_ON` set; `--no_harness` disables all.
@@ -301,6 +291,9 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md`
   resumes with `Command(resume=decision)`.
 - **Launch**: `python -m ml.orchestrator` (same flags as before + `--invent`, `--invent_rounds`,
   `--no_harness`).
+- **LangSmith tracing**: `orchestrator.py` auto-loads repo-root `.env` (gitignored) at import —
+  set `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT` there and every
+  node run/route is traced to smith.langchain.com with no code changes.
 
 ---
 
