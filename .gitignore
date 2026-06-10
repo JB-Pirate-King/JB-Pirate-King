@@ -78,3 +78,6 @@ ml/google_credentials.json
 *.original.md
 
 ml/.baseline_diag*
+
+# reco 생성 동적 후보
+ml/dynamic_candidates.py
