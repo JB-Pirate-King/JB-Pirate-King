@@ -10,5 +10,11 @@
     "_comment": "Google Cloud 서비스계정 JSON 경로 + 대상 시트 ID. 서비스계정 이메일을 해당 시트에 편집자로 공유할 것.",
     "credentials_file": "ml/google_credentials.json",
     "sheet_id": "구글시트-URL-가운데-ID"
+  },
+  "_notify_comment": "Discord+Slack 동시 알림 — ml/notify_config.json (별도 gitignore 파일)에 설정.",
+  "_notify_config_example": {
+    "discord_webhook": "https://discord.com/api/webhooks/...",
+    "slack_bot_token": "xoxb-...",
+    "slack_channel": "ais-training-alerts"
   }
 }

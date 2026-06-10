@@ -1,0 +1,5 @@
+# 각 팀원의 Obsidian 개인 설정은 공유하지 않음
+.obsidian/
+.trash/
+.DS_Store
+Thumbs.db

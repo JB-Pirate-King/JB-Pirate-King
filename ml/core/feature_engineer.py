@@ -81,7 +81,7 @@ EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 �
 # 0% 고착 시나리오를 살리는 피처가 영원히 채택되지 않는다.
 # 목적 점수 = 전체평균 + WEAK_WEIGHT × (베이스라인 약세 시나리오 평균)
 WEAK_FLOOR_DEFAULT  = 50.0   # 베이스라인 탐지율 < 이 값 → "약세" 시나리오로 분류
-WEAK_WEIGHT_DEFAULT = 1.0    # 약세 시나리오 평균에 곱할 가중치
+WEAK_WEIGHT_DEFAULT = 1.5    # 약세 시나리오 평균에 곱할 가중치 (Iter7: 1.0→1.5 강화)
 MIN_GAIN_DEFAULT    = 3.0    # 목적 점수 채택 임계 (노이즈 오채택 방지)
 
 # ── 베이스 피처 (현재 12개) ────────────────────────────────────────
@@ -101,8 +101,9 @@ except ModuleNotFoundError:                      # `python ml/core/feature_engin
 # Iteration 6: 16피처 고정, 잔존 약점 FN3-COG경계(~28%)·FN4-status(~8%) 정조준
 #              weak_floor 55로 FN3 보호, max_feat 18로 타겟 피처 추가 기회
 # Iteration 7: hdg_perp_score·status_fn4_flag 신규 후보 추가, weak_weight=1.5
-#              (Iteration 7 결과 따라 INITIAL_EXTRA 갱신 예정)
-INITIAL_EXTRA: list = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
+# Iteration 8: sog_vec_kn·turn_rate 추가 채택 (FE 2026-06-04 결과), 18피처 → 20후보 풀탐색
+#              INITIAL_EXTRA 갱신 완료, weak_weight=1.5 적용
+INITIAL_EXTRA: list = ["accel", "heading_rate", "vec_sog_diff", "heading_change", "sog_vec_kn", "turn_rate"]
 
 
 # ── 각도 차이 헬퍼 ────────────────────────────────────────────────

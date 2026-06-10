@@ -1,5 +1,33 @@
 # CLAUDE.md — JB-Pirate-King Project Context
 
+## 🔁 세션 시작 프로토콜 (MANDATORY)
+
+**새 세션은 반드시 아래 순서로 시작한다. 사용자 요청 전에 이 단계를 완료하라.**
+
+```powershell
+# 1. 부트스트랩 — 현황 즉시 파악
+$env:PYTHONUTF8="1"
+python ml/automation/bootstrap.py
+```
+
+이 명령 하나로:
+- Obsidian SSOT(현재 작업·차기 할 일) 요약 출력
+- 실행중/완료/정지 run 상태 확인
+- `distribute_manifest.json` 감지 시 → 배포 대기 항목 자동 안내
+
+**배포 대기 항목이 있으면 즉시 처리:**
+```powershell
+python ml/automation/bootstrap.py --distribute
+# 출력된 지시에 따라 Sheets/Drive/Notion MCP 작업 수행
+```
+
+**세션 중 자주 참조:**
+- 상태 파일: `D:\ais_output\ens24_v2\state.json`
+- 인수인계: `C:\ObsidianVault\운영\실험\ens24_run_2026-06-04.md`
+- 구글 시트: https://docs.google.com/spreadsheets/d/1uSF1FXsMvha24t0LpgNbI20MLumbq4lm1LbBtc14H1U
+
+---
+
 ## Pre-Push Checklist
 
 On code/structure change, keep ALL docs in sync. Before push (or when asked to push), check + update first:
