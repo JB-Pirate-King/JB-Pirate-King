@@ -1,5 +1,33 @@
 # CLAUDE.md — JB-Pirate-King Project Context
 
+## 🔁 세션 시작 프로토콜 (MANDATORY)
+
+**새 세션은 반드시 아래 순서로 시작한다. 사용자 요청 전에 이 단계를 완료하라.**
+
+```powershell
+# 1. 부트스트랩 — 현황 즉시 파악
+$env:PYTHONUTF8="1"
+python ml/automation/bootstrap.py
+```
+
+이 명령 하나로:
+- Obsidian SSOT(현재 작업·차기 할 일) 요약 출력
+- 실행중/완료/정지 run 상태 확인
+- `distribute_manifest.json` 감지 시 → 배포 대기 항목 자동 안내
+
+**배포 대기 항목이 있으면 즉시 처리:**
+```powershell
+python ml/automation/bootstrap.py --distribute
+# 출력된 지시에 따라 Sheets/Drive/Notion MCP 작업 수행
+```
+
+**세션 중 자주 참조:**
+- 상태 파일: `D:\ais_output\ens24_v2\state.json`
+- 인수인계: `C:\ObsidianVault\운영\실험\ens24_run_2026-06-04.md`
+- 구글 시트: https://docs.google.com/spreadsheets/d/1uSF1FXsMvha24t0LpgNbI20MLumbq4lm1LbBtc14H1U
+
+---
+
 ## Pre-Push Checklist
 
 On code/structure change, keep ALL docs in sync. Before push (or when asked to push), check + update first:
@@ -11,7 +39,7 @@ On code/structure change, keep ALL docs in sync. Before push (or when asked to p
 
 > Rule: a code/structure change isn't "done" until README + CLAUDE.md + Notion reflect it.
 
-> **Docs language: English.** All Markdown docs and any prompt-as-file (e.g. `ml/ralph_feature_invention.md`) are written in English.
+> **Docs language: English.** All Markdown docs are written in English.
 
 ---
 
@@ -38,8 +66,8 @@ JB-Pirate-King/
 │   │   ├── sheets.py           # Google Sheets logging
 │   │   ├── notify.py           # Discord webhook + Notion reports
 │   │   └── git_manager.py      # Auto branch creation / commit
-│   ├── orchestrator.py         # Full pipeline entry point (Slack + Sheets + git)
-│   ├── ralph_feature_invention.md # Ralph Loop prompt: autonomous feature invention (English)
+│   ├── orchestrator.py         # LangGraph orchestrator (reco + per-node harness + gates) ★
+│   ├── pipeline_steps.py       # Shared step library (run_cmd, stage_*, _fe_train_eval, parsers) ★
 │   ├── reset_sheets.py         # Utility: clear all Google Sheets tabs (keep headers)
 │   ├── fe_state.json           # FE starting features (initial_extra)
 │   ├── build_plugin_wsl.sh     # WSL (Ubuntu-24.04) cmake+make package auto-build ★
@@ -127,31 +155,20 @@ python ml/core/preprocess.py "D:\ais_data\preprocessed\2025\daily\*_preprocessed
 
 SEQ_LEN = 10
 
-### FE candidate features (CANDIDATE_FEATURES in feature_engineer.py)
+### FE candidate features — fully dynamic (no static pool)
 
-| Feature | Computation |
-|---|---|
-| `sog_vec_kn` | GPS-derived speed — lat/lon_speed → km/s → knots |
-| `lowspeed_crab` | Low-speed crab angle — cog_hdg_diff × max(0, 1-sog/3kn) |
-| `cog_change` | COG change — \|COG(t) - COG(t-1)\| (deg) |
-| `cog_move_diff` | COG vs actual heading-of-travel diff — error between AIS COG and lat/lon-derived travel angle |
-| `dist_speed_err` | Distance/speed mismatch — \|dist_km/dt×3600 - sog×1.852\| |
-| `dist_speed_ratio` | Distance/speed ratio — dist_km / (sog×dt converted) |
-| `anchor_suspicion` | Anchor suspicion — low-speed + heading-change composite indicator |
-| `speed_ratio` | Relative speed change rate — \|sog_change\| / max(sog, 0.5) |
-| `anchored_excess_speed` | Excess speed while anchored — status∈{1,5,6} × max(0, sog-1.5kn) |
-| `accel` | Acceleration — Δsog/dt (knots/s) |
-| `heading_rate` | Heading change rate — Δheading/dt (°/s) |
-| `heading_change` | Heading change — \|heading(t) - heading(t-1)\| |
-| `vec_sog_diff` | Vector-SOG diff — magnitude diff after vector decomposition |
+`CANDIDATE_FEATURES` in `feature_engineer.py` is **empty**. All candidates are invented
+per run by the orchestrator `recommend` node: weak-scenario diagnosis → `claude -p`
+proposes `--invent N` (default 5) new lambda features → validated (exec on dummy seq +
+dedup) → written to `ml/dynamic_candidates.py` (gitignored) → `feature_engineer.py`
+exec-loads them into the pool.
 
-> The candidate pool is **not fixed** — see [Ralph Loop](#ralph-loop-autonomous-feature-invention) for autonomous invention of new candidates.
+### Current adoption status
 
-### Current adoption status (as of dcdetect_012)
-
-Base 12 + extra 12 = **24 features**
-Extra: `sog_vec_kn, lowspeed_crab, cog_change, cog_move_diff, dist_speed_err, dist_speed_ratio, accel, anchor_suspicion, heading_rate, heading_change, speed_ratio, anchored_excess_speed`
-Best detection rate: dcdetect_011 → **83.5% (FP=1%, 23 features)**
+FE history reset after the LangGraph migration — runs restart from the base 12 features
+(`fe_state.json` `initial_extra: []`, branch numbering back to `dcdetect_001`).
+Prior runs (up to 24 features, best 83.5% FP=1%) are preserved in `run/dcdetect_NNN`
+release tags and git history.
 
 ---
 
@@ -245,18 +262,38 @@ Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
 
 ---
 
-## Ralph Loop: Autonomous Feature Invention
+## LangGraph Orchestrator (`ml/orchestrator.py`)
 
-Orchestrator only **selects** from the fixed `CANDIDATE_FEATURES` pool; never writes new feature code. The `ralph-loop` plugin closes the gap: re-feeds a prompt file each iteration so Claude **invents new candidate features**, growing the pool until convergence.
+`orchestrator.py` is a LangGraph `StateGraph` (control flow); the heavy execution functions
+live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md` / `pipeline_full.png`.
 
-- **Prompt file**: `ml/ralph_feature_invention.md` (English). Per iteration: pick weak scenario (<50%) → physical hypothesis → add ONE `(desc, lambda)` to `CANDIDATE_FEATURES` → validate via standalone FE → keep+commit if objective gain ≥ +3.0pp, revert if < 0 → log to `ml/.ralph_fe_log.md`. Done at 3 adopted features with `<promise>RALPH_FE_DONE</promise>`.
-- **Closed loop with orchestrator**: each FE run writes its Claude analysis (weak-scenario diagnosis + suggested feature *kinds*) to `ml/.pipeline_tmp/claude_fe_analysis.md` (`orchestrator._fe_run`). Ralph reads it as the primary invention direction → new candidates are grounded in the run's own data, not static guesses. Workflow: orchestrator converges → Ralph invents candidates targeting the diagnosed weaknesses → rerun orchestrator with the grown pool.
-- **Launch** (English prompt):
-  ```
-  /ralph-loop Execute the mission in ml/ralph_feature_invention.md exactly. Re-read that file at the start of every iteration and follow the procedure. --max-iterations 30 --completion-promise "RALPH_FE_DONE"
-  ```
-- **Windows hook**: the plugin Stop hook must use Git Bash (it needs `jq`/`perl`). The cached `hooks/hooks.json` is patched to `"C:/Program Files/Git/bin/bash.exe"`. **A hooks.json change requires a Claude Code restart** to take effect.
-- **Do NOT run Ralph while the orchestrator test is running** — both share one working tree and touch git; commits collide. Ralph uses **standalone FE only** (no orchestrator, no branch chaining).
+- **pipeline_steps.py** — `run_cmd`, output parsers, `claude_analyze`, `stage_preprocess`,
+  `stage_build_plugin`, `stage_release`, `_fe_train_eval` (greedy 1-step train+eval+parse+log),
+  `_fe_build_and_release`, `_fe_commit_release`, fe_state io, constants. Not an entry point.
+- **FE decomposition**: `fe_baseline` node (`feature_engineer --diagnose_only` → baseline det +
+  weak scenarios) is split from `fe_train` (scan→adopt→retrain→importance→finaleval→export, one
+  `feature_engineer` subprocess via `_fe_train_eval`).
+- **claude feature recommendation (`n_recommend`)**: weak-scenario diagnosis → `claude -p` proposes
+  N new candidate features (name + lambda) → validated (exec on dummy seq + dedup) → written to
+  `ml/dynamic_candidates.py` (gitignored) → `feature_engineer` loads + scans them. Convergence
+  (no adoption) re-recommends from a different angle up to `--invent_rounds`. `--invent` defaults
+  to **5** and is the ONLY candidate source — `CANDIDATE_FEATURES` is empty (no static pool).
+- **per-node claude harness** (`claude_harness` factory): each compute node is followed by a harness
+  node that runs `claude -p --output-format json` → `{assessment, verdict: continue|retry|stop, ...}`
+  → routing. Toggle per node via `HARNESS_ON` set; `--no_harness` disables all.
+- **interrupt() gates**: deploy / release / converge are independent `interrupt()` nodes. Because
+  gates sit at node boundaries, a crash while awaiting Slack approval resumes **without retraining**.
+- **Sheets**: `log_sheet(kind)` DRY factory (`run_start|fe|run_done|converge`).
+- **Chaining = graph cycle**: `release → chain → new_branch`. Convergence → `converge → END`.
+  `--max_runs` is a state-counter guard; `recursion_limit = max_runs × 25`.
+- **Checkpointer**: `MemorySaver` (in-process). Swap to `SqliteSaver` for cross-restart resume.
+- **Runner**: `run_pipeline` polls `__interrupt__`, gets the Slack decision via `bot.wait_approval`,
+  resumes with `Command(resume=decision)`.
+- **Launch**: `python -m ml.orchestrator` (same flags as before + `--invent`, `--invent_rounds`,
+  `--no_harness`).
+- **LangSmith tracing**: `orchestrator.py` auto-loads repo-root `.env` (gitignored) at import —
+  set `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT` there and every
+  node run/route is traced to smith.langchain.com with no code changes.
 
 ---
 

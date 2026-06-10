@@ -67,8 +67,14 @@ from train_benchmark import (
 # iforest/ocsvm 은 sklearn → 제외.
 FE_SUPPORTED_MODELS = ["dcdetect", "conv1d", "lstm", "tcn"]
 
-# ── 고정 상수 ──────────────────────────────────────────────────────
-SEQ_LEN         = 10
+# ── 고정 상수 (SEQ_LEN/BASE_FEATURES 는 ml/core/constants.py 가 단일 출처) ──
+try:
+    from ml.core.constants import SEQ_LEN
+except ModuleNotFoundError:
+    try:                                         # cwd=ml (CI)
+        from core.constants import SEQ_LEN
+    except ModuleNotFoundError:
+        from constants import SEQ_LEN
 SEQ_BREAK       = 600   # dt 임계값 (초) — 시퀀스 분리
 MAX_SEQ_PER_MMSI = 500  # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
 EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 비율 (학습 풀에서 분리)
@@ -78,17 +84,17 @@ EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 �
 # 0% 고착 시나리오를 살리는 피처가 영원히 채택되지 않는다.
 # 목적 점수 = 전체평균 + WEAK_WEIGHT × (베이스라인 약세 시나리오 평균)
 WEAK_FLOOR_DEFAULT  = 50.0   # 베이스라인 탐지율 < 이 값 → "약세" 시나리오로 분류
-WEAK_WEIGHT_DEFAULT = 1.0    # 약세 시나리오 평균에 곱할 가중치
+WEAK_WEIGHT_DEFAULT = 1.5    # 약세 시나리오 평균에 곱할 가중치 (Iter7: 1.0→1.5 강화)
 MIN_GAIN_DEFAULT    = 3.0    # 목적 점수 채택 임계 (노이즈 오채택 방지)
 
 # ── 베이스 피처 (현재 12개) ────────────────────────────────────────
-BASE_FEATURES = [
-    "sog", "cog", "heading", "status",
-    "dt", "dist_km",
-    "cog_hdg_diff", "sog_change", "cog_hdg_change",
-    "speed_consistency", "lat_speed", "lon_speed",
-]
-_B = {name: i for i, name in enumerate(BASE_FEATURES)}
+try:
+    from ml.core.constants import BASE_FEATURES, BASE_INDEX as _B
+except ModuleNotFoundError:
+    try:                                         # cwd=ml (CI)
+        from core.constants import BASE_FEATURES, BASE_INDEX as _B
+    except ModuleNotFoundError:                  # `python ml/core/feature_engineer.py`
+        from constants import BASE_FEATURES, BASE_INDEX as _B
 
 # ── 이전 반복에서 검증·채택된 피처 (Greedy 탐색의 출발점) ──────────────
 # Iteration 1: accel (+12.0pp)
@@ -101,8 +107,9 @@ _B = {name: i for i, name in enumerate(BASE_FEATURES)}
 # Iteration 6: 16피처 고정, 잔존 약점 FN3-COG경계(~28%)·FN4-status(~8%) 정조준
 #              weak_floor 55로 FN3 보호, max_feat 18로 타겟 피처 추가 기회
 # Iteration 7: hdg_perp_score·status_fn4_flag 신규 후보 추가, weak_weight=1.5
-#              (Iteration 7 결과 따라 INITIAL_EXTRA 갱신 예정)
-INITIAL_EXTRA: list = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
+# Iteration 8: sog_vec_kn·turn_rate 추가 채택 (FE 2026-06-04 결과), 18피처 → 20후보 풀탐색
+#              INITIAL_EXTRA 갱신 완료, weak_weight=1.5 적용
+INITIAL_EXTRA: list = ["accel", "heading_rate", "vec_sog_diff", "heading_change", "sog_vec_kn", "turn_rate"]
 
 
 # ── 각도 차이 헬퍼 ────────────────────────────────────────────────
@@ -116,194 +123,18 @@ def _ang_diff(a: float, b: float) -> float:
 # 형식: {name: (설명, fn)}
 # fn(seq: List[List[float]], t: int) -> float
 #   seq[t] 는 BASE_FEATURES 순서의 현재 행
-CANDIDATE_FEATURES: dict = {
-    # ── 기존 후보 (Iteration 1 미채택) ──
-    "cog_change": (
-        "COG 변화량 (도)",
-        lambda seq, t: (
-            _ang_diff(seq[t][_B["cog"]], seq[t - 1][_B["cog"]]) if t > 0 else 0.0
-        ),
-    ),
-    "heading_change": (
-        "Heading 변화량 (도)",
-        lambda seq, t: (
-            _ang_diff(seq[t][_B["heading"]], seq[t - 1][_B["heading"]]) if t > 0 else 0.0
-        ),
-    ),
-    "turn_rate": (
-        "COG 변화율 (도/초)",
-        lambda seq, t: (
-            _ang_diff(seq[t][_B["cog"]], seq[t - 1][_B["cog"]])
-            / max(seq[t][_B["dt"]], 1.0)
-            if t > 0
-            else 0.0
-        ),
-    ),
-    "heading_rate": (
-        "Heading 변화율 (도/초)",
-        lambda seq, t: (
-            _ang_diff(seq[t][_B["heading"]], seq[t - 1][_B["heading"]])
-            / max(seq[t][_B["dt"]], 1.0)
-            if t > 0
-            else 0.0
-        ),
-    ),
-    "accel": (
-        "속도 변화율 (노트/초)",
-        lambda seq, t: seq[t][_B["sog_change"]] / max(seq[t][_B["dt"]], 1.0),
-    ),
-    "dist_speed_err": (
-        "거리/속도 불일치 (km)",
-        lambda seq, t: abs(
-            seq[t][_B["dist_km"]]
-            - seq[t][_B["sog"]] * seq[t][_B["dt"]] / 3600.0 * 1.852
-        ),
-    ),
-    "status_change": (
-        "상태코드 변화 (0/1)",
-        lambda seq, t: (
-            float(int(seq[t][_B["status"]]) != int(seq[t - 1][_B["status"]]))
-            if t > 0
-            else 0.0
-        ),
-    ),
-    "anchor_suspicion": (
-        "정박의심 (저속+Heading변화)",
-        lambda seq, t: (
-            float(seq[t][_B["sog"]] < 0.5
-                  and _ang_diff(seq[t][_B["heading"]], seq[t - 1][_B["heading"]]) > 15)
-            if t > 0 else 0.0
-        ),
-    ),
-    "cog_move_diff": (
-        "COG vs 실이동방향 차이 (도)",
-        lambda seq, t: _ang_diff(
-            seq[t][_B["cog"]],
-            math.degrees(math.atan2(seq[t][_B["lon_speed"]], seq[t][_B["lat_speed"]])) % 360
-        ) if (abs(seq[t][_B["lat_speed"]]) + abs(seq[t][_B["lon_speed"]]) > 1e-6) else 0.0,
-    ),
-    "speed_ratio": (
-        "상대 속도 변화율 (변화/현재속도)",
-        lambda seq, t: abs(seq[t][_B["sog_change"]]) / max(seq[t][_B["sog"]], 0.5),
-    ),
-    "dist_speed_ratio": (
-        "거리/속도 비율 (차이 대신 비율)",
-        lambda seq, t: seq[t][_B["dist_km"]] / max(
-            seq[t][_B["sog"]] * seq[t][_B["dt"]] / 3600.0 * 1.852, 0.001
-        ),
-    ),
-    # ── Iteration 2 신규 후보 ──────────────────────────────────────
-    "hdg_vec_diff": (
-        "Heading vs GPS이동방향 차이 (도)",
-        # lat_speed/lon_speed로 실제 이동 방위각 추정 → heading과 비교
-        # G3-PhantomHDG 퇴보(-36pp) 복구 타겟
-        lambda seq, t: _ang_diff(
-            seq[t][_B["heading"]],
-            math.degrees(math.atan2(
-                seq[t][_B["lon_speed"]], seq[t][_B["lat_speed"]]
-            )) % 360,
-        ) if (abs(seq[t][_B["lat_speed"]]) + abs(seq[t][_B["lon_speed"]]) > 1e-6) else 0.0,
-    ),
-    "status_motion": (
-        "정박/계류 상태이동 (anchored×sog)",
-        # status 1(anchor)·5(moored)이면서 sog>0 → 충돌 신호
-        # 정박이동·D1-LowSlow 0% 탐지 타겟
-        lambda seq, t: float(int(round(seq[t][_B["status"]])) in (1, 5))
-        * seq[t][_B["sog"]],
-    ),
-    "sog_vec_kn": (
-        "GPS유도 속력 (노트)",
-        # lat_speed·lon_speed(deg/s) → km/s 변환 후 노트로
-        # 1 deg ≈ 111.32 km,  1 knot = 1.852 km/h
-        lambda seq, t: math.sqrt(
-            (seq[t][_B["lat_speed"]] * 111320.0) ** 2
-            + (seq[t][_B["lon_speed"]] * 111320.0) ** 2
-        ) / 1852.0 * 3600.0,
-    ),
-    "vec_sog_diff": (
-        "SOG vs GPS속력 절대차이 (노트)",
-        lambda seq, t: abs(
-            seq[t][_B["sog"]]
-            - math.sqrt(
-                (seq[t][_B["lat_speed"]] * 111320.0) ** 2
-                + (seq[t][_B["lon_speed"]] * 111320.0) ** 2
-            ) / 1852.0 * 3600.0
-        ),
-    ),
-    # ── Iteration 4 신규 후보 (0% 고착 시나리오 타겟, 노이즈 플로어/도메인 기반) ──
-    "anchored_excess_speed": (
-        "정박/계류 중 초과속력 (status∈{1,5,6} × max(0, sog-1.5kn))",
-        # 정박이동 타겟. 1.5kn = GPS 지터 허용 임계(해양 관행) → 정상 정박선은 0
-        lambda seq, t: float(int(round(seq[t][_B["status"]])) in (1, 5, 6))
-        * max(0.0, seq[t][_B["sog"]] - 1.5),
-    ),
-    "uncommon_status": (
-        "비통상 항행상태 (0=underway/1=anchored/5=moored 외 = 1)",
-        # FN4-status 타겟. 통상 3개 상태 외는 운용상 드묾(도메인 지식, 공격값 비하드코딩)
-        lambda seq, t: 0.0 if int(round(seq[t][_B["status"]])) in (0, 1, 5) else 1.0,
-    ),
-    "lowspeed_crab": (
-        "저속 crab각 (cog_hdg_diff × max(0, 1-sog/3kn))",
-        # D1-LowSlow 타겟. 저속일수록 heading-course 불일치 가중 (3kn 이하)
-        lambda seq, t: seq[t][_B["cog_hdg_diff"]]
-        * max(0.0, 1.0 - seq[t][_B["sog"]] / 3.0),
-    ),
-    # ── Iteration 7 신규 후보 (FN3 정조준) ────────────────────────────
-    "hdg_perp_score": (
-        "COG-Heading 직교성 (|sin(cog_hdg_diff)|, FN3 정조준)",
-        # FN3-COG경界: 헤딩이 진침로에 수직(91~99°) → sin값 ≈ 1.0 (최대)
-        # 정상선박: cog_hdg_diff < 30° → sin < 0.5  |  반대방향(180°): sin = 0
-        # cog_hdg_diff가 이미 있지만 선형 스케일에서 90° 구분력이 낮음 →
-        # sin 변환으로 90°에서 극대, 0°/180° 에서 0으로 비선형 강조
-        # cog_hdg_diff = -1.0 은 heading 불가(511) 센티넬 → 0.0 반환
-        lambda seq, t: 0.0 if seq[t][_B["cog_hdg_diff"]] < 0.0 else abs(math.sin(math.radians(seq[t][_B["cog_hdg_diff"]]))),
-    ),
-    "status_fn4_flag": (
-        "FN4 비통상 상태 누적 (시퀀스 내 uncommon_status 비율)",
-        # FN4-status: status∈{2,3,7,8,11,12} 가 SEQ_LEN 내내 지속 → 비율=1.0
-        # 정상: status=0/1/5만 → 비율=0.0
-        # uncommon_status(단일 타임스텝) 보다 시퀀스 맥락 반영
-        lambda seq, t: sum(
-            1.0 for row in seq if int(round(row[_B["status"]])) not in (0, 1, 5)
-        ) / len(seq),
-    ),
-    # ── Ralph 발명 (claude_fe_analysis item4-① 기반, D1-LowSlow 0% 타겟) ──
-    "lowspeed_micro_var": (
-        "저속 미세변동 누적 (sog<3kn에서 COG 누적변화/길이)",
-        # D1-LowSlow: 느린데 비정상적으로 꿈틀대는 궤적. 저속 정상선(정박/계류)은
-        # COG 안정 → ≈0. 저속 위장 표류는 미세 COG 변동 누적 → 큼. dist/sog 가
-        # 정상범위라 단일스텝 피처엔 안 잡히는 걸 '누적'으로 증폭.
-        lambda seq, t: (
-            sum(_ang_diff(seq[i][_B["cog"]], seq[i - 1][_B["cog"]])
-                for i in range(1, t + 1)) / max(t, 1)
-            if seq[t][_B["sog"]] < 3.0 else 0.0
-        ),
-    ),
-    # ── claude -p 발명 → 채택 승격 (dcdetect run, D1-LowSlow/드리프트, +17.1pp) ──
-    "drift_straightness": (
-        "누적 변위벡터 직진도 — |Σ속도벡터| / Σ|속도벡터| (곧장이동≈1, 표류<1)",
-        # 정상 직진: 속도벡터 합 크기 ≈ 경로 길이 → 1.0
-        # 저속 표류/배회: 벡터 상쇄 → 합 크기 << 경로 길이 → 0에 근접. D1-LowSlow 타겟.
-        lambda seq, t: (
-            math.hypot(sum(seq[k][_B["lon_speed"]] for k in range(t + 1)),
-                       sum(seq[k][_B["lat_speed"]] for k in range(t + 1)))
-            / max(sum(math.hypot(seq[k][_B["lon_speed"]], seq[k][_B["lat_speed"]])
-                      for k in range(t + 1)), 1e-6)
-        ),
-    ),
-}
+CANDIDATE_FEATURES: dict = {}  # 정적 후보 없음 — 전량 claude -p 동적 생성 (n_recommend)
 
 
-# ── 동적 후보 (claude -p 자동 발명분) ───────────────────────────────
-# orchestrator 의 발명 stage 가 약세 진단 → claude -p 로 새 피처 lambda 를
-# ml/dynamic_candidates.py 에 DYNAMIC_FEATURES dict 로 써넣는다. 여기서 이 파일을
-# 이 모듈 네임스페이스에서 exec → lambda 가 _B / _ang_diff / math 를 그대로 참조,
-# CANDIDATE_FEATURES 에 병합한다. 파일 없으면 무시(기본 동작 불변).
+# ── 동적 후보 (orchestrator n_recommend 가 claude -p 로 생성) ──────────
+# reco 노드가 약세 진단 → 새 피처 lambda 를 ml/dynamic_candidates.py 에
+# DYNAMIC_FEATURES dict 로 써둔다. 여기서 이 모듈 네임스페이스로 exec → lambda 가
+# _B / _ang_diff / math 를 그대로 참조 → CANDIDATE_FEATURES 에 병합. 파일 없으면 무시.
 _DYN_PATH = os.path.join(os.path.dirname(__file__), "..", "dynamic_candidates.py")
 if os.path.exists(_DYN_PATH):
     try:
         with open(_DYN_PATH, encoding="utf-8") as _df:
-            exec(_df.read(), globals())          # DYNAMIC_FEATURES 정의
+            exec(_df.read(), globals())
         _dyn = globals().get("DYNAMIC_FEATURES", {})
         CANDIDATE_FEATURES.update(_dyn)
         print(f"[동적후보] {len(_dyn)}개 로드: {list(_dyn)}")
@@ -866,7 +697,7 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     current_extra: list = list(INITIAL_EXTRA)
     # accel 등 INITIAL_EXTRA에 포함된 항목은 다시 탐색하지 않음
     remaining: list = [k for k in CANDIDATE_FEATURES.keys() if k not in INITIAL_EXTRA]
-    # 후보 명시 (--candidates): 지정한 이름만 탐색 (Ralph/큐레이션 추천 풀).
+    # 후보 명시 (--candidates): 지정한 이름만 탐색 (큐레이션 추천 풀).
     #   CANDIDATE_FEATURES 에 있고 INITIAL_EXTRA(기채택) 아닌 것만 유효.
     cand_list = getattr(args, "candidates", None)
     if cand_list is not None:   # 명시됨 (빈 리스트면 베이스전용 = 후보 0)
@@ -1209,7 +1040,7 @@ def main():
     ap.add_argument("--max_candidates", type=int, default=None,
                     help="Greedy 후보 수 제한 (정의 순서 앞 N개만, 속도용)")
     ap.add_argument("--candidates", nargs="*", default=None,
-                    help="탐색할 후보 피처 이름 명시 (Ralph/큐레이션 추천 풀). "
+                    help="탐색할 후보 피처 이름 명시 (큐레이션 추천 풀). "
                          "미지정 시 CANDIDATE_FEATURES 전체")
     ap.add_argument("--diagnose_only", action="store_true",
                     help="베이스라인 학습+평가(약세 진단)까지만, 재학습/순열중요도/export 생략")
@@ -1245,7 +1076,7 @@ def main():
     print_report(history)
 
     # 진단 전용(--diagnose_only): 약세 시나리오만 필요 → 재학습/순열중요도/export 생략.
-    #   orchestrator stage_invent 가 약세 진단만 쓰므로 ③단계(낭비) 건너뜀.
+    #   약세 진단만 빠르게 보고 싶을 때 ③단계(낭비) 건너뜀.
     if getattr(args, "diagnose_only", False):
         base_h = history[0]
         scen = {n: d for n, d, _ in base_h.get("scenarios", [])}
