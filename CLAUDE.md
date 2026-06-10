@@ -66,8 +66,8 @@ JB-Pirate-King/
 │   │   ├── sheets.py           # Google Sheets logging
 │   │   ├── notify.py           # Discord webhook + Notion reports
 │   │   └── git_manager.py      # Auto branch creation / commit
-│   ├── orchestrator.py         # Full pipeline entry point (Slack + Sheets + git)
-│   ├── orchestrator_lg.py      # LangGraph port of orchestrator (interrupt-gated HITL) ★
+│   ├── orchestrator.py         # LangGraph orchestrator (reco + per-node harness + gates) ★
+│   ├── pipeline_steps.py       # Shared step library (run_cmd, stage_*, _fe_train_eval, parsers) ★
 │   ├── reset_sheets.py         # Utility: clear all Google Sheets tabs (keep headers)
 │   ├── fe_state.json           # FE starting features (initial_extra)
 │   ├── build_plugin_wsl.sh     # WSL (Ubuntu-24.04) cmake+make package auto-build ★
@@ -273,28 +273,34 @@ Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
 
 ---
 
-## LangGraph Port (`ml/orchestrator_lg.py`)
+## LangGraph Orchestrator (`ml/orchestrator.py`)
 
-A LangGraph reimplementation of `orchestrator.py`'s control flow. Same behavior, but the
-pipeline is a `StateGraph` instead of a hand-written `while` loop.
+`orchestrator.py` is a LangGraph `StateGraph` (control flow); the heavy execution functions
+live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md` / `pipeline_full.png`.
 
-- **Decomposed FE**: `orchestrator.py`'s `_fe_run` is split into reusable pieces —
-  `_fe_train_eval` (greedy 1-feature train + eval + parse + logging), `_fe_build_and_release`
-  (plugin build), `_fe_commit_release` (git commit + GitHub release). The original `_fe_run`
-  is now a thin wrapper over these, so `orchestrator.py` behavior is unchanged.
-- **interrupt() gates**: the 3 HITL gates (FE-eval / build / converge) + fail gate are
-  independent nodes that call LangGraph `interrupt()`. Because gates sit at node boundaries
-  (not inside the heavy train node), a crash while awaiting Slack approval resumes **without
-  retraining** — the `_fe_train_eval` result is preserved in the checkpoint.
-- **Chaining = graph cycle**: `release → chain → new_branch`. Convergence (no adoption) →
-  `converge → END`. `--max_runs` is a state-counter guard; `recursion_limit = max_runs × 15`.
+- **pipeline_steps.py** — `run_cmd`, output parsers, `claude_analyze`, `stage_preprocess`,
+  `stage_build_plugin`, `stage_release`, `_fe_train_eval` (greedy 1-step train+eval+parse+log),
+  `_fe_build_and_release`, `_fe_commit_release`, fe_state io, constants. Not an entry point.
+- **FE decomposition**: `fe_baseline` node (`feature_engineer --diagnose_only` → baseline det +
+  weak scenarios) is split from `fe_train` (scan→adopt→retrain→importance→finaleval→export, one
+  `feature_engineer` subprocess via `_fe_train_eval`).
+- **claude feature recommendation (`n_recommend`)**: weak-scenario diagnosis → `claude -p` proposes
+  N new candidate features (name + lambda) → validated (exec on dummy seq + dedup) → written to
+  `ml/dynamic_candidates.py` (gitignored) → `feature_engineer` loads + scans them. Convergence
+  (no adoption) re-recommends from a different angle up to `--invent_rounds`. Enable with `--invent N`.
+- **per-node claude harness** (`claude_harness` factory): each compute node is followed by a harness
+  node that runs `claude -p --output-format json` → `{assessment, verdict: continue|retry|stop, ...}`
+  → routing. Toggle per node via `HARNESS_ON` set; `--no_harness` disables all.
+- **interrupt() gates**: deploy / release / converge are independent `interrupt()` nodes. Because
+  gates sit at node boundaries, a crash while awaiting Slack approval resumes **without retraining**.
+- **Sheets**: `log_sheet(kind)` DRY factory (`run_start|fe|run_done|converge`).
+- **Chaining = graph cycle**: `release → chain → new_branch`. Convergence → `converge → END`.
+  `--max_runs` is a state-counter guard; `recursion_limit = max_runs × 25`.
 - **Checkpointer**: `MemorySaver` (in-process). Swap to `SqliteSaver` for cross-restart resume.
-- **Runner**: `run_pipeline` polls `__interrupt__`, gets the Slack decision via
-  `bot.wait_approval`, resumes with `Command(resume=decision)`.
-- **Launch**: same flags as `orchestrator.py` (run with `python -m ml.orchestrator_lg`).
-
-> Both orchestrators share the same execution functions and integrations (slack/sheets/git).
-> `orchestrator.py` remains the canonical entry point; `orchestrator_lg.py` is the graph variant.
+- **Runner**: `run_pipeline` polls `__interrupt__`, gets the Slack decision via `bot.wait_approval`,
+  resumes with `Command(resume=decision)`.
+- **Launch**: `python -m ml.orchestrator` (same flags as before + `--invent`, `--invent_rounds`,
+  `--no_harness`).
 
 ---
 
