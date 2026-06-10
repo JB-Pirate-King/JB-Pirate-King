@@ -1,3 +1,11 @@
 {
-  "initial_extra": ["accel", "heading_rate", "vec_sog_diff", "heading_change", "sog_vec_kn", "turn_rate"]
+  "initial_extra": [
+    "accel",
+    "heading_rate",
+    "vec_sog_diff",
+    "heading_change",
+    "sog_vec_kn",
+    "turn_rate",
+    "uncommon_status"
+  ]
 }
