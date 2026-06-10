@@ -122,16 +122,14 @@ except ImportError:
     _CAND_FEATURES = {}
     def _augment_seq(seq, extra_names): return seq
 
-# ── 공통 설정 ─────────────────────────────────────────────────────
-FEATURES = [
-    "sog", "cog", "heading", "status",
-    "dt", "dist_km",
-    "cog_hdg_diff", "sog_change",
-    "cog_hdg_change",
-    "speed_consistency",
-    "lat_speed", "lon_speed",
-]
-SEQ_LEN    = 10
+# ── 공통 설정 (FEATURES/SEQ_LEN 은 ml/core/constants.py 가 단일 출처) ──
+try:
+    from ml.core.constants import BASE_FEATURES as FEATURES, SEQ_LEN
+except ModuleNotFoundError:
+    try:                                         # cwd=ml (CI smoke test)
+        from core.constants import BASE_FEATURES as FEATURES, SEQ_LEN
+    except ModuleNotFoundError:                  # `python ml/core/train_benchmark.py`
+        from constants import BASE_FEATURES as FEATURES, SEQ_LEN
 N_FEAT     = len(FEATURES)   # 12
 SEED       = 42
 

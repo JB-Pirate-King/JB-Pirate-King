@@ -46,7 +46,6 @@ sys.argv = [sys.argv[0]]
 try:
     from eval_anomaly import (
         SCENARIO_MAKERS,
-        _build_derived,
         make_normal_seq,
     )
 finally:
@@ -54,14 +53,28 @@ finally:
 
 from train_benchmark import (
     DCdetector,
+    Conv1DAE,
+    LSTMAutoencoder,
+    TCNAE,
     make_loaders,
     train_standard,
     SEED,
     VAL_RATIO,
 )
 
-# ── 고정 상수 ──────────────────────────────────────────────────────
-SEQ_LEN         = 10
+# FE 지원 모델 (모두 단일 재구성 AE → 점수 ((out-x)^2).mean() / 제네릭 ONNX export 호환).
+# usad/tranad/anomtrans 는 forward 가 튜플 반환 → 점수 로직 변경 필요해 제외.
+# iforest/ocsvm 은 sklearn → 제외.
+FE_SUPPORTED_MODELS = ["dcdetect", "conv1d", "lstm", "tcn"]
+
+# ── 고정 상수 (SEQ_LEN/BASE_FEATURES 는 ml/core/constants.py 가 단일 출처) ──
+try:
+    from ml.core.constants import SEQ_LEN
+except ModuleNotFoundError:
+    try:                                         # cwd=ml (CI)
+        from core.constants import SEQ_LEN
+    except ModuleNotFoundError:
+        from constants import SEQ_LEN
 SEQ_BREAK       = 600   # dt 임계값 (초) — 시퀀스 분리
 MAX_SEQ_PER_MMSI = 500  # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
 EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 비율 (학습 풀에서 분리)
@@ -71,17 +84,17 @@ EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 �
 # 0% 고착 시나리오를 살리는 피처가 영원히 채택되지 않는다.
 # 목적 점수 = 전체평균 + WEAK_WEIGHT × (베이스라인 약세 시나리오 평균)
 WEAK_FLOOR_DEFAULT  = 50.0   # 베이스라인 탐지율 < 이 값 → "약세" 시나리오로 분류
-WEAK_WEIGHT_DEFAULT = 1.0    # 약세 시나리오 평균에 곱할 가중치
+WEAK_WEIGHT_DEFAULT = 1.5    # 약세 시나리오 평균에 곱할 가중치 (Iter7: 1.0→1.5 강화)
 MIN_GAIN_DEFAULT    = 3.0    # 목적 점수 채택 임계 (노이즈 오채택 방지)
 
 # ── 베이스 피처 (현재 12개) ────────────────────────────────────────
-BASE_FEATURES = [
-    "sog", "cog", "heading", "status",
-    "dt", "dist_km",
-    "cog_hdg_diff", "sog_change", "cog_hdg_change",
-    "speed_consistency", "lat_speed", "lon_speed",
-]
-_B = {name: i for i, name in enumerate(BASE_FEATURES)}
+try:
+    from ml.core.constants import BASE_FEATURES, BASE_INDEX as _B
+except ModuleNotFoundError:
+    try:                                         # cwd=ml (CI)
+        from core.constants import BASE_FEATURES, BASE_INDEX as _B
+    except ModuleNotFoundError:                  # `python ml/core/feature_engineer.py`
+        from constants import BASE_FEATURES, BASE_INDEX as _B
 
 # ── 이전 반복에서 검증·채택된 피처 (Greedy 탐색의 출발점) ──────────────
 # Iteration 1: accel (+12.0pp)
@@ -94,8 +107,9 @@ _B = {name: i for i, name in enumerate(BASE_FEATURES)}
 # Iteration 6: 16피처 고정, 잔존 약점 FN3-COG경계(~28%)·FN4-status(~8%) 정조준
 #              weak_floor 55로 FN3 보호, max_feat 18로 타겟 피처 추가 기회
 # Iteration 7: hdg_perp_score·status_fn4_flag 신규 후보 추가, weak_weight=1.5
-#              (Iteration 7 결과 따라 INITIAL_EXTRA 갱신 예정)
-INITIAL_EXTRA: list = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
+# Iteration 8: sog_vec_kn·turn_rate 추가 채택 (FE 2026-06-04 결과), 18피처 → 20후보 풀탐색
+#              INITIAL_EXTRA 갱신 완료, weak_weight=1.5 적용
+INITIAL_EXTRA: list = ["accel", "heading_rate", "vec_sog_diff", "heading_change", "sog_vec_kn", "turn_rate"]
 
 
 # ── 각도 차이 헬퍼 ────────────────────────────────────────────────
@@ -109,158 +123,23 @@ def _ang_diff(a: float, b: float) -> float:
 # 형식: {name: (설명, fn)}
 # fn(seq: List[List[float]], t: int) -> float
 #   seq[t] 는 BASE_FEATURES 순서의 현재 행
-CANDIDATE_FEATURES: dict = {
-    # ── 기존 후보 (Iteration 1 미채택) ──
-    "cog_change": (
-        "COG 변화량 (도)",
-        lambda seq, t: (
-            _ang_diff(seq[t][_B["cog"]], seq[t - 1][_B["cog"]]) if t > 0 else 0.0
-        ),
-    ),
-    "heading_change": (
-        "Heading 변화량 (도)",
-        lambda seq, t: (
-            _ang_diff(seq[t][_B["heading"]], seq[t - 1][_B["heading"]]) if t > 0 else 0.0
-        ),
-    ),
-    "turn_rate": (
-        "COG 변화율 (도/초)",
-        lambda seq, t: (
-            _ang_diff(seq[t][_B["cog"]], seq[t - 1][_B["cog"]])
-            / max(seq[t][_B["dt"]], 1.0)
-            if t > 0
-            else 0.0
-        ),
-    ),
-    "heading_rate": (
-        "Heading 변화율 (도/초)",
-        lambda seq, t: (
-            _ang_diff(seq[t][_B["heading"]], seq[t - 1][_B["heading"]])
-            / max(seq[t][_B["dt"]], 1.0)
-            if t > 0
-            else 0.0
-        ),
-    ),
-    "accel": (
-        "속도 변화율 (노트/초)",
-        lambda seq, t: seq[t][_B["sog_change"]] / max(seq[t][_B["dt"]], 1.0),
-    ),
-    "dist_speed_err": (
-        "거리/속도 불일치 (km)",
-        lambda seq, t: abs(
-            seq[t][_B["dist_km"]]
-            - seq[t][_B["sog"]] * seq[t][_B["dt"]] / 3600.0 * 1.852
-        ),
-    ),
-    "status_change": (
-        "상태코드 변화 (0/1)",
-        lambda seq, t: (
-            float(int(seq[t][_B["status"]]) != int(seq[t - 1][_B["status"]]))
-            if t > 0
-            else 0.0
-        ),
-    ),
-    "anchor_suspicion": (
-        "정박의심 (저속+Heading변화)",
-        lambda seq, t: (
-            float(seq[t][_B["sog"]] < 0.5
-                  and _ang_diff(seq[t][_B["heading"]], seq[t - 1][_B["heading"]]) > 15)
-            if t > 0 else 0.0
-        ),
-    ),
-    "cog_move_diff": (
-        "COG vs 실이동방향 차이 (도)",
-        lambda seq, t: _ang_diff(
-            seq[t][_B["cog"]],
-            math.degrees(math.atan2(seq[t][_B["lon_speed"]], seq[t][_B["lat_speed"]])) % 360
-        ) if (abs(seq[t][_B["lat_speed"]]) + abs(seq[t][_B["lon_speed"]]) > 1e-6) else 0.0,
-    ),
-    "speed_ratio": (
-        "상대 속도 변화율 (변화/현재속도)",
-        lambda seq, t: abs(seq[t][_B["sog_change"]]) / max(seq[t][_B["sog"]], 0.5),
-    ),
-    "dist_speed_ratio": (
-        "거리/속도 비율 (차이 대신 비율)",
-        lambda seq, t: seq[t][_B["dist_km"]] / max(
-            seq[t][_B["sog"]] * seq[t][_B["dt"]] / 3600.0 * 1.852, 0.001
-        ),
-    ),
-    # ── Iteration 2 신규 후보 ──────────────────────────────────────
-    "hdg_vec_diff": (
-        "Heading vs GPS이동방향 차이 (도)",
-        # lat_speed/lon_speed로 실제 이동 방위각 추정 → heading과 비교
-        # G3-PhantomHDG 퇴보(-36pp) 복구 타겟
-        lambda seq, t: _ang_diff(
-            seq[t][_B["heading"]],
-            math.degrees(math.atan2(
-                seq[t][_B["lon_speed"]], seq[t][_B["lat_speed"]]
-            )) % 360,
-        ) if (abs(seq[t][_B["lat_speed"]]) + abs(seq[t][_B["lon_speed"]]) > 1e-6) else 0.0,
-    ),
-    "status_motion": (
-        "정박/계류 상태이동 (anchored×sog)",
-        # status 1(anchor)·5(moored)이면서 sog>0 → 충돌 신호
-        # 정박이동·D1-LowSlow 0% 탐지 타겟
-        lambda seq, t: float(int(round(seq[t][_B["status"]])) in (1, 5))
-        * seq[t][_B["sog"]],
-    ),
-    "sog_vec_kn": (
-        "GPS유도 속력 (노트)",
-        # lat_speed·lon_speed(deg/s) → km/s 변환 후 노트로
-        # 1 deg ≈ 111.32 km,  1 knot = 1.852 km/h
-        lambda seq, t: math.sqrt(
-            (seq[t][_B["lat_speed"]] * 111320.0) ** 2
-            + (seq[t][_B["lon_speed"]] * 111320.0) ** 2
-        ) / 1852.0 * 3600.0,
-    ),
-    "vec_sog_diff": (
-        "SOG vs GPS속력 절대차이 (노트)",
-        lambda seq, t: abs(
-            seq[t][_B["sog"]]
-            - math.sqrt(
-                (seq[t][_B["lat_speed"]] * 111320.0) ** 2
-                + (seq[t][_B["lon_speed"]] * 111320.0) ** 2
-            ) / 1852.0 * 3600.0
-        ),
-    ),
-    # ── Iteration 4 신규 후보 (0% 고착 시나리오 타겟, 노이즈 플로어/도메인 기반) ──
-    "anchored_excess_speed": (
-        "정박/계류 중 초과속력 (status∈{1,5,6} × max(0, sog-1.5kn))",
-        # 정박이동 타겟. 1.5kn = GPS 지터 허용 임계(해양 관행) → 정상 정박선은 0
-        lambda seq, t: float(int(round(seq[t][_B["status"]])) in (1, 5, 6))
-        * max(0.0, seq[t][_B["sog"]] - 1.5),
-    ),
-    "uncommon_status": (
-        "비통상 항행상태 (0=underway/1=anchored/5=moored 외 = 1)",
-        # FN4-status 타겟. 통상 3개 상태 외는 운용상 드묾(도메인 지식, 공격값 비하드코딩)
-        lambda seq, t: 0.0 if int(round(seq[t][_B["status"]])) in (0, 1, 5) else 1.0,
-    ),
-    "lowspeed_crab": (
-        "저속 crab각 (cog_hdg_diff × max(0, 1-sog/3kn))",
-        # D1-LowSlow 타겟. 저속일수록 heading-course 불일치 가중 (3kn 이하)
-        lambda seq, t: seq[t][_B["cog_hdg_diff"]]
-        * max(0.0, 1.0 - seq[t][_B["sog"]] / 3.0),
-    ),
-    # ── Iteration 7 신규 후보 (FN3 정조준) ────────────────────────────
-    "hdg_perp_score": (
-        "COG-Heading 직교성 (|sin(cog_hdg_diff)|, FN3 정조준)",
-        # FN3-COG경界: 헤딩이 진침로에 수직(91~99°) → sin값 ≈ 1.0 (최대)
-        # 정상선박: cog_hdg_diff < 30° → sin < 0.5  |  반대방향(180°): sin = 0
-        # cog_hdg_diff가 이미 있지만 선형 스케일에서 90° 구분력이 낮음 →
-        # sin 변환으로 90°에서 극대, 0°/180° 에서 0으로 비선형 강조
-        # cog_hdg_diff = -1.0 은 heading 불가(511) 센티넬 → 0.0 반환
-        lambda seq, t: 0.0 if seq[t][_B["cog_hdg_diff"]] < 0.0 else abs(math.sin(math.radians(seq[t][_B["cog_hdg_diff"]]))),
-    ),
-    "status_fn4_flag": (
-        "FN4 비통상 상태 누적 (시퀀스 내 uncommon_status 비율)",
-        # FN4-status: status∈{2,3,7,8,11,12} 가 SEQ_LEN 내내 지속 → 비율=1.0
-        # 정상: status=0/1/5만 → 비율=0.0
-        # uncommon_status(단일 타임스텝) 보다 시퀀스 맥락 반영
-        lambda seq, t: sum(
-            1.0 for row in seq if int(round(row[_B["status"]])) not in (0, 1, 5)
-        ) / len(seq),
-    ),
-}
+CANDIDATE_FEATURES: dict = {}  # 정적 후보 없음 — 전량 claude -p 동적 생성 (n_recommend)
+
+
+# ── 동적 후보 (orchestrator n_recommend 가 claude -p 로 생성) ──────────
+# reco 노드가 약세 진단 → 새 피처 lambda 를 ml/dynamic_candidates.py 에
+# DYNAMIC_FEATURES dict 로 써둔다. 여기서 이 모듈 네임스페이스로 exec → lambda 가
+# _B / _ang_diff / math 를 그대로 참조 → CANDIDATE_FEATURES 에 병합. 파일 없으면 무시.
+_DYN_PATH = os.path.join(os.path.dirname(__file__), "..", "dynamic_candidates.py")
+if os.path.exists(_DYN_PATH):
+    try:
+        with open(_DYN_PATH, encoding="utf-8") as _df:
+            exec(_df.read(), globals())
+        _dyn = globals().get("DYNAMIC_FEATURES", {})
+        CANDIDATE_FEATURES.update(_dyn)
+        print(f"[동적후보] {len(_dyn)}개 로드: {list(_dyn)}")
+    except Exception as _e:
+        print(f"[동적후보] 로드 실패(무시): {_e}")
 
 
 # ── 편향 제거용 스케일러 ─────────────────────────────────────────
@@ -500,23 +379,45 @@ def prepare_tensor(raw_seqs: list, extra_names: list):
 
 
 # ── DCdetector 학습 ───────────────────────────────────────────────
-def train_dcdetect(
+def _build_model(model_name: str, n_feat: int, d_model: int = 64, nhead_max: int = 8):
+    """모델명 → nn.Module 생성. 모두 (B, SEQ_LEN, n_feat) → 동형 재구성 출력.
+
+    DCdetector 만 nhead 자동 조정 필요 (n_feat·d_model 공통 약수 중 최댓값).
+    conv1d/lstm/tcn 은 채널 수만 받으므로 n_feat 만 전달."""
+    if model_name == "dcdetect":
+        nhead = max(h for h in range(1, nhead_max + 1)
+                    if n_feat % h == 0 and d_model % h == 0)
+        return DCdetector(SEQ_LEN, n_feat, patch_size=2, d_model=d_model, nhead=nhead)
+    if model_name == "conv1d":
+        return Conv1DAE(n_feat, hidden_ch=32)
+    if model_name == "lstm":
+        return LSTMAutoencoder(input_size=n_feat, hidden_size=64, num_layers=2)
+    if model_name == "tcn":
+        return TCNAE(n_feat, hidden_ch=32, kernel_size=3, dilations=[1, 2, 4])
+    raise ValueError(f"FE 미지원 모델: {model_name} (지원: {FE_SUPPORTED_MODELS})")
+
+
+def train_recon_model(
+    model_name: str,
     tensor: torch.Tensor,
     n_feat: int,
     epochs: int,
     lr: float = 1e-3,
     batch_size: int = 256,
     patience: int = 5,
-    nhead_max: int = 8,
 ):
-    """DCdetector 학습 후 (model, val_loader) 반환.
-    nhead 는 n_feat 의 약수 중 nhead_max 이하 최댓값으로 자동 조정.
-    16피처 → nhead=8, 14피처 → nhead=2, 12피처 → nhead=4 등."""
+    """재구성 AE 학습 후 (model, val_loader) 반환. model_name 으로 아키텍처 분기.
+    학습 루프(train_standard)·로더·점수·export 는 모델 공통 (설계 무변경).
+
+    호출마다 고정 SEED 로 재시드 → 모든 후보가 동일 init 에서 학습되어
+    Greedy 비교가 공정(학습 노이즈 제거)하고, 채택 후 재학습 점수가 스캔 점수와
+    재현됨. (재시드 없으면 RNG 드리프트로 winner's curse — 운 좋은 후보를 채택한
+    뒤 재학습 시 회귀해 탐지율이 하락함.)"""
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
     device = torch.device("cpu")
-    d_model = 64
-    # n_feat % nhead == 0  AND  d_model % nhead == 0 을 동시에 만족하는 최대 nhead
-    nhead = max(h for h in range(1, nhead_max + 1) if n_feat % h == 0 and d_model % h == 0)
-    model = DCdetector(SEQ_LEN, n_feat, patch_size=2, d_model=d_model, nhead=nhead).to(device)
+    model = _build_model(model_name, n_feat).to(device)
     train_loader, val_loader = make_loaders(tensor, batch_size)
     train_standard(model, train_loader, val_loader, device, epochs, lr, patience)
     return model, val_loader
@@ -628,9 +529,10 @@ def evaluate(
                 sum(1 for s in anom_scores if s > thr) / len(anom_scores) * 100.0
             )
 
-    # extra_fp 출력
+    # extra_fp 출력 (FP=1% 도 같은 [FP≈N%] 형식으로 함께 표기 → Slack 일관성)
     if extra_fp:
         W = 52
+        print(f"\n  [FP≈1%] 평균 탐지율 {float(np.mean(all_dets)):.1f}%")
         for fp in sorted(extra_fp):
             sc_dets = extra_results[fp]
             avg = float(np.mean(list(sc_dets.values())))
@@ -770,6 +672,21 @@ def _objective(sc: list, weak_names: set, weak_weight: float) -> float:
     return overall + weak_weight * weak_mean
 
 
+def _combine_multifp(sc: list, extra: dict) -> list:
+    """FP1 시나리오 결과 + extra{fp:{name:det}} → 시나리오별 FP1/5/10 평균 detection.
+
+    단일 임계(FP=1%, 99퍼센타일 꼬리)는 모델 미세변화에 출렁임이 큼.
+    여러 FP 임계(1/5/10) 탐지율을 평균하면 목적함수가 부드러워져
+    들쑥날쑥·winner's curse·채택후 회귀가 완화됨. extra 없으면 sc 그대로."""
+    if not extra:
+        return sc
+    out = []
+    for name, d1, hold in sc:
+        ds = [d1] + [extra[fp].get(name, d1) for fp in extra]
+        out.append((name, float(np.mean(ds)), hold))
+    return out
+
+
 # ── Greedy Forward Selection 메인 루프 ────────────────────────────
 def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     weak_floor  = getattr(args, "weak_floor",  WEAK_FLOOR_DEFAULT)
@@ -780,11 +697,34 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     current_extra: list = list(INITIAL_EXTRA)
     # accel 등 INITIAL_EXTRA에 포함된 항목은 다시 탐색하지 않음
     remaining: list = [k for k in CANDIDATE_FEATURES.keys() if k not in INITIAL_EXTRA]
+    # 후보 명시 (--candidates): 지정한 이름만 탐색 (큐레이션 추천 풀).
+    #   CANDIDATE_FEATURES 에 있고 INITIAL_EXTRA(기채택) 아닌 것만 유효.
+    cand_list = getattr(args, "candidates", None)
+    if cand_list is not None:   # 명시됨 (빈 리스트면 베이스전용 = 후보 0)
+        remaining = [k for k in cand_list
+                     if k in CANDIDATE_FEATURES and k not in INITIAL_EXTRA]
+        unknown = [k for k in cand_list if k not in CANDIDATE_FEATURES]
+        if unknown:
+            print(f"  [경고] CANDIDATE_FEATURES 에 없는 후보 무시: {unknown}")
+        if not remaining:
+            print("  [베이스전용] 후보 0개 — 베이스라인만 학습/평가 (진단용)")
     # 후보 수 제한 (--max_candidates): 정의 순서대로 앞 N개만 탐색 (속도)
     max_cand = getattr(args, "max_candidates", None)
     if max_cand is not None and max_cand > 0:
         remaining = remaining[:max_cand]
     history: list = []
+
+    # 스캔 서브샘플(--scan_ratio): 후보 평가(베이스+후보)만 부분표본으로 빠르게.
+    #   채택 best 1개는 main 에서 풀 train_seqs 로 재학습 → 배포 정확도 유지.
+    #   eval(탐지율)은 항상 풀 홀드아웃 → 순위 비교 공정. 고정 SEED 로 동일 표본.
+    scan_ratio = getattr(args, "scan_ratio", 1.0)
+    if scan_ratio < 1.0 and len(train_seqs) > 1:
+        n_scan = max(1, int(len(train_seqs) * scan_ratio))
+        scan_seqs = random.Random(SEED).sample(train_seqs, n_scan)
+        print(f"  [스캔 서브샘플] 후보 평가 {n_scan:,}/{len(train_seqs):,} 시퀀스 "
+              f"({scan_ratio:.0%}) — 채택본은 풀 데이터 재학습")
+    else:
+        scan_seqs = train_seqs
 
     n_base_total = len(BASE_FEATURES) + len(current_extra)
     W = 65
@@ -802,15 +742,16 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     print(f"[베이스라인]  피처 {n_base_total}개: {BASE_FEATURES + current_extra}")
     print(f"{'─'*W}")
     t0 = time.time()
-    tensor, scaler = prepare_tensor(train_seqs, current_extra)
-    model, val_loader = train_dcdetect(tensor, n_base_total, args.epochs)
-    det0, sc0, _, _ = evaluate(model, scaler, current_extra, args.n_anom,
-                               raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
+    tensor, scaler = prepare_tensor(scan_seqs, current_extra)
+    model, val_loader = train_recon_model(args.model, tensor, n_base_total, args.epochs)
+    det0, sc0, extra0, _ = evaluate(model, scaler, current_extra, args.n_anom,
+                                    raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
     elapsed = time.time() - t0
 
-    # 약세 시나리오 집합 = 베이스라인 탐지율 < weak_floor (전 과정 고정)
+    # 약세 시나리오 집합 = 베이스라인 FP=1% 탐지율 < weak_floor (전 과정 고정)
     weak_names = {n for n, d, _ in sc0 if d < weak_floor}
-    best_score = _objective(sc0, weak_names, weak_weight)
+    # 목적점수는 FP1/5/10 평균(부드러운 지표)으로 계산 → 출렁임/회귀 완화
+    best_score = _objective(_combine_multifp(sc0, extra0), weak_names, weak_weight)
     best_det   = det0
     print(f"  → 전체 평균 탐지율 {det0:.1f}%  (목적점수 {best_score:.1f})  [{elapsed/60:.1f}분]")
     if weak_names:
@@ -850,13 +791,14 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
             print(f"  + {cand:<20s}  ({desc})  →  {n_feat}개 학습 중...",
                   end="", flush=True)
             t0 = time.time()
-            tensor, scaler = prepare_tensor(train_seqs, trial_extra)
-            model, val_loader = train_dcdetect(tensor, n_feat, args.epochs)
-            det, sc, _, _ = evaluate(model, scaler, trial_extra, args.n_anom, raw_seqs=eval_seqs)
+            tensor, scaler = prepare_tensor(scan_seqs, trial_extra)
+            model, val_loader = train_recon_model(args.model, tensor, n_feat, args.epochs)
+            det, sc, extra, _ = evaluate(model, scaler, trial_extra, args.n_anom,
+                                         raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
             elapsed = time.time() - t0
-            score = _objective(sc, weak_names, weak_weight)
-            gain  = score - best_score          # 목적 점수 기준 향상
-            det_gain = det - best_det           # 참고용 전체평균 변화
+            score = _objective(_combine_multifp(sc, extra), weak_names, weak_weight)
+            gain  = score - best_score          # 목적 점수 기준 향상 (FP1/5/10 평균)
+            det_gain = det - best_det           # 참고용 전체평균(FP1) 변화
             arrow = "▲" if gain > min_gain else ("▼" if gain < -min_gain else "─")
             print(
                 f"  전체평균 {det:5.1f}%({det_gain:+.1f})"
@@ -867,8 +809,13 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
                 step_best_feat = cand
                 step_best_result = (det, trial_extra, tensor, scaler, model, sc, score)
 
-        # 목적 점수 min_gain 이상 향상 시 채택
-        if step_best_gain > min_gain:
+        # 채택 조건: 목적점수 min_gain 이상 향상 AND 전체 FP1 탐지율이 회귀(>tol 하락) 아님.
+        #   회귀 가드: 약세 가중으로 목적점수는 올라도 전체 FP1 이 크게 깎이는 피처는 거부
+        #   (예전 anchor_suspicion 채택 후 -3.1pp 같은 회귀 방지).
+        overall_tol = getattr(args, "overall_tol", 1.0)
+        cand_det = step_best_result[0]
+        regressed = cand_det < best_det - overall_tol
+        if step_best_gain > min_gain and not regressed:
             current_extra = step_best_result[1]
             best_det   = step_best_result[0]
             best_score = step_best_result[6]
@@ -884,6 +831,9 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
                      extra=list(current_extra),
                      scenarios=step_best_result[5])
             )
+        elif step_best_gain > min_gain and regressed:
+            print(f"\n  ✗ 채택 거부: [{step_best_feat}] 목적점수 +{step_best_gain:.1f}나 "
+                  f"전체 FP1 {best_det:.1f}%→{cand_det:.1f}% 회귀(>{overall_tol}pp) → 종료")
         else:
             best_cand = step_best_feat
             print(f"\n  ✗ 개선 없음 (최고 후보: {best_cand}  목적점수 {step_best_gain:+.1f})"
@@ -1060,6 +1010,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="DCdetect 피처 엔지니어링 자동화 (Greedy Forward Selection)"
     )
+    ap.add_argument("--model",    default="dcdetect", choices=FE_SUPPORTED_MODELS,
+                    help=f"FE 학습 모델 (기본: dcdetect, 지원: {FE_SUPPORTED_MODELS})")
     ap.add_argument("--input",    required=True,
                     help="전처리 CSV 경로")
     ap.add_argument("--base_dir", default=r"C:\Users\imcas",
@@ -1080,10 +1032,21 @@ def main():
                     help=f"약세 시나리오 평균 가중치 (기본: {WEAK_WEIGHT_DEFAULT})")
     ap.add_argument("--min_gain", type=float, default=MIN_GAIN_DEFAULT,
                     help=f"목적점수 채택 임계 (기본: {MIN_GAIN_DEFAULT})")
+    ap.add_argument("--overall_tol", type=float, default=1.0,
+                    help="채택 회귀 가드: 전체 FP1 탐지율이 이 값(pp) 넘게 하락하면 "
+                         "목적점수 올라도 채택 거부 (기본 1.0)")
     ap.add_argument("--max_feat", type=int, default=None,
                     help="총 피처 수 상한 (nhead=8 유지하려면 16 권장)")
     ap.add_argument("--max_candidates", type=int, default=None,
                     help="Greedy 후보 수 제한 (정의 순서 앞 N개만, 속도용)")
+    ap.add_argument("--candidates", nargs="*", default=None,
+                    help="탐색할 후보 피처 이름 명시 (큐레이션 추천 풀). "
+                         "미지정 시 CANDIDATE_FEATURES 전체")
+    ap.add_argument("--diagnose_only", action="store_true",
+                    help="베이스라인 학습+평가(약세 진단)까지만, 재학습/순열중요도/export 생략")
+    ap.add_argument("--scan_ratio", type=float, default=1.0,
+                    help="후보 스캔 학습 표본 비율 (예 0.4 = 40%%만, 채택본은 풀 재학습). "
+                         "1.0=풀(기본). 순위만 보므로 best 선택은 보통 동일, 스캔 2~3배 빠름")
     ap.add_argument("--max_steps", type=int, default=None,
                     help="Greedy 최대 채택 스텝 수 (orchestrator에서 1로 지정해 1회 채택 후 종료)")
     ap.add_argument("--export_dir", default=None,
@@ -1112,13 +1075,42 @@ def main():
     history, best_extra = greedy_forward_selection(train_seqs, eval_normal_seqs, args)
     print_report(history)
 
+    # 진단 전용(--diagnose_only): 약세 시나리오만 필요 → 재학습/순열중요도/export 생략.
+    #   약세 진단만 빠르게 보고 싶을 때 ③단계(낭비) 건너뜀.
+    if getattr(args, "diagnose_only", False):
+        base_h = history[0]
+        scen = {n: d for n, d, _ in base_h.get("scenarios", [])}
+        if args.out_json:
+            with open(args.out_json, "w", encoding="utf-8") as jf:
+                json.dump({"baseline_det": base_h["det"], "scenario_fp1": scen},
+                          jf, ensure_ascii=False, indent=2)
+        print(f"\n[진단전용] 재학습/순열중요도/export 생략 — 약세 진단 완료 "
+              f"(베이스 탐지율 {base_h['det']:.1f}%)")
+        return
+
     # ── 최적 피처셋으로 재학습 → Permutation Importance ──────────────
     # 학습은 train_seqs, FP(오탐)·중요도 평가는 홀드아웃 eval_normal_seqs 사용
     best = max(history, key=lambda x: x.get("score", x["det"]))
     best_extra = best.get("extra", [])
+
+    # 채택 0 (수렴): best == 시작셋(INITIAL_EXTRA). 동일 피처셋 재학습/순열중요도/export 는
+    #   무의미(새 모델 없음, 배포본은 직전 채택 브랜치 모델). → 생략하고 수렴 보고만.
+    newly_adopted = [f for f in best_extra if f not in INITIAL_EXTRA]
+    if not newly_adopted:
+        base_h = history[0]
+        scen = {n: d for n, d, _ in base_h.get("scenarios", [])}
+        if args.out_json:
+            with open(args.out_json, "w", encoding="utf-8") as jf:
+                json.dump({"best_extra": list(best_extra), "best_det": base_h["det"],
+                           "baseline_det": base_h["det"], "scenario_fp1": scen},
+                          jf, ensure_ascii=False, indent=2)
+        print(f"\n[수렴] 신규 채택 0 — 동일 피처셋({best['n_feat']}개) 재학습/순열중요도/"
+              f"export 생략 (탐지율 {base_h['det']:.1f}%)")
+        return
+
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
     tensor_best, scaler_best = prepare_tensor(train_seqs, best_extra)
-    model_best, _ = train_dcdetect(tensor_best, best["n_feat"], args.epochs)
+    model_best, _ = train_recon_model(args.model, tensor_best, best["n_feat"], args.epochs)
     perm_results = permutation_importance(
         model_best, scaler_best, best_extra, eval_normal_seqs, n_anom=args.n_anom
     )
@@ -1220,9 +1212,9 @@ def main():
             os.makedirs(args.export_dir, exist_ok=True)
             all_feat_names = BASE_FEATURES + best_extra
             n_feat         = best["n_feat"]
-            onnx_path      = os.path.join(args.export_dir, "model_dcdetect.onnx")
-            scaler_path    = os.path.join(args.export_dir, "scaler_dcdetect.json")
-            threshold_path = os.path.join(args.export_dir, "threshold_dcdetect.txt")
+            onnx_path      = os.path.join(args.export_dir, f"model_{args.model}.onnx")
+            scaler_path    = os.path.join(args.export_dir, f"scaler_{args.model}.json")
+            threshold_path = os.path.join(args.export_dir, f"threshold_{args.model}.txt")
 
             # ONNX (input "x", shape (1, SEQ_LEN, n_feat))
             model_best.eval()

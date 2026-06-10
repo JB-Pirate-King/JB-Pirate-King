@@ -1,6 +1,9 @@
 ais_ids_pi/build
 ais_ids_pi/po
 
+# LangSmith / 환경변수
+.env
+
 # ── ml/ ────────────────────────────────────────────────────────────────
 # 데이터 (실제 경로: D:\ais_data\)
 ml/data/
@@ -73,3 +76,11 @@ build/
 # 민감한 설정 파일
 ml/pipeline_config.json
 ml/google_credentials.json
+
+# caveman-compress backups
+*.original.md
+
+ml/.baseline_diag*
+
+# reco 생성 동적 후보
+ml/dynamic_candidates.py

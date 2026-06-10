@@ -60,14 +60,91 @@ FIXED_TABS = {
 }
 
 
+# 마스터 시트의 모델 인덱스(허브) 탭 — 모델명 클릭 시 해당 탭으로 점프
+HUB_TAB = "모델목록"
+HUB_HEADERS = ["model", "요약", "상세", "시나리오", "중요도", "created"]
+
+
 class PipelineSheets:
+    """모델별로 **탭을 분리**해 단일 마스터 스프레드시트에 기록 (A안).
+
+    - 서비스계정은 개인 Gmail Drive 에 새 스프레드시트를 만들 수 없음(quota 0)이라
+      파일 분리(B안) 대신 **한 시트 안에서 모델별 탭 접두**로 분리한다.
+    - 모델 `m` 의 탭: `m_실행요약 / m_상세로그 / m_시나리오결과 / m_피처중요도 / m`(상세).
+    - 허브 탭(`모델목록`)에 모델별 탭으로 점프하는 HYPERLINK 를 등록 → "클릭→이동" UX.
+    - 파이프라인은 한 번에 한 모델(run)만 처리하므로 '현재 모델' 상태로 라우팅.
+    - 마스터 시트 1개만 서비스계정에 공유돼 있으면 됨 (모델별 시트 공유 불필요).
+    """
+
     def __init__(self, credentials_file: str, sheet_id: str):
         creds = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
-        gc = gspread.authorize(creds)
-        self.sh = gc.open_by_key(sheet_id)
-        self._tabs: dict[str, gspread.Worksheet] = {}
+        self.gc = gspread.authorize(creds)
+        self.master = self.gc.open_by_key(sheet_id)
+        self._tabs: dict[tuple, gspread.Worksheet] = {}     # (model, base_title) -> 탭
         self._summary_row: int | None = None
-        self._ensure_fixed_tabs()
+        self._cur_model: str | None = None
+        self._inited: set = set()                           # 탭/허브 준비된 모델
+        self._hub = self._ensure_hub()
+        for row in self._hub.get_all_values()[1:]:
+            if row and row[0]:
+                self._inited.add(row[0])
+
+    # ── 허브 ─────────────────────────────────────────────────────────
+
+    def _ensure_hub(self) -> gspread.Worksheet:
+        try:
+            ws = self.master.worksheet(HUB_TAB)
+        except gspread.WorksheetNotFound:
+            ws = self.master.add_worksheet(title=HUB_TAB, rows=200,
+                                           cols=len(HUB_HEADERS) + 1)
+        if ws.row_values(1) != HUB_HEADERS:
+            ws.insert_row(HUB_HEADERS, index=1)
+        return ws
+
+    def _jump(self, ws: gspread.Worksheet, label: str) -> str:
+        """같은 스프레드시트 내 특정 탭(gid)으로 점프하는 HYPERLINK 수식."""
+        return f'=HYPERLINK("{self.master.url}#gid={ws.id}","{label}")'
+
+    def _register_in_hub(self, model: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self._hub.append_row([
+            model,
+            self._jump(self._tabs[(model, "실행요약")],   "요약"),
+            self._jump(self._tabs[(model, "상세로그")],   "상세"),
+            self._jump(self._tabs[(model, "시나리오결과")], "시나리오"),
+            self._jump(self._tabs[(model, "피처중요도")], "중요도"),
+            ts,
+        ], value_input_option="USER_ENTERED")
+
+    # ── 모델 라우팅 ──────────────────────────────────────────────────
+
+    def _tab(self, model: str, base: str, headers: list) -> gspread.Worksheet:
+        """마스터 시트에서 `{model}_{base}` 탭 확보(없으면 생성+헤더). 캐시."""
+        key = (model, base)
+        if key in self._tabs:
+            return self._tabs[key]
+        title = f"{model}_{base}"
+        try:
+            ws = self.master.worksheet(title)
+        except gspread.WorksheetNotFound:
+            ws = self.master.add_worksheet(title=title, rows=3000,
+                                           cols=len(headers) + 1)
+        if ws.row_values(1) != headers:
+            ws.insert_row(headers, index=1)
+        self._tabs[key] = ws
+        return ws
+
+    def _use(self, model: str):
+        """현재 모델의 5개 탭 확보 + 허브 등록(최초 1회) 후 상태 설정."""
+        if (model, "실행요약") not in self._tabs:
+            for base, headers in FIXED_TABS.items():
+                self._tab(model, base, headers)
+            self._make_detail(model)
+            if model not in self._inited:
+                self._register_in_hub(model)
+                self._inited.add(model)
+                print(f"[sheets] 모델 탭 생성 + 허브 등록: {model}")
+        self._cur_model = model
 
     # ── 내부 유틸 ────────────────────────────────────────────────────
 
@@ -78,32 +155,28 @@ class PipelineSheets:
         ws.append_row(row)
         return data_rows + 1
 
-    def _ensure_fixed_tabs(self):
-        for title, headers in FIXED_TABS.items():
-            try:
-                ws = self.sh.worksheet(title)
-            except gspread.WorksheetNotFound:
-                ws = self.sh.add_worksheet(title=title, rows=3000,
-                                           cols=len(headers) + 1)
-            if ws.row_values(1) != headers:
-                ws.insert_row(headers, index=1)
-            self._tabs[title] = ws
-
-    def _ensure_model_tab(self, model: str) -> gspread.Worksheet:
-        if model in self._tabs:
-            return self._tabs[model]
+    def _make_detail(self, model: str) -> gspread.Worksheet:
+        """모델 상세 탭(`{model}`) 확보. 헤더 = MODEL_HEADERS. (재귀 회피용 내부)"""
+        key = (model, "__detail__")
+        if key in self._tabs:
+            return self._tabs[key]
         try:
-            ws = self.sh.worksheet(model)
+            ws = self.master.worksheet(model)
         except gspread.WorksheetNotFound:
-            ws = self.sh.add_worksheet(title=model, rows=3000,
-                                       cols=len(MODEL_HEADERS) + 1)
+            ws = self.master.add_worksheet(title=model, rows=3000,
+                                           cols=len(MODEL_HEADERS) + 1)
         if ws.row_values(1) != MODEL_HEADERS:
             ws.insert_row(MODEL_HEADERS, index=1)
-        self._tabs[model] = ws
+        self._tabs[key] = ws
         return ws
 
+    def _ensure_model_tab(self, model: str) -> gspread.Worksheet:
+        """공개: 현재 모델 라우팅(5탭 확보) 후 상세 탭 반환."""
+        self._use(model)
+        return self._tabs[(model, "__detail__")]
+
     def _ws(self, title: str) -> gspread.Worksheet:
-        return self._tabs[title]
+        return self._tabs[(self._cur_model, title)]
 
     # ── 실행 시작 ────────────────────────────────────────────────────
 
@@ -130,51 +203,7 @@ class PipelineSheets:
             "진행 중"
         ])
 
-    # ── 학습 ────────────────────────────────────────────────────────
-
-    def log_train(self, branch: str, model: str, epochs: int, max_mmsi: int,
-                  status: str, elapsed_sec: float = None, notes: str = ""):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        elapsed_str = f"{elapsed_sec:.0f}s" if elapsed_sec else ""
-
-        ws_model = self._ensure_model_tab(model)
-        # MODEL_HEADERS: branch,timestamp,stage,status,det_change,n_features,adopted,threshold,elapsed_s
-        self._append_and_track(ws_model, [
-            "", ts, "베이스학습", status,
-            "", "", "", "", elapsed_str
-        ])
-
-        self._append_and_track(self._ws("상세로그"), [
-            ts, branch, "베이스학습", status,
-            "", "", "", elapsed_str.rstrip("s"), notes
-        ])
-        # 실행요약은 FE 단계가 소유 — 학습 단계는 모델탭/상세로그에만 기록
-
-    # ── 평가 ────────────────────────────────────────────────────────
-
-    def log_eval(self, branch: str, model: str, status: str,
-                 det_fp1: float = None, det_fp5: float = None,
-                 det_fp10: float = None,
-                 elapsed_sec: float = None, notes: str = ""):
-        """베이스 평가 결과 기록 (모델탭 + 상세로그).
-        실행요약은 FE 단계가 소유하므로 여기서 건드리지 않음.
-        시나리오별 탐지율은 호출측에서 log_scenarios로 별도 기록."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f = lambda v, d=1: f"{v:.{d}f}" if v is not None else "-"
-        elapsed_str = f"{elapsed_sec:.0f}s" if elapsed_sec else ""
-
-        det_summary = f"FP1:{f(det_fp1)}% FP5:{f(det_fp5)}% FP10:{f(det_fp10)}%" if det_fp1 else ""
-
-        ws_model = self._ensure_model_tab(model)
-        # MODEL_HEADERS: branch,timestamp,stage,status,det_change,n_features,adopted,threshold,elapsed_s
-        self._append_and_track(ws_model, [
-            "", ts, "베이스평가", status, det_summary, "", "", "", elapsed_str
-        ])
-
-        self._append_and_track(self._ws("상세로그"), [
-            ts, branch, "베이스평가", status,
-            f(det_fp1), "", "", elapsed_str.rstrip("s"), det_summary
-        ])
+    # ── 시나리오 결과 ─────────────────────────────────────────────────
 
     def log_scenarios(self, branch: str, model: str, fp_target: str,
                       scenarios: dict[str, float]):
@@ -182,6 +211,7 @@ class PipelineSheets:
         scenarios: {시나리오명: 탐지율%}
         """
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._use(model)
         ws = self._ws("시나리오결과")
         for name, rate in sorted(scenarios.items()):
             self._append_and_track(ws, [
@@ -198,6 +228,8 @@ class PipelineSheets:
                threshold: float = None, elapsed_sec: float = None,
                notes: str = ""):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if model:
+            self._use(model)
         gain = (best_det - baseline_det) if (best_det is not None and baseline_det is not None) else None
         adopted_str = ", ".join(adopted) if adopted else "채택없음"
         features_str = ", ".join(all_features) if all_features else adopted_str
@@ -310,5 +342,5 @@ def from_config(config_path: str = "ml/pipeline_config.json") -> "PipelineSheets
         cfg = json.load(f)
     return PipelineSheets(
         credentials_file=cfg["google_sheets"]["credentials_file"],
-        sheet_id=cfg["google_sheets"]["sheet_id"]
+        sheet_id=cfg["google_sheets"]["sheet_id"],
     )
