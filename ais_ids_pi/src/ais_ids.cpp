@@ -179,7 +179,34 @@ void ais_ids::to_snapshot(AISTarget &target)
         float lon_speed = (dt > 0.0f) ? (float)((cur.lon - prev.lon) / dt) : 0.0f;
 
         // [AUTO:extra_feats_begin]
-        // 추가 파생 피처 없음 (베이스 12개만 사용)
+        // 추가 파생 피처 계산 (patch_plugin.py 자동 생성)
+        float accel = (dt > 0.0f) ? sog_change / dt : 0.0f;
+        float heading_rate = 0.0f;
+        if (cur.hdg < 511 && prev.hdg < 511) {
+            float _hr = std::abs((float)cur.hdg - (float)prev.hdg);
+            if (_hr > 180.0f) _hr = 360.0f - _hr;
+            heading_rate = (dt > 0.0f) ? _hr / dt : 0.0f;
+        }
+        float vec_sog_diff = 0.0f;
+        {
+            // lat/lon speed (도/초) → 노트 변환 (1도≈111320m, 1노트=1852m/h)
+            float _gps = std::sqrt(lat_speed * lat_speed + lon_speed * lon_speed)
+                         * 111320.0f * 3600.0f / 1852.0f;
+            vec_sog_diff = std::abs(_gps - (float)cur.sog);
+        }
+        float heading_change = 0.0f;
+        if (cur.hdg < 511 && prev.hdg < 511) {
+            float _hd = std::abs((float)cur.hdg - (float)prev.hdg);
+            heading_change = (_hd > 180.0f) ? 360.0f - _hd : _hd;
+        }
+        // [UNKNOWN FEATURE: sog_vec_kn]
+        float turn_rate = 0.0f;
+        {
+            float _tr = std::abs((float)cur.cog - (float)prev.cog);
+            if (_tr > 180.0f) _tr = 360.0f - _tr;
+            turn_rate = (dt > 0.0f) ? _tr / dt : 0.0f;
+        }
+        // [UNKNOWN FEATURE: uncommon_status]
         // [AUTO:extra_feats_end]
 
         // [AUTO:push_calls_begin]
@@ -192,7 +219,12 @@ void ais_ids::to_snapshot(AISTarget &target)
                 cog_hdg_diff, sog_change,
                 cog_hdg_change,
                 speed_consistency,
-                lat_speed, lon_speed);
+                lat_speed, lon_speed,
+                accel,
+                heading_rate,
+                vec_sog_diff,
+                heading_change,
+                turn_rate);
 
         if (ais_ml_short->IsLoaded())
             ais_ml_short->PushFeature(target.mmsi,
@@ -202,7 +234,12 @@ void ais_ids::to_snapshot(AISTarget &target)
                 cog_hdg_diff, sog_change,
                 cog_hdg_change,
                 speed_consistency,
-                lat_speed, lon_speed);
+                lat_speed, lon_speed,
+                accel,
+                heading_rate,
+                vec_sog_diff,
+                heading_change,
+                turn_rate);
         // [AUTO:push_calls_end]
     }
 }
