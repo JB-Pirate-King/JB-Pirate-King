@@ -23,8 +23,11 @@ sys.stderr.reconfigure(encoding="utf-8")
 # ── 베이스 피처 (고정 12개, 순서 불변) — ml/core/constants.py 가 단일 출처 ──
 try:
     from ml.core.constants import BASE_FEATURES
-except ModuleNotFoundError:                      # `python ml/core/patch_plugin.py` (스크립트 dir = sys.path[0])
-    from constants import BASE_FEATURES
+except ModuleNotFoundError:
+    try:                                         # cwd=ml (CI)
+        from core.constants import BASE_FEATURES
+    except ModuleNotFoundError:                  # `python ml/core/patch_plugin.py` (스크립트 dir = sys.path[0])
+        from constants import BASE_FEATURES
 
 BASE_FEAT_DESC = {
     "sog":              "속력 (knots)",

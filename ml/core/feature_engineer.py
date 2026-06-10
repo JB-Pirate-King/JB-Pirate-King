@@ -71,7 +71,10 @@ FE_SUPPORTED_MODELS = ["dcdetect", "conv1d", "lstm", "tcn"]
 try:
     from ml.core.constants import SEQ_LEN
 except ModuleNotFoundError:
-    from constants import SEQ_LEN
+    try:                                         # cwd=ml (CI)
+        from core.constants import SEQ_LEN
+    except ModuleNotFoundError:
+        from constants import SEQ_LEN
 SEQ_BREAK       = 600   # dt 임계값 (초) — 시퀀스 분리
 MAX_SEQ_PER_MMSI = 500  # MMSI당 최대 시퀀스 수 (고빈도 선박 편향 방지)
 EVAL_NORMAL_RATIO = 0.2  # FP(오탐) 측정용 홀드아웃 정상 시퀀스 비율 (학습 풀에서 분리)
@@ -87,8 +90,11 @@ MIN_GAIN_DEFAULT    = 3.0    # 목적 점수 채택 임계 (노이즈 오채택 
 # ── 베이스 피처 (현재 12개) ────────────────────────────────────────
 try:
     from ml.core.constants import BASE_FEATURES, BASE_INDEX as _B
-except ModuleNotFoundError:                      # `python ml/core/feature_engineer.py`
-    from constants import BASE_FEATURES, BASE_INDEX as _B
+except ModuleNotFoundError:
+    try:                                         # cwd=ml (CI)
+        from core.constants import BASE_FEATURES, BASE_INDEX as _B
+    except ModuleNotFoundError:                  # `python ml/core/feature_engineer.py`
+        from constants import BASE_FEATURES, BASE_INDEX as _B
 
 # ── 이전 반복에서 검증·채택된 피처 (Greedy 탐색의 출발점) ──────────────
 # Iteration 1: accel (+12.0pp)

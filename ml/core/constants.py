@@ -6,11 +6,14 @@ orchestrator.py(BASE_FEATURES) / train_benchmark.py(FEATURES) 에 같은 12개 �
 각각 복제돼 있어, 하나만 고치면 나머지와 어긋나 C++ ML_FEATURE_COUNT 와 불일치할
 위험이 있었다. 그 복제를 여기로 통합한다.
 
-임포트 (실행 방식이 둘이라 dual-import 권장):
+임포트 (실행 방식이 셋이라 triple-import 권장):
     try:
         from ml.core.constants import BASE_FEATURES, SEQ_LEN, BASE_INDEX
-    except ModuleNotFoundError:                      # `python ml/core/xxx.py` 스크립트 실행
-        from constants import BASE_FEATURES, SEQ_LEN, BASE_INDEX
+    except ModuleNotFoundError:
+        try:                                         # cwd=ml (CI 등)
+            from core.constants import BASE_FEATURES, SEQ_LEN, BASE_INDEX
+        except ModuleNotFoundError:                  # `python ml/core/xxx.py` 스크립트 실행
+            from constants import BASE_FEATURES, SEQ_LEN, BASE_INDEX
 """
 
 # 기본 입력 피처 12개. 순서 = 모델 입력 채널 순서이므로 임의 재배열 금지
