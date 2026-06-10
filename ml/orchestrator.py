@@ -1,1127 +1,571 @@
 """
-AIS 파이프라인 오케스트레이터 (DCdetect 피처 엔지니어링 자동화)
+AIS 파이프라인 오케스트레이터 — LangGraph 완전판.
 
-구조: 브랜치마다 Greedy 1피처 채택 → 채택 시 그 피처셋으로 재학습/평가 →
-      배포모델 export + 플러그인 빌드 + 커밋 + 릴리즈 → fe_state 저장 →
-      새 브랜치(dcdetect_001 → 002 → ...)로 자동 체이닝, 수렴(채택 없음)하면 종료.
-  - 베이스라인 학습+평가는 FE 내부(feature_engineer.py)에서 수행 (별도 단계 없음).
-  - 전처리는 --skip_preprocess 가 아니면 첫 브랜치에서 1회만.
-  - 각 단계: 실행 → Claude 분석 → Slack 보고/승인(또는 --auto_approve) → Sheets 기록.
-  - 모델 브랜치/커밋은 project(upstream) 저장소로 push.
+graph.md 구조도 반영:
+  - claude 피처 추천(reco) 노드: 약세 진단 → claude 가 새 후보 피처 발명·검증 → 후보풀 확장.
+    수렴(채택0) 시 다른 각도로 재추천 루프(라운드 상한).
+  - 노드별 하네스: 각 compute 노드 뒤 claude -p 하네스 → 분석·판정(continue/retry/stop).
+  - 사람 게이트: 비가역(배포·커밋) 단계 interrupt() 승인.
+  - Sheets: log_sheet(kind) 팩토리로 DRY 로깅.
 
-사용법:
+무거운 실행 함수/통합/파서는 `ml/pipeline_steps.py` 재사용. 제어흐름만 여기 그래프로.
+
+실행:
     python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
         --data_file D:/ais_data/preprocessed/ais_preprocessed_3yr.csv \
         --skip_preprocess --auto_approve
 """
-import argparse
+from __future__ import annotations
+
 import json
-import os
-import re
-import shutil
 import subprocess
 import sys
 import time
-from collections import deque
-from pathlib import Path
+from typing import Optional, TypedDict
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
+
+import ml.pipeline_steps as steps
 import ml.integrations.slack_bot as _sb
 import ml.integrations.sheets as _sh
 import ml.integrations.git_manager as git
 
-CONFIG_PATH = "ml/pipeline_config.json"
+# 하네스를 켤 노드 (전체). 비용 줄이려면 일부만 남긴다.
+HARNESS_ON = {"new_branch", "baseline", "reco", "fe", "build", "release", "chain"}
 
-from ml.core.constants import BASE_FEATURES   # 단일 출처 (ml/core/constants.py)
-
-# feature_engineer.py 의 INITIAL_EXTRA 와 동기화
-FE_INITIAL_EXTRA = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
-
-# 파이프라인 작업용 임시 출력 디렉터리 (repo-local, gitignore 대상)
-#   - FE 결과 JSON / 모델 export 는 여기에 쓰고 transient 하게만 사용.
-#   - 영구 산출물: 지표→Google Sheets, 모델→브랜치(ais_ids_pi/data) 커밋.
-#   - D 드라이브(base_dir)에는 더 이상 출력물을 남기지 않음 (입력 데이터/캐시만 D).
-WORK_DIR = Path("ml/.pipeline_tmp")
-
-# 피처 설명 (계산 방식 포함)
-FEATURE_DESCRIPTIONS = {
-    "sog":               "속력 — AIS 원본값 (knots)",
-    "cog":               "항로각 — AIS 원본값 (0-360°)",
-    "heading":           "선수방향 — AIS 원본값 (0-360°)",
-    "status":            "운항상태 — AIS status 코드 (0-15)",
-    "dt":                "시간차 — 이전 메시지와의 경과시간 (초)",
-    "dist_km":           "이동거리 — 연속 위경도 간 Haversine 거리 (km)",
-    "cog_hdg_diff":      "COG-HDG 차이 — |COG-Heading|을 [0,180]으로 정규화",
-    "sog_change":        "속력변화 — |SOG(t) - SOG(t-1)|",
-    "cog_hdg_change":    "방향불일치 변화율 — cog_hdg_diff의 시간 미분",
-    "speed_consistency": "속력일관성 — SOG vs dist_km/dt 비율",
-    "lat_speed":         "위도속도 — Δlat/dt (°/s)",
-    "lon_speed":         "경도속도 — Δlon/dt (°/s)",
-    # FE 추가 피처
-    "accel":                 "가속도 — Δsog/dt (knots/s)",
-    "heading_rate":          "선수변화율 — Δheading/dt (°/s)",
-    "vec_sog_diff":          "벡터SOG차이 — 벡터분해 후 크기 차이",
-    "heading_change":        "선수각변화 — |heading(t) - heading(t-1)|",
-    "sog_vec_kn":            "GPS유도 속력 (노트) — lat/lon_speed로 계산한 실제 이동속력",
-    "lowspeed_crab":         "저속 crab각 — cog_hdg_diff × max(0, 1-sog/3kn)",
-    "cog_change":            "COG 변화량 — |COG(t) - COG(t-1)| (도)",
-    "cog_move_diff":         "COG vs 실이동방향 차이 — AIS COG와 lat/lon 기반 실이동각 오차 (도)",
-    "dist_speed_err":        "거리/속도 불일치 — |dist_km/dt×3600 - sog×1.852| (km/h)",
-    "dist_speed_ratio":      "거리/속도 비율 — dist_km / max(sog×1.852×dt/3600, 1e-6)",
-    "anchor_suspicion":      "정박의심 — 저속+Heading변화 복합 지표",
-    "speed_ratio":           "상대 속도 변화율 — |sog_change| / max(sog, 0.5)",
-    "anchored_excess_speed": "정박 중 초과속력 — status∈{1,5,6} × max(0, sog-1.5kn)",
-}
+# 추천 피처를 feature_engineer 가 읽는 동적 후보 파일 (feature_engineer 가 exec 로드)
+DYNAMIC_CAND_PATH = "ml/dynamic_candidates.py"
 
 
-def load_config():
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+class _Runtime:
+    bot = None
+    sheet = None
+    args = None
 
-
-def run_cmd(cmd: list[str], progress_cb=None, interactive=False) -> tuple[int, str]:
-    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
-           "PYTHONUNBUFFERED": "1"}
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        stdin=subprocess.PIPE if interactive else None,
-        text=True, encoding="utf-8", errors="replace", env=env
-    )
-    # 파싱은 후보표/중요도/마지막 N줄만 필요 → 상한 buffer 로 메모리 폭주 방지.
-    # tqdm progress 줄은 live progress_cb 가 처리하므로 buffer 에 적재하지 않음.
-    output_lines = deque(maxlen=20000)
-    for line in proc.stdout:
-        line = line.rstrip()
-        is_tqdm = bool(re.search(r"Epoch\s+\d+/\s*\d+:\s+[\d.]+%\|", line))
-        if not is_tqdm:
-            print(line, flush=True)
-            output_lines.append(line)
-        if progress_cb:
-            progress_cb(line, proc)
-    proc.wait()
-    return proc.returncode, "\n".join(output_lines)
+RT = _Runtime()
 
 
 # ─────────────────────────────────────────────
-# 출력 파싱 헬퍼
+# State
 # ─────────────────────────────────────────────
-
-def _extract_lines(out: str, keywords: list[str], max_lines: int = 8) -> list[str]:
-    hits = []
-    for line in out.splitlines():
-        s = line.strip()
-        if s and any(k in s for k in keywords):
-            hits.append(s)
-    return hits[-max_lines:]
-
-
-def _parse_preprocess(out: str) -> list[str]:
-    return _extract_lines(out, ["MMSI", "행", "총", "입력", "출력", "완료", "처리"], max_lines=6)
-
-def _parse_permutation_importance(out: str) -> list[tuple[str, float]]:
-    """순열 중요도 파싱 → [(feat, pp), ...] 절댓값 내림차순 (더 음수 = 더 중요)"""
-    scores: dict[str, float] = {}
-    for line in out.splitlines():
-        m = re.search(r"(\w+)\s+중요도:\s+(-?\d+\.?\d*)pp", line)
-        if m:
-            scores[m.group(1)] = float(m.group(2))
-    return sorted(scores.items(), key=lambda x: x[1])  # 가장 음수 = 가장 중요
-
-
-def _parse_greedy_candidates(out: str) -> list[tuple[str, str, float, float, float]]:
-    """Greedy 후보 → [(feat, desc, det_gain_pp, obj_score, obj_gain), ...] obj_gain 내림차순"""
-    candidates = []
-    current_feat: str | None = None
-    current_desc: str | None = None
-    for line in out.splitlines():
-        s = line.strip()
-        m = re.match(r"\+\s+(\w+)\s+\((.+?)\)\s+→", s)
-        if m:
-            current_feat = m.group(1)
-            current_desc = m.group(2)
-        if current_feat and "전체평균" in s and "%" in s:
-            m2 = re.search(
-                r"전체평균\s+[\d.]+%\(([+-]?\d+\.?\d*)\)\s+점수\s+([\d.]+)\s*[▲▼─]([+-]?\d+\.?\d*)",
-                s
-            )
-            if m2:
-                candidates.append((current_feat, current_desc,
-                                   float(m2.group(1)), float(m2.group(2)), float(m2.group(3))))
-                current_feat = current_desc = None
-    return sorted(candidates, key=lambda x: x[4], reverse=True)
-
-
-def _parse_fe(out: str) -> list[str]:
-    details = []
-    for line in out.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if "베이스라인" in s or ("전체 평균 탐지율" in s and "목적점수" in s):
-            details.append(s)
-        elif s.startswith("+ ") and "학습 중" in s:
-            details.append(s)
-        elif any(a in s for a in ["▲", "▼", "─"]) and "전체평균" in s:
-            details.append(s)
-        elif "✓ 채택" in s:
-            details.append(s)
-        elif ("전체평균" in s and "→" in s and "목적점수" in s):
-            details.append(s)
-        elif "✗ 개선 없음" in s or "이번 반복 채택" in s:
-            details.append(s)
-    return details[-20:]
+class PipelineState(TypedDict, total=False):
+    run_num: int
+    branch: str
+    current_extra: list
+    iters: int
+    first_iter: bool
+    # 진단 / 추천
+    baseline: dict            # {det, weak, out}
+    candidates: list          # 추천된 후보 이름
+    tried_feats: list         # 시도한 피처 (중복 회피)
+    reco_round: int
+    # fe 결과
+    r: dict                   # _fe_train_eval 반환 dict
+    commit_files: list
+    build_summary: list
+    # 라우팅
+    decision: str             # 하네스/게이트 결정
+    harness: dict             # 노드별 하네스 결과
+    adopted_any: bool
+    terminate: bool
 
 
 # ─────────────────────────────────────────────
-# Claude 분석 (claude CLI 호출)
+# 하네스 (claude -p 분석·판정) 노드 팩토리
 # ─────────────────────────────────────────────
-
-def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
-                   extra: dict = None) -> list[str]:
-    """claude -p 로 단계 결과 분석 → Slack 메시지 라인 목록 반환.
-    [피처개선] 단계는 매우 상세한 다중 섹션 분석, 그 외는 간결 분석."""
-    extra_str = json.dumps(extra or {}, ensure_ascii=False)
-
-    if stage == "피처개선":
-        # FE 결과: 후보 평가표·시나리오·중요도가 출력 뒤쪽에 있어 충분히 길게 전달
-        last_lines = "\n".join(out.splitlines()[-150:])
-        prompt = (
-            "당신은 AIS 선박 이상탐지(비지도 재구성 오토인코더 DCdetect) ML 파이프라인의 "
-            "수석 분석가입니다. 방금 끝난 [피처 엔지니어링] 단계 결과를 **매우 상세히** 분석하세요.\n\n"
-            f"성공: {'예' if success else '아니오'} | 소요: {elapsed:.0f}초\n"
-            f"핵심 지표(JSON): {extra_str}\n\n"
-            f"=== 실행 출력 (마지막 150줄: 베이스라인·후보별 탐지율/목적점수·채택·재학습·최종 FP1/5/10·순열중요도) ===\n"
-            f"{last_lines}\n\n"
-            "아래 5개 항목을 한국어로, 각 항목 3~5문장씩 **구체적 수치를 인용**하며 상세히 작성하세요 "
-            "(전체 1500자 내외, 항목 번호와 제목 유지):\n"
-            "1. 📊 결과 평가: 베이스라인→최종 탐지율 변화(pp), 채택 피처 수, FP=1/5/10 비교. "
-            "이번 iter이 성공적인지/미미한지 판단.\n"
-            "2. 🧬 채택 피처 분석: 어떤 피처가 채택됐고 목적점수가 왜 올랐는지, "
-            "그 피처가 물리적으로 어떤 이상 패턴(예: 정박이동·저속crab·급가속)을 포착하는지 해석.\n"
-            "3. ⚠️ 약세 시나리오 진단: 여전히 탐지율이 낮은(<50%) 시나리오와 그 원인 가설. "
-            "재구성 오차 관점에서 왜 안 잡히는지.\n"
-            "4. 🎯 다음 단계 전략: 다음 브랜치에서 어떤 '종류'의 파생 피처를 추가하면 약세를 줄일지 "
-            "구체적으로 1~2개 제안(이름이 아니라 아이디어).\n"
-            "5. ✅ 권고: continue / retry / stop 중 하나 + 명확한 근거(수치 기반).\n"
-        )
-        timeout = 180
-    else:
-        last_lines = "\n".join(out.splitlines()[-60:])
-        prompt = (
-            f"AIS 이상탐지 ML 파이프라인 [{stage}] 단계 결과를 분석해줘.\n\n"
-            f"성공 여부: {'성공' if success else '실패'} | 소요: {elapsed:.0f}초\n"
-            f"추가 정보: {extra_str}\n\n"
-            f"실행 출력 (마지막 60줄):\n{last_lines}\n\n"
-            f"아래 3가지를 한국어로 항목별 2~3문장씩 상세히 답해:\n"
-            f"1. 결과 평가: 정상인지 문제가 있는지, 핵심 수치 해석\n"
-            f"2. 원인/근거: 왜 이 결과가 나왔는지\n"
-            f"3. 다음 행동 추천: continue / retry / stop 중 하나 + 이유\n"
-        )
-        timeout = 120
-
+def _claude_json(prompt: str, timeout: int = 120) -> Optional[dict]:
+    """claude -p --output-format json 호출 → dict. 실패 시 None."""
     try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout
+        out = subprocess.run(
+            ["claude", "-p", prompt, "--output-format", "json"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            lines = ["🤖 *Claude 상세 분석*"]
-            for l in result.stdout.strip().splitlines():
-                if l.strip():
-                    lines.append(l.rstrip())
-            return lines
-    except FileNotFoundError:
-        pass
+        if out.returncode == 0 and out.stdout.strip():
+            # claude --output-format json 은 메타 래핑이 있을 수 있어 result 추출 시도
+            raw = out.stdout.strip()
+            data = json.loads(raw)
+            if isinstance(data, dict) and "result" in data:
+                inner = data["result"]
+                return json.loads(inner) if isinstance(inner, str) else inner
+            return data
     except Exception as e:
-        print(f"[Claude 분석 오류] {e}")
+        print(f"[하네스] claude 호출 실패: {e}")
+    return None
 
-    return ["🤖 Claude 분석 불가 (수동 확인 필요)"]
+
+def _harness_prompt(stage: str, text: str, extra: dict) -> str:
+    return (
+        f"AIS 이상탐지 ML 파이프라인 [{stage}] 노드 결과를 분석하고 다음 행동을 판정하라.\n\n"
+        f"핵심지표(JSON): {json.dumps(extra, ensure_ascii=False)}\n\n"
+        f"=== 출력(마지막 부분) ===\n{text[-2500:]}\n\n"
+        "아래 JSON 만 출력(설명 산문 금지):\n"
+        '{"assessment":"수치 요약 1~2문장","evidence":"근거","verdict":"continue|retry|stop",'
+        '"reason":"판정 근거","suggestion":"있으면 다음 개선 아이디어"}\n'
+        "verdict 규칙: 정상 진행=continue / 일시오류·재실행 권장=retry / 치명·중단 권장=stop."
+    )
 
 
-def fe_adopted_analysis(out: str, adopted: list[str], det_rate,
-                        baseline_det, weak_names: list[str]) -> list[str]:
-    """FE 채택 피처 상세 분석 (claude_analyze 보완용)"""
-    desc_map = {}
-    gain_map = {}
-    last_feat = None
-    for line in out.splitlines():
-        s = line.strip()
-        m = re.search(r"✓ 채택: \[(.+?)\]\s*\((.+?)\)", s)
-        if m:
-            last_feat = m.group(1)
-            desc_map[last_feat] = m.group(2)
-        if last_feat and "목적점수" in s:
-            m2 = re.search(r"목적점수 \+(\d+\.?\d*)", s)
-            if m2 and last_feat not in gain_map:
-                gain_map[last_feat] = float(m2.group(1))
-    lines = []
-    if adopted:
-        lines.append(f"*채택된 피처 {len(adopted)}개*")
-        for feat in adopted:
-            desc = desc_map.get(feat, "설명 없음")
-            gain = gain_map.get(feat)
-            gain_str = f"  (목적점수 +{gain:.1f})" if gain else ""
-            lines.append(f"  • `{feat}` — {desc}{gain_str}")
-    else:
-        lines.append("이번 iter 채택 피처 없음")
+def claude_harness(stage: str, ctx_fn):
+    """노드 뒤에 붙는 claude -p 하네스 노드 생성.
+    ctx_fn(state) -> (분석 텍스트, extra dict). HARNESS_ON 에 없으면 무판정(continue)."""
+    def node(state: PipelineState) -> dict:
+        if stage not in HARNESS_ON:
+            return {"decision": "continue"}
+        text, extra = ctx_fn(state)
+        v = _claude_json(_harness_prompt(stage, text, extra)) or {
+            "assessment": "분석 불가(claude 없음)", "verdict": "continue", "reason": "fallback"}
+        verdict = v.get("verdict", "continue")
+        RT.bot.log(
+            f"🤖 *[{stage}] 하네스* — {v.get('assessment','')}\n"
+            f"  → *{verdict}*: {v.get('reason','')}"
+            + (f"\n  💡 {v['suggestion']}" if v.get("suggestion") else ""),
+            "하네스",
+        )
+        return {"harness": {**state.get("harness", {}), stage: v}, "decision": verdict}
+    return node
 
-    if det_rate is not None and baseline_det is not None:
-        delta = det_rate - baseline_det
-        sign = "▲" if delta > 0 else ("▼" if delta < 0 else "─")
-        lines.append(f"탐지율: {baseline_det:.1f}% → {det_rate:.1f}%  {sign}{abs(delta):.1f}pp")
 
-    if weak_names:
-        lines.append(f"*약세 시나리오*: {', '.join(weak_names[:4])}")
-        lines.append("  → 다음 iter에서 이 시나리오를 타겟하는 피처 추가 검토")
-
-    return lines
+def _route_harness(continue_to: str):
+    """하네스 verdict → continue_to / fe_train(retry) / user_stop(stop)."""
+    def route(state: PipelineState) -> str:
+        d = state.get("decision", "continue")
+        if d == "stop":
+            return "user_stop"
+        if d == "retry":
+            return "fe_train"
+        return continue_to
+    return route
 
 
 # ─────────────────────────────────────────────
-# 단계별 실행 함수
+# Sheets 로깅 DRY 팩토리
 # ─────────────────────────────────────────────
+def log_sheet(kind: str):
+    """kind: run_start|fe|run_done|converge. 동일 로깅 노드 복제 대신 하나로."""
+    def node(state: PipelineState) -> dict:
+        s, r, a = RT.sheet, state.get("r", {}), RT.args
+        try:
+            if kind == "run_start":
+                s.log_run_start(state["branch"], a.model, a.epochs, a.max_mmsi,
+                                data_file=a.data_file)
+            elif kind == "fe":
+                fe = r.get("fe_stats", {})
+                s.log_fe(state["branch"], state["run_num"], "완료",
+                         model=a.model, fe_step=len(r.get("newly_adopted", [])),
+                         baseline_det=fe.get("baseline_det"), best_det=fe.get("det_rate"),
+                         n_features=r.get("n_feat"), adopted=r.get("newly_adopted"),
+                         all_features=r.get("full_extra"),
+                         threshold=fe.get("threshold"))
+            elif kind == "run_done":
+                s.log_run_done(state["branch"], a.model, success=True)
+            elif kind == "converge":
+                s.update_run_summary(notes="수렴 완료",
+                                     adopted=state.get("current_extra"))
+        except Exception as e:
+            print(f"[Sheets:{kind}] 로깅 실패(무시): {e}")
+        return {}
+    return node
 
-_AUTO_APPROVE = False  # main()에서 --auto_approve 플래그로 설정
 
-
-def _wait(bot, stage: str, summary: list[str]) -> str:
-    """auto_approve 모드면 즉시 approve, 아니면 Slack 대기. 실패(❌) 시엔 stop."""
-    if _AUTO_APPROVE:
-        if any("❌" in s for s in summary):
-            bot.log(f"🤖 [auto_approve] {stage} ❌ → stop", stage)
+# ─────────────────────────────────────────────
+# 게이트 (interrupt 또는 auto_approve)
+# ─────────────────────────────────────────────
+def _gate(summary: list, key: str, prompt: str) -> str:
+    if RT.args.auto_approve:
+        if any("❌" in str(s) for s in summary):
+            RT.bot.log(f"🤖 [auto_approve] {prompt} ❌ → stop", "gate")
             return "stop"
-        bot.log(f"🤖 [auto_approve] {stage} → approve", stage)
+        RT.bot.log(f"🤖 [auto_approve] {prompt} → approve", "gate")
         return "approve"
-    return bot.wait_approval(stage, summary)
+    return interrupt({"gate": key, "prompt": prompt, "summary": summary})
 
-
-def _step_header(cur: int, total: int, name: str, next_name: str) -> str:
-    bar = "".join("■" if i <= cur else "□" for i in range(1, total + 1))
-    return f"📍 [{cur}/{total}] {bar}  *{name}*  →  다음: {next_name}"
-
-
-def stage_preprocess(bot, sheet, branch, args, step_info: tuple):
-    cur, total, next_name = step_info
-    while True:
-        bot.log_stage_start("전처리",
-            f"{_step_header(cur, total, '전처리', next_name)}\n{args.raw_dir}")
-        t0 = time.time()
-        ret, out = run_cmd(
-            [sys.executable, "ml/core/preprocess.py", args.raw_dir, "--output", args.data_file]
-        )
-        elapsed = time.time() - t0
-        details  = _parse_preprocess(out)
-        analysis = claude_analyze("전처리", out, ret == 0, elapsed)
-
-        hdr = _step_header(cur, total, "전처리", next_name)
-        if ret != 0:
-            summary = [hdr, "❌ 전처리 실패", f"소요: {elapsed:.0f}s"] + details + ["─"] + analysis
-            bot.log_stage_result("전처리", summary, success=False)
-            sheet.log(branch, "전처리", "실패", elapsed_sec=elapsed)
-        else:
-            summary = [hdr, f"소요: {elapsed:.0f}s"] + details + ["─"] + analysis
-            bot.log_stage_result("전처리", summary, success=True)
-            sheet.log(branch, "전처리", "완료", elapsed_sec=elapsed)
-
-        decision = _wait(bot,"전처리", summary)
-        if decision == "approve":
-            return True
-        if decision == "stop":
-            return False
 
 # ─────────────────────────────────────────────
-# 플러그인 자동 빌드
+# 코어 노드
 # ─────────────────────────────────────────────
-
-def _win_to_wsl(win_path: str) -> str:
-    """C:\\Users\\foo\\bar → /mnt/c/Users/foo/bar"""
-    p = win_path.replace("\\", "/")
-    if len(p) >= 2 and p[1] == ":":
-        drive = p[0].lower()
-        return f"/mnt/{drive}{p[2:]}"
-    return p
-
-
-def stage_build_plugin(bot, args, scaler_path: str) -> list[str]:
-    """FE 채택 후 플러그인 자동 빌드.
-
-    단계:
-      1. patch_plugin.py  → C++ 코드 자동 패치 (ML_FEATURE_COUNT / PushFeature)
-      2. 모델 파일        → ais_ids_pi/data/ 복사 (model.onnx / scaler.json / threshold.txt)
-      3. WSL cmake+make   → ais_ids_pi/*.tar.gz 생성
-
-    반환: git에 포함할 파일 경로 목록 (실패 단계까지 수집한 것 반환)
-    """
-    plugin_dir = Path("ais_ids_pi")
-    data_dir   = plugin_dir / "data"
-    data_dir.mkdir(exist_ok=True)
-    model_dir  = WORK_DIR / "model"
-
-    # ── 1. C++ 패치 ──────────────────────────────────────────────────
-    bot.log("🔧 플러그인 C++ 코드 패치 중...", "플러그인빌드")
-    ret, out = run_cmd([
-        sys.executable, "ml/core/patch_plugin.py",
-        "--scaler", scaler_path,
-        "--root", ".",
-    ])
-    if ret != 0:
-        bot.log(
-            f"❌ patch_plugin 실패 (플러그인 빌드 생략)\n{out[-300:]}",
-            "플러그인빌드",
-        )
-        return []
-    bot.log("✅ C++ 패치 완료", "플러그인빌드")
-
-    # ── 2. 모델 파일 복사 → ais_ids_pi/data/ ─────────────────────────
-    copy_ok = True
-    for src_name, dst_name in [
-        (f"model_{args.model}.onnx",    "model.onnx"),
-        (f"scaler_{args.model}.json",   "scaler.json"),
-        (f"threshold_{args.model}.txt", "threshold.txt"),
-    ]:
-        src = model_dir / src_name
-        dst = data_dir / dst_name
-        if src.exists():
-            shutil.copy2(src, dst)
-        else:
-            bot.log(f"⚠ 모델 파일 없음: {src}", "플러그인빌드")
-            copy_ok = False
-
-    cpp_files = [
-        "ais_ids_pi/include/ais_ml.h",
-        "ais_ids_pi/src/ais_ml.cpp",
-        "ais_ids_pi/src/ais_ids.cpp",
-    ]
-    data_files = [
-        str(data_dir / "model.onnx"),
-        str(data_dir / "scaler.json"),
-        str(data_dir / "threshold.txt"),
-    ]
-
-    if not copy_ok:
-        bot.log("❌ 모델 파일 복사 실패 (WSL 빌드 생략)", "플러그인빌드")
-        return [f for f in cpp_files + data_files if Path(f).exists()]
-    bot.log("✅ 모델 파일 복사 완료 → ais_ids_pi/data/", "플러그인빌드")
-
-    # ── 3. (선택) WSL 빌드 ───────────────────────────────────────────
-    #   정책상 플러그인 빌드/배포는 native Linux 가 정본 (CLAUDE.md).
-    #   Windows 운용 중 tar.gz 가 필요할 때만 --build_plugin 으로 WSL 빌드 시도.
-    #   기본 off → C++ 패치 + 모델 파일만 커밋, tar.gz 는 native Linux 에서 빌드.
-    if not getattr(args, "build_plugin", False):
-        bot.log(
-            "ℹ️ WSL 빌드 생략 (--build_plugin 미지정) — C++패치+모델만 커밋. "
-            "tar.gz 는 native Linux 에서 `./local-build-package.sh` 로 빌드.",
-            "플러그인빌드",
-        )
-        return [f for f in cpp_files + data_files if Path(f).exists()]
-
-    bot.log("🔨 WSL 플러그인 빌드 시작 (cmake+make)...", "플러그인빌드")
-    repo_abs   = str(Path(".").resolve())
-    wsl_repo   = _win_to_wsl(repo_abs)
-    wsl_script = f"{wsl_repo}/ml/build_plugin_wsl.sh"
-
-    ret, out = run_cmd(["wsl", "-d", "Ubuntu-24.04", "bash", wsl_script, wsl_repo])
-    if ret != 0:
-        bot.log(
-            f"❌ WSL 빌드 실패 (tar.gz 없음, C++패치+모델만 커밋)\n{out[-400:]}",
-            "플러그인빌드",
-        )
-        return [f for f in cpp_files + data_files if Path(f).exists()]
-
-    # 마지막 ".tar.gz" 줄 캡처 → Windows 경로 변환
-    tarball_wsl = ""
-    for line in reversed(out.splitlines()):
-        line = line.strip()
-        if line.endswith(".tar.gz"):
-            tarball_wsl = line
-            break
-
-    tarball_win = None
-    if tarball_wsl.startswith("/mnt/"):
-        parts = tarball_wsl[5:].split("/", 1)
-        if len(parts) == 2:
-            drive, rest = parts[0].upper(), parts[1].replace("/", "\\")
-            tarball_win = f"{drive}:\\{rest}"
-
-    if not tarball_win or not Path(tarball_win).exists():
-        found = sorted(plugin_dir.glob("*.tar.gz"))
-        if found:
-            tarball_win = str(found[-1])
-
-    if tarball_win and Path(tarball_win).exists():
-        # tar.gz 는 *.tar.gz gitignore 규칙 적용 → 커밋 대상 아님
-        # 릴리스 시 `gh release create` 로 직접 첨부
-        bot.log(
-            f"✅ 플러그인 빌드 완료: {Path(tarball_win).name}\n"
-            f"  📦 릴리스 시 첨부: `gh release create vX.X.X {tarball_win} ...`",
-            "플러그인빌드",
-        )
-    else:
-        bot.log("⚠ tar.gz 위치 특정 불가 (빌드 성공했을 수 있음)", "플러그인빌드")
-
-    return [f for f in cpp_files + data_files if Path(f).exists()]
-
-
-def stage_release(bot, args, branch: str, run_num: int,
-                  full_extra: list, det_rate) -> None:
-    """FE 채택 커밋 후 GitHub 릴리스 자동 생성.
-
-    태그: run/{model}_{NNN} (브랜치명 기반, prerelease).
-    첨부: tar.gz (존재하면) + 모델 3파일.
-    """
-    plugin_dir = Path("ais_ids_pi")
-    model_dir  = WORK_DIR / "model"
-
-    tag = f"run/{args.model}_{run_num:03d}"
-
-    # commit SHA를 target으로 사용 (브랜치명은 422 오류 발생)
-    sha_ret, sha_out = run_cmd(["git", "rev-parse", "HEAD"])
-    commit_sha = sha_out.strip() if sha_ret == 0 else branch
-
-    tarballs = sorted(plugin_dir.glob("*.tar.gz"))
-    tarball  = str(tarballs[-1]) if tarballs else None
-
-    model_files = []
-    for fname in [f"model_{args.model}.onnx",
-                  f"scaler_{args.model}.json",
-                  f"threshold_{args.model}.txt"]:
-        p = model_dir / fname
-        if p.exists():
-            model_files.append(str(p))
-
-    n_feat    = len(BASE_FEATURES) + len(full_extra)
-    feat_list = ", ".join(full_extra) if full_extra else "-"
-    det_str   = f"{det_rate:.1f}" if det_rate is not None else "?"
-
-    notes = (
-        f"## 모델\n- {args.model}  (epochs={args.epochs})\n\n"
-        f"## 학습 데이터\n- {args.data_file}\n\n"
-        f"## 피처 ({n_feat}개)\n- 기본 12개 + 추가: {feat_list}\n\n"
-        f"## 성능 (FP≈1%)\n- {args.model}: 탐지율 {det_str}%\n\n"
-        f"## 브랜치\n- {branch}\n\n"
-        f"## 배포 (Deployment)\n"
-        f"이 릴리스의 모델 3파일은 학습 산출물 이름이라 그대로는 플러그인이 로드하지 않음.\n"
-        f"**런타임 로드 위치**(`g_pData`)로 옮기고 **고정 이름으로 리네임**해야 함:\n"
-        f"- 런타임 경로 (Linux): `~/.opencpn/plugins/ais_ids_pi/data/`\n"
-        f"- 로드 규칙 (`ais_ids.cpp`): `ensemble_config.json` 없으면 → `model.onnx`/`scaler.json`/`threshold.txt` 단일모델 폴백\n\n"
-        f"```bash\n"
-        f"DEST=\"$HOME/.opencpn/plugins/ais_ids_pi/data\"\n"
-        f"mkdir -p \"$DEST\"\n"
-        f"cp model_{args.model}.onnx     \"$DEST/model.onnx\"\n"
-        f"cp scaler_{args.model}.json    \"$DEST/scaler.json\"\n"
-        f"cp threshold_{args.model}.txt  \"$DEST/threshold.txt\"\n"
-        f"```\n"
-        f"> 또는 native Linux 에서 `ais_ids_pi/local-build-package.sh` 실행 시 "
-        f"`ais_ids_pi/data/` 전체가 위 경로로 자동 설치됨 (단, repo `data/` 에 미리 위 3파일을 넣어둘 것).\n\n"
-        f"🤖 Generated by orchestrator.py"
-    )
-
-    assets = (([tarball] if tarball else []) + model_files)
-
-    # 기존 동일 태그 릴리즈가 있으면 먼저 삭제(+태그) → 재실행 시 덮어쓰기 (충돌로 누락 방지).
-    run_cmd(["gh", "release", "delete", tag, "--yes", "--cleanup-tag"])
-
-    cmd = ["gh", "release", "create", tag,
-           "--title", f"{tag} — {args.model} iter{run_num:03d}",
-           "--notes", notes,
-           "--target", commit_sha,
-           "--prerelease"]
-    cmd += assets
-
-    bot.log(f"📦 GitHub 릴리스 생성 중: {tag}  ({len(assets)}개 파일 첨부)", "릴리스")
-    ret, out = run_cmd(cmd)
-    if ret == 0:
-        url_line = next((l for l in out.splitlines() if "github.com" in l), out.strip())
-        bot.log(f"✅ 릴리스 완료: {url_line}", "릴리스")
-    else:
-        bot.log(f"⚠ 릴리스 실패 (수동 생성 필요)\n{out[-300:]}", "릴리스")
-
-
-FE_STATE_FILE = "ml/fe_state.json"
-
-
-def _load_fe_initial_extra() -> list[str]:
-    """이전 run에서 저장된 채택 피처 로드. 없으면 기본값 반환."""
-    try:
-        with open(FE_STATE_FILE, encoding="utf-8") as f:
-            return json.load(f).get("initial_extra", FE_INITIAL_EXTRA)
-    except FileNotFoundError:
-        return FE_INITIAL_EXTRA
-
-
-def _save_fe_initial_extra(adopted: list[str]):
-    """이번 run 채택 피처를 다음 run(다음 브랜치)을 위해 저장."""
-    with open(FE_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"initial_extra": adopted}, f, ensure_ascii=False, indent=2)
-
-
-def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, step_info):
-    """Greedy FE 1스텝: 학습 + 평가 + 파싱 + Slack/Sheets 로깅 (게이트/빌드/릴리즈 제외).
-
-    반환 dict:
-      ret           — feature_engineer 반환코드 (0=성공)
-      summary       — Slack 요약 라인 목록 (게이트에 그대로 전달)
-      fe_stats      — {baseline_det, det_rate, det_fp5, det_fp10, threshold}
-      newly_adopted — 이번 스텝 신규 채택 피처 (없으면 [])
-      full_extra    — 누적 extra 피처 전체 (성공 시) / None
-      det_rate,det_str,n_feat,n_feat_s,scaler_path — 빌드/릴리즈/게이트 메시지용
-
-    게이트(승인)는 호출측(_fe_run 래퍼 또는 LangGraph 게이트 노드)에서 수행한다.
-    """
-    cur, total, next_name = step_info
-    fe_start_total = len(BASE_FEATURES) + len(current_initial_extra)
-    init_feat_lines = "\n".join(
-        f"  • `{f}` — {FEATURE_DESCRIPTIONS.get(f, '')}" for f in current_initial_extra
-    ) or "  (없음 — 베이스 12개만)"
-    bot.log_stage_start(
-        "피처개선",
-        f"{_step_header(cur, total, '피처 엔지니어링 학습', next_name)}\n"
-        f"iter {run_num:03d} / epochs={args.epochs} / max_mmsi={args.max_mmsi}\n"
-        f"베이스 {len(BASE_FEATURES)}개 + 기채택 {len(current_initial_extra)}개 = 출발점 {fe_start_total}개\n"
-        f"기채택 피처:\n{init_feat_lines}\n"
-        f"─\n"
-        f"📐 목적함수 (FP=1% 기준): `전체평균 + 1.0 × 약세평균`\n"
-        f"  채택 조건: 목적점수 +{args.min_gain} 이상  |  수렴 시 자동 종료"
-    )
-    t0 = time.time()
-
-    out_json = str(fe_dir / f"feat_eng_iter{run_num:02d}.json")
-
-    fe_candidate_count = [0]
-    fe_total_cand      = [0]
-    fe_baseline_det    = [None]
-    fe_baseline_done   = [False]
-    fe_final_phase     = [False]  # 채택 후 재학습/최종평가 단계
-    fe_cur_cand: list  = [None]   # 현재 평가 중인 후보 (feat, desc)
-    fe_pending_adoption: list = []
-
-    def fe_progress(line, proc=None):
-        s = line.strip()
-
-        # 후보 총 개수 (헤더 "후보: 20개")
-        mt = re.search(r"후보:\s*(\d+)개", s)
-        if mt:
-            fe_total_cand[0] = int(mt.group(1))
-
-        # 베이스라인 결과: "→ 전체 평균 탐지율 40.6%  (목적점수 77.2)"
-        if "전체 평균 탐지율" in s and "목적점수" in s:
-            m = re.search(r"탐지율\s+([\d.]+)%.*목적점수\s+([\d.]+)", s)
-            if m:
-                fe_baseline_det[0]  = float(m.group(1))
-                fe_baseline_done[0] = True
-                bot.log(
-                    f"📊 *베이스라인* ({fe_start_total}피처): "
-                    f"FP=1% 탐지율 *{m.group(1)}%*  ·  목적점수 {m.group(2)}\n"
-                    f"  이제 후보 {fe_total_cand[0] or '?'}개를 하나씩 추가해 평가합니다 "
-                    f"(채택 기준: 목적점수 +{args.min_gain} 이상)",
-                    "피처개선"
-                )
-            return
-
-        # 약세 시나리오 목록
-        mw = re.search(r"약세 시나리오\((\d+)개\):\s*(.+)", s)
-        if mw:
-            bot.log(f"⚠️ 약세 시나리오 {mw.group(1)}개 (베이스 탐지율<50%): {mw.group(2)[:250]}", "피처개선")
-            return
-
-        # ── 채택 후: 최적 피처셋으로 재학습 시작 ──
-        mrt = re.search(r"최적 피처셋\((\d+)개\)으로 재학습", s)
-        if mrt:
-            fe_final_phase[0] = True
-            bot.log(
-                f"🔁 *채택 피처셋({mrt.group(1)}개)으로 최종 모델 재학습 시작*\n"
-                f"  (이 모델이 배포본 — 순열중요도 + FP=1%/5%/10% 평가 + threshold 산출)",
-                "피처개선"
-            )
-            return
-
-        # 최종 재학습 검증 손실 (최종 단계만)
-        if fe_final_phase[0] and "최적 검증 MSE" in s:
-            m = re.search(r"최적 검증 MSE:\s*([\d.]+)", s)
-            if m:
-                bot.log(f"  ✅ 최종 모델 학습 완료 — 최적 검증 MSE {m.group(1)}", "피처개선")
-            return
-
-        # 최종 다중 FP 평가 시작
-        if "최종 모델 다중 FP 평가" in s:
-            bot.log("📊 *최종 모델 평가 중* (FP=1%/5%/10% + 시나리오별 탐지율)...", "피처개선")
-            return
-
-        # 최종 FP별 평균: "FP=1%: X%  FP=5%: Y%  FP=10%: Z%"
-        mfp = re.search(r"FP=1%:\s*([\d.]+)%\s+FP=5%:\s*([\d.]+)%\s+FP=10%:\s*([\d.]+)%", s)
-        if mfp:
-            bot.log(
-                f"📈 *최종 탐지율* — FP=1%: *{mfp.group(1)}%*  ·  "
-                f"FP=5%: {mfp.group(2)}%  ·  FP=10%: {mfp.group(3)}%",
-                "피처개선"
-            )
-            return
-
-        # 최종 [FP≈N%] 평균 (참고)
-        mfpavg = re.search(r"\[FP≈(\d+)%\]\s*평균 탐지율\s*([\d.]+)%", s)
-        if mfpavg:
-            bot.log(f"  · FP≈{mfpavg.group(1)}% 평균 탐지율 {mfpavg.group(2)}%", "피처개선")
-            return
-
-        # 배포 임계값
-        mth = re.search(r"threshold \(FP=1% 기준\):\s*([\d.]+)", s)
-        if mth:
-            bot.log(f"🎯 배포 임계값(FP=1% 정상 99퍼센타일): `{mth.group(1)}`", "피처개선")
-            return
-
-        # 채택 확정 follow-up: "전체평균 X% → Y%  |  목적점수 +g"
-        if fe_pending_adoption and "전체평균" in s and "→" in s:
-            feat_name, feat_desc = fe_pending_adoption.pop()
-            m = re.search(r"([\d.]+)%\s*→\s*([\d.]+)%.*목적점수\s*([+-][\d.]+)", s)
-            if m:
-                bot.log(
-                    f"🏆 *채택 확정!* `{feat_name}` — {feat_desc}\n"
-                    f"  FP=1% 탐지율 {m.group(1)}% → *{m.group(2)}%*  |  목적점수 {m.group(3)}",
-                    "피처개선"
-                )
-            else:
-                bot.log(f"🏆 *채택 확정!* `{feat_name}` — {feat_desc}", "피처개선")
-            return
-
-        # 후보 평가 시작: "+ turn_rate (설명) → 16개 학습 중..."
-        if s.startswith("+ ") and "학습 중" in s:
-            fe_candidate_count[0] += 1
-            m = re.search(r"\+\s+(\w+)\s+\(", s)
-            feat_name = m.group(1) if m else "?"
-            feat_desc = FEATURE_DESCRIPTIONS.get(feat_name, "")
-            fe_cur_cand[0] = (feat_name, feat_desc)
-            tot = f"/{fe_total_cand[0]}" if fe_total_cand[0] else ""
-            bot.log(
-                f"🔬 후보 #{fe_candidate_count[0]}{tot} `{feat_name}` 평가 중 — {feat_desc}",
-                "피처개선"
-            )
-            return
-
-        # 후보 결과: "전체평균  33.6%(-6.7)  점수   62.0 ▼-11.9  [0.3분]"
-        mr = re.search(
-            r"전체평균\s+([\d.]+)%\(([+-][\d.]+)\)\s+점수\s+([\d.]+)\s+[▲▼─]\s*([+-]?[\d.]+)", s)
-        if mr and fe_cur_cand[0]:
-            det, det_g, score, obj_g = mr.group(1), mr.group(2), mr.group(3), mr.group(4)
-            feat_name, _ = fe_cur_cand[0]
-            try:
-                passed = float(obj_g) >= args.min_gain
-            except ValueError:
-                passed = False
-            verdict = f"✅ 기준충족(≥+{args.min_gain})" if passed else "⬜ 미달"
-            bot.log(
-                f"   └ `{feat_name}`: FP=1% 탐지율 {det}% ({det_g}pp)  ·  "
-                f"목적점수 {score} ({obj_g})  →  {verdict}",
-                "피처개선"
-            )
-            fe_cur_cand[0] = None
-            return
-
-        # 채택 마커
-        if "✓ 채택" in s:
-            m = re.search(r"✓ 채택: \[?(\w+)\]?", s)
-            feat_name = m.group(1) if m else "?"
-            feat_desc = FEATURE_DESCRIPTIONS.get(feat_name, "")
-            fe_pending_adoption.append((feat_name, feat_desc))
-            return
-
-        # epoch 진행 — 베이스라인 또는 최종 재학습 단계만 (후보 스캔 중엔 스팸이라 생략)
-        if not fe_baseline_done[0] or fe_final_phase[0]:
-            me = re.search(r"Epoch\s+(\d+)/\s*(\d+)\s*\|.*train=", line)
-            if me:
-                ep, total_ep = int(me.group(1)), int(me.group(2))
-                pct = int(ep / total_ep * 100)
-                milestone = (pct // 25) * 25
-                if milestone > 0 and ep == round(total_ep * milestone / 100):
-                    elapsed_now = time.time() - t0
-                    label = "최종 모델 학습" if fe_final_phase[0] else "베이스라인 학습"
-                    mtl = re.search(r"train=([\d.]+)\s*\|?\s*val=([\d.]+)", line)
-                    loss = f"  (train={mtl.group(1)} val={mtl.group(2)})" if mtl else ""
-                    bot.log(
-                        f"🧠 {label} {milestone}% — Epoch {ep}/{total_ep}{loss}  "
-                        f"(경과 {elapsed_now:.0f}s)",
-                        "피처개선"
-                    )
-
-    ret, out = run_cmd(
-        [sys.executable, "ml/core/feature_engineer.py",
-         "--model", args.model,
-         "--input", args.data_file,
-         "--base_dir", args.base_dir,
-         "--epochs", str(args.epochs),
-         "--max_mmsi", str(args.max_mmsi),
-         "--out_json", out_json,
-         "--max_steps", "1",
-         "--initial_extra"] + current_initial_extra + [
-         "--export_dir", str(WORK_DIR / "model"),
-         "--min_gain", str(args.min_gain),
-         "--overall_tol", str(args.overall_tol),
-         "--n_anom", str(args.n_anom if args.n_anom else args.max_mmsi),
-         "--scan_ratio", str(args.scan_ratio)]
-        + (["--max_candidates", str(args.max_candidates)] if args.max_candidates else [])
-        + (["--candidates"] + args.candidates if args.candidates else [])
-        + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
-        progress_cb=fe_progress
-    )
-    elapsed = time.time() - t0
-
-    if ret != 0:
-        fe_details = _parse_fe(out)
-        analysis = claude_analyze("피처개선", out, False, elapsed)
-        summary = (["❌ 피처 엔지니어링 실패", f"소요: {elapsed:.0f}s"]
-                   + fe_details + ["─"] + analysis)
-        bot.log_stage_result("피처개선", summary, success=False)
-        sheet.log_fe(branch, run_num, "실패", elapsed_sec=elapsed)
-        return {"ret": ret, "summary": summary, "fe_stats": {},
-                "newly_adopted": [], "full_extra": None,
-                "det_rate": None, "det_str": "?", "n_feat": None,
-                "n_feat_s": "?", "scaler_path": None}
-
-    # 결과 파싱
-    det_rate, det_fp5, det_fp10, n_feat, threshold = None, None, None, None, None
-    full_extra, baseline_det, baseline_score, scenario_fp1 = [], None, None, {}
-    if Path(out_json).exists():
-        with open(out_json, encoding="utf-8") as f:
-            result = json.load(f)
-        det_rate       = result.get("best_det")
-        det_fp5        = result.get("det_fp5")
-        det_fp10       = result.get("det_fp10")
-        threshold      = result.get("threshold")
-        n_feat         = len(result.get("best_extra", [])) + len(BASE_FEATURES)
-        _best = result.get("best_extra", [])
-        full_extra = list(dict.fromkeys(current_initial_extra + _best))
-        baseline_det   = result.get("baseline_det")
-        baseline_score = result.get("baseline_score")
-        scenario_fp1   = result.get("scenario_fp1", {})
-
-    newly_adopted = [f for f in full_extra if f not in current_initial_extra]
-
-    weak_names = []
-    for line in out.splitlines():
-        m = re.search(r"약세 시나리오\(.+?\): (.+)", line.strip())
-        if m:
-            weak_names = [s.strip() for s in m.group(1).split(",")]
-
-    adopted_detail = fe_adopted_analysis(out, newly_adopted, det_rate, baseline_det, weak_names)
-    candidates     = _parse_greedy_candidates(out)
-    importance     = _parse_permutation_importance(out)
-
-    gain_pp = ((det_rate - baseline_det)
-               if (det_rate is not None and baseline_det is not None) else 0.0)
-    result_title = (f"✅ 채택 {len(newly_adopted)}개: {', '.join(newly_adopted)}"
-                    if newly_adopted else "수렴 — 신규 채택 없음")
-
-    summary = (
-        [
-            result_title,
-            (f"FP=1% 탐지율: {baseline_det:.1f}% → {det_rate:.1f}%  ({gain_pp:+.1f}pp)"
-             if (det_rate is not None and baseline_det is not None) else "탐지율: -"),
-            f"총 피처 수: {n_feat}개  |  소요: {elapsed:.0f}s",
-        ]
-        + adopted_detail
-    )
-    bot.log_stage_result("피처개선", summary, success=True)
-
-    # ── Claude 분석 → 별도 메시지로 명확히 표시 ──
-    bot.log("🤖 Claude가 FE 결과 분석 중... (최대 2분)", "피처개선")
-    analysis = claude_analyze("피처개선", out, bool(newly_adopted), elapsed, {
-        "newly_adopted": newly_adopted,
-        "det_rate": det_rate, "baseline_det": baseline_det, "n_feat": n_feat
+def _step_info(name: str, run_preprocess: bool) -> tuple:
+    stages = (["전처리"] if run_preprocess else []) + ["피처 엔지니어링 학습"]
+    total = len(stages)
+    idx = stages.index(name)
+    nxt = stages[idx + 1] if idx + 1 < total else "파이프라인 종료"
+    return (idx + 1, total, nxt)
+
+
+def n_new_branch(state: PipelineState) -> dict:
+    run_num = git.get_next_run_num(RT.args.model)
+    branch = git.create_branch(RT.args.model, run_num)
+    RT.bot.log_run_start(branch, {
+        "모델": RT.args.model, "epochs": RT.args.epochs, "max_mmsi": RT.args.max_mmsi,
+        "데이터": RT.args.data_file, "base_dir": RT.args.base_dir,
+        "베이스 피처": f"{len(steps.BASE_FEATURES)}개",
+        "출발 피처": f"{len(state.get('current_extra', []))}개 (기채택)",
     })
-    bot.log("\n".join(analysis), "피처개선")
-
-    if candidates:
-        baseline_info = ""
-        if baseline_det is not None and baseline_score is not None:
-            baseline_info = f"베이스라인: FP=1% 탐지율 {baseline_det:.1f}%  목적점수 {baseline_score:.1f}  → 채택기준 +{args.min_gain}"
-        cand_rows = ([baseline_info] if baseline_info else []) + ["─" * 70,
-                      f"{'피처':<22} {'탐지율gain(FP1%)':>16}  {'목적점수':>8}  {'목적gain':>8}  설명",
-                      "─" * 70]
-        for feat, desc, det_gain, obj_score, obj_gain in candidates:
-            mark = "✅" if feat in newly_adopted else "  "
-            arrow = "▲" if obj_gain > 0 else ("▼" if obj_gain < 0 else "─")
-            cand_rows.append(
-                f"{mark}{feat:<20} {det_gain:>+8.1f}pp  {obj_score:>8.1f}  {arrow}{obj_gain:>+6.1f}  {desc[:18]}"
-            )
-        bot.log_table("Greedy 후보 평가 결과", cand_rows, "🔬")
-
-    if importance:
-        imp_rows = [f"{'피처':<22} {'중요도':>10}", "─" * 38]
-        for feat, pp in importance:
-            bar = "★" * min(int(abs(pp) / 5) + 1, 5)
-            desc = FEATURE_DESCRIPTIONS.get(feat, "")
-            imp_rows.append(f"{feat:<22} {pp:>+8.2f}pp  {bar}")
-            if desc:
-                imp_rows.append(f"  └ {desc}")
-        bot.log_table("피처 중요도 (순열 기반)", imp_rows, "🔑")
-
-    sheet.log_fe(branch, run_num, "완료",
-                 model=args.model, fe_step=len(newly_adopted),
-                 baseline_det=baseline_det, best_det=det_rate,
-                 n_features=n_feat, adopted=newly_adopted,
-                 all_features=full_extra,
-                 threshold=threshold, elapsed_sec=elapsed)
-    if importance:
-        sheet.log_importance(branch, 1, importance, FEATURE_DESCRIPTIONS)
-
-    fe_stats = {
-        "baseline_det": baseline_det, "det_rate": det_rate,
-        "det_fp5": det_fp5, "det_fp10": det_fp10, "threshold": threshold,
-    }
-    if scenario_fp1:
-        sheet.log_scenarios(branch, args.model, "FP=1%", scenario_fp1)
-
-    det_str  = f"{det_rate:.1f}" if det_rate is not None else "?"
-    n_feat_s = str(n_feat) if n_feat else "?"
-    scaler_path = str(WORK_DIR / "model" / f"scaler_{args.model}.json")
-    return {
-        "ret": 0, "summary": summary, "fe_stats": fe_stats,
-        "newly_adopted": newly_adopted, "full_extra": full_extra,
-        "det_rate": det_rate, "det_str": det_str,
-        "n_feat": n_feat, "n_feat_s": n_feat_s, "scaler_path": scaler_path,
-    }
+    return {"run_num": run_num, "branch": branch, "iters": state.get("iters", 0) + 1}
 
 
-def _fe_build_and_release(bot, sheet, branch, args, run_num, r: dict) -> bool:
-    """게이트① 통과 후: 플러그인 빌드 → (게이트② 호출측) → 커밋 + 릴리즈.
-
-    이 함수는 빌드만 수행하고 build_summary 를 bot 에 로깅한다. 커밋/릴리즈는
-    게이트②를 거쳐야 하므로 _fe_run 래퍼/LangGraph 노드에서 분리 호출한다.
-    반환: commit_files (빌드 산출 파일 목록).
-    """
-    commit_files = stage_build_plugin(bot, args, r["scaler_path"])
-    build_summary = [
-        "✅ 플러그인 빌드 완료" if commit_files else "⚠️ 빌드 산출 없음(부분 실패 가능)",
-        f"커밋 대상 파일 {len(commit_files)}개 (C++ 패치 + 모델)",
-        f"채택 피처셋 {r['n_feat_s']}개 · 탐지율 {r['det_str']}%",
-    ]
-    bot.log_stage_result("플러그인빌드", build_summary, success=bool(commit_files))
-    return commit_files, build_summary
+def n_preprocess(state: PipelineState) -> dict:
+    ok = steps.stage_preprocess(RT.bot, RT.sheet, state["branch"], RT.args,
+                                _step_info("전처리", True))
+    if not ok:
+        RT.bot.log("파이프라인 중단", "warning")
+        return {"first_iter": False, "terminate": True}
+    return {"first_iter": False}
 
 
-def _fe_commit_release(bot, sheet, branch, args, run_num, r: dict, commit_files: list):
-    """게이트② 통과 후: git 커밋 + GitHub 릴리즈."""
-    if commit_files:
-        git.commit_results(
-            commit_files,
-            f"feat(fe): {args.model} iter{run_num:03d} "
-            f"det={r['det_str']}% feat={r['n_feat_s']} ({len(r['newly_adopted'])}개 채택)",
-            branch=branch,
-        )
-    stage_release(bot, args, branch, run_num, r["full_extra"], r["det_rate"])
+def n_fe_baseline(state: PipelineState) -> dict:
+    """feature_engineer --diagnose_only → 베이스 탐지율 + 약세 시나리오."""
+    RT.bot.log("🧪 *베이스라인 진단* (현재 피처셋, 약세 시나리오 도출)", "피처개선")
+    out_json = str(steps.WORK_DIR / "baseline_diag.json")
+    steps.WORK_DIR.mkdir(parents=True, exist_ok=True)
+    ret, out = steps.run_cmd(
+        [sys.executable, "ml/core/feature_engineer.py",
+         "--model", RT.args.model, "--input", RT.args.data_file,
+         "--base_dir", RT.args.base_dir, "--epochs", str(RT.args.epochs),
+         "--max_mmsi", str(RT.args.max_mmsi),
+         "--n_anom", str(RT.args.n_anom if RT.args.n_anom else RT.args.max_mmsi),
+         "--initial_extra"] + state.get("current_extra", []) + [
+         "--candidates", "--diagnose_only", "--out_json", out_json]
+        + (["--holdout_file", RT.args.holdout_file] if RT.args.holdout_file else []),
+    )
+    import re
+    det = None
+    m = re.search(r"전체 평균 탐지율\s+([\d.]+)%", out)
+    if m:
+        det = float(m.group(1))
+    weak = next((l.strip() for l in out.splitlines() if "약세 시나리오(" in l), "")
+    RT.bot.log(f"📊 베이스 탐지율 {det}%\n⚠️ {weak}", "피처개선")
+    return {"baseline": {"det": det, "weak": weak, "out": out}}
 
 
-def _fe_run(bot, sheet, branch, args, run_num, current_initial_extra, fe_dir, step_info):
-    """기존 동작 보존 래퍼: train_eval → 게이트① → 빌드 → 게이트② → 커밋/릴리즈.
-    반환: ('approve' | 'retry' | 'stop', full_extra | None, fe_stats)
+def _reco_prompt(weak: str, tried: list, base_det) -> str:
+    avoid = ("\n시도했으나 효과없던 피처(회피): " + ", ".join(tried)) if tried else ""
+    return (
+        "AIS 이상탐지 DCdetect 의 피처 엔지니어다. 아래 약세 시나리오를 포착할 새 파생 피처를 "
+        f"{RT.args.invent}개 발명하라. 베이스 탐지율 {base_det}%.{avoid}\n"
+        f"약세: {weak}\n\n"
+        "JSON 배열만 출력(설명 금지). 각 원소:\n"
+        '{"name":"snake_case","desc":"한줄","lambda_src":"lambda seq,t: ...",'
+        '"target_scenario":"타겟"}\n'
+        '컬럼 접근 seq[t][_B["sog"]]. BASE 12: sog,cog,heading,status,dt,dist_km,'
+        "cog_hdg_diff,sog_change,cog_hdg_change,speed_consistency,lat_speed,lon_speed. "
+        "이전행 seq[t-1] 은 if t>0 else 0.0 가드, 0나눗셈 max(x,1e-6). 순수함수."
+    )
 
-    분해 함수(_fe_train_eval/_fe_build_and_release/_fe_commit_release)를 blocking
-    게이트(_wait)로 엮는다. LangGraph(orchestrator_lg) 는 같은 분해 함수를
-    interrupt() 게이트 노드로 엮어 재구성한다.
-    """
-    r = _fe_train_eval(bot, sheet, branch, args, run_num,
-                       current_initial_extra, fe_dir, step_info)
-    fe_stats = r["fe_stats"]
 
-    if r["ret"] != 0:
-        decision = _wait(bot, "피처 엔지니어링 실패", r["summary"])
-        return decision, None, fe_stats
-
-    newly_adopted = r["newly_adopted"]
-    if newly_adopted:
-        # ── 게이트 ①: FE 평가 → 배포 진행 여부 ──
-        gate1 = _wait(
-            bot,
-            f"FE 평가 — `{', '.join(newly_adopted)}` 채택 (탐지율 {r['det_str']}%) → 배포 진행?",
-            r["summary"],
-        )
-        if gate1 == "retry":
-            return "retry", None, fe_stats
-        if gate1 == "stop":
-            bot.log("⏹ 채택했으나 배포 중단 (사용자 stop) — 모델 미커밋", "피처개선")
-            return "stop", None, fe_stats
-
-        commit_files, build_summary = _fe_build_and_release(bot, sheet, branch, args, run_num, r)
-
-        # ── 게이트 ②: 빌드 → 커밋 + 릴리즈 진행 여부 ──
-        gate2 = _wait(bot, "배포 — git 커밋 + GitHub 릴리즈 진행?", build_summary)
-        if gate2 == "stop":
-            bot.log("⏹ 빌드까지 완료, 커밋/릴리즈 중단 (사용자 stop)", "피처개선")
-            return "stop", None, fe_stats
-
-        _fe_commit_release(bot, sheet, branch, args, run_num, r, commit_files)
-        return "approve", r["full_extra"], fe_stats
+def n_recommend(state: PipelineState) -> dict:
+    """claude 피처 추천 → 검증 → dynamic_candidates.py 기록 → 후보풀 확장."""
+    if not (RT.args.invent and RT.args.invent > 0):
+        return {"candidates": []}     # reco 비활성 → 기존 후보 사용
+    weak = state.get("baseline", {}).get("weak", "")
+    tried = state.get("tried_feats", [])
+    arr = _claude_json(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")), timeout=240)
+    cands = _validate_recos(arr if isinstance(arr, list) else [])
+    if cands:
+        _write_dynamic_candidates(cands)
+        RT.args.candidates = [c["name"] for c in cands]
+        RT.bot.log(f"🧬 *추천 {len(cands)}개*: " +
+                   ", ".join(f"`{c['name']}`" for c in cands), "추천")
     else:
-        decision = _wait(bot, "피처 엔지니어링 — 수렴 완료 → 파이프라인 종료?", r["summary"])
-        return decision, None, fe_stats
+        RT.bot.log("⚠️ 추천 실패/0개 — 기존 후보로 진행", "추천")
+    return {"candidates": [c["name"] for c in cands],
+            "tried_feats": tried + [c["name"] for c in cands]}
 
 
-def stage_fe(bot, sheet, branch, args, run_num, step_info: tuple):
-    """FE 수렴까지 전체 실행.
-    반환값:
-      list  — 채택된 전체 extra 피처 목록
-      []    — 수렴 (신규 채택 없음)
-      None  — 사용자 중단
-    """
-    current_initial_extra = _load_fe_initial_extra()
-    fe_dir = WORK_DIR
-    fe_dir.mkdir(parents=True, exist_ok=True)
-
-    while True:  # retry 전용 루프
-        decision, new_extra, fe_stats = _fe_run(
-            bot, sheet, branch, args, run_num,
-            current_initial_extra=current_initial_extra,
-            fe_dir=fe_dir, step_info=step_info
-        )
-
-        if decision == "stop":
-            return None
-        if decision == "retry":
+def _validate_recos(arr: list) -> list:
+    """추천 lambda 를 더미 시퀀스로 exec 검증 + dedup."""
+    import math as _math
+    ns = {"math": _math, "_ang_diff": lambda a, b: abs((a - b + 180) % 360 - 180)}
+    ns["_B"] = {k: i for i, k in enumerate(steps.BASE_FEATURES)}
+    dummy = [[0.0] * 12 for _ in range(10)]
+    seen, valid = set(), []
+    for c in arr:
+        name, src = c.get("name"), c.get("lambda_src")
+        if not name or not src or name in seen:
             continue
+        try:
+            fn = eval(src, dict(ns))            # lambda 컴파일
+            float(fn(dummy, 5))                 # 실행 가능 검증
+            seen.add(name)
+            valid.append(c)
+        except Exception as e:
+            print(f"[추천] '{name}' 제외: {e}")
+    return valid
 
-        n_adopted = len(new_extra) - len(current_initial_extra) if new_extra else 0
-        sheet.update_run_summary(
-            fe_steps=n_adopted,
-            fe_baseline=fe_stats.get("baseline_det"),
-            fe_det=fe_stats.get("det_rate"),
-            fe_det_fp5=fe_stats.get("det_fp5"),
-            fe_det_fp10=fe_stats.get("det_fp10"),
-            fe_n_feat=len(BASE_FEATURES) + len(new_extra) if new_extra else None,
-            adopted=new_extra or current_initial_extra,
-            threshold=fe_stats.get("threshold"),
-            notes="완료" if new_extra else "수렴 완료"
-        )
-        return new_extra if new_extra is not None else []
+
+def _write_dynamic_candidates(cands: list):
+    body = ["# 자동 생성: orchestrator n_recommend (claude -p)",
+            "# feature_engineer 네임스페이스에서 exec → _B/_ang_diff/math 사용 가능",
+            "DYNAMIC_FEATURES = {"]
+    for c in cands:
+        body.append(f'    "{c["name"]}": ({json.dumps(c.get("desc",""), ensure_ascii=False)}, {c["lambda_src"]}),')
+    body.append("}")
+    with open(DYNAMIC_CAND_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(body) + "\n")
+
+
+def n_fe_train(state: PipelineState) -> dict:
+    """scan→adopt→retrain→importance→finaleval→export (feature_engineer 1 subprocess)."""
+    run_preprocess = state.get("first_iter", True) and not RT.args.skip_preprocess
+    si = _step_info("피처 엔지니어링 학습", run_preprocess)
+    steps.WORK_DIR.mkdir(parents=True, exist_ok=True)
+    r = steps._fe_train_eval(RT.bot, RT.sheet, state["branch"], RT.args,
+                             state["run_num"], state["current_extra"], steps.WORK_DIR, si)
+    return {"r": r, "first_iter": False}
+
+
+def n_build(state: PipelineState) -> dict:
+    cf, bs = steps._fe_build_and_release(RT.bot, RT.sheet, state["branch"],
+                                         RT.args, state["run_num"], state["r"])
+    return {"commit_files": cf, "build_summary": bs}
+
+
+def n_release(state: PipelineState) -> dict:
+    steps._fe_commit_release(RT.bot, RT.sheet, state["branch"], RT.args,
+                             state["run_num"], state["r"], state["commit_files"])
+    return {}
+
+
+def n_chain(state: PipelineState) -> dict:
+    full_extra = state["r"]["full_extra"]
+    steps._save_fe_initial_extra(full_extra)
+    git.commit_results([steps.FE_STATE_FILE],
+                       f"chore(fe): {state['branch']} fe_state 갱신 ({len(full_extra)}피처)",
+                       branch=state["branch"])
+    nxt = git.get_next_run_num(RT.args.model)
+    RT.bot.log(f"🔁 채택 완료 ({', '.join(full_extra)}) → {RT.args.model}_{nxt:03d} 재시작", "피처개선")
+    return {"current_extra": full_extra, "adopted_any": True}
+
+
+def n_converge(state: PipelineState) -> dict:
+    RT.bot.log_stage_result("파이프라인 완료 — 수렴",
+                            [f"브랜치: {state['branch']}", "추가 채택 없음"], success=True)
+    return {"terminate": True}
+
+
+def n_user_stop(state: PipelineState) -> dict:
+    try:
+        RT.sheet.log_run_done(state.get("branch", "?"), RT.args.model, success=False)
+    except Exception:
+        pass
+    RT.bot.log("⏹ 파이프라인 중단", "warning")
+    return {"terminate": True}
 
 
 # ─────────────────────────────────────────────
-# 메인
+# 게이트 노드 + 라우팅
 # ─────────────────────────────────────────────
+def n_gate_deploy(state: PipelineState) -> dict:
+    r = state["r"]
+    prompt = (f"FE 평가 — `{', '.join(r['newly_adopted'])}` 채택 "
+              f"(탐지율 {r['det_str']}%) → 배포 진행?")
+    return {"decision": _gate(r["summary"], "deploy", prompt)}
+
+
+def n_gate_release(state: PipelineState) -> dict:
+    return {"decision": _gate(state["build_summary"], "release",
+                              "배포 — git 커밋 + GitHub 릴리즈 진행?")}
+
+
+def n_gate_converge(state: PipelineState) -> dict:
+    return {"decision": _gate(state["r"]["summary"], "converge",
+                              "피처 엔지니어링 — 수렴 → 종료?")}
+
+
+def route_after_branch(state: PipelineState) -> str:
+    if state.get("iters", 0) > RT.args.max_runs:
+        RT.bot.log(f"⚠️ 안전 상한 {RT.args.max_runs} 도달", "warning")
+        return "END"
+    return "preprocess" if (state.get("first_iter", True) and not RT.args.skip_preprocess) else "fe_baseline"
+
+
+def route_after_preprocess(state: PipelineState) -> str:
+    return "END" if state.get("terminate") else "fe_baseline"
+
+
+def route_after_fe(state: PipelineState) -> str:
+    """하네스 verdict + 채택여부 결합 라우팅."""
+    d = state.get("decision", "continue")
+    if d == "stop":
+        return "user_stop"
+    if d == "retry":
+        return "fe_baseline"
+    r = state.get("r", {})
+    if r.get("ret", 0) != 0:
+        return "fe_baseline"           # 실패 → 재진단/재시도
+    if r.get("newly_adopted"):
+        return "gate_deploy"
+    # 수렴: 추천 라운드 남으면 재추천, 아니면 종료 게이트
+    if (RT.args.invent and RT.args.invent > 0
+            and not state.get("adopted_any")
+            and state.get("reco_round", 1) < RT.args.invent_rounds):
+        return "reco_again"
+    return "gate_converge"
+
+
+def n_reco_again(state: PipelineState) -> dict:
+    """수렴 → 라운드 올리고 재추천 진입 표시."""
+    return {"reco_round": state.get("reco_round", 1) + 1}
+
+
+def route_gate_deploy(state: PipelineState) -> str:
+    return {"approve": "build", "retry": "fe_baseline"}.get(state["decision"], "user_stop")
+
+
+def route_gate_release(state: PipelineState) -> str:
+    return "release" if state["decision"] == "approve" else "user_stop"
+
+
+def route_gate_converge(state: PipelineState) -> str:
+    return "converge" if state["decision"] == "approve" else "user_stop"
+
+
+# ─────────────────────────────────────────────
+# 그래프
+# ─────────────────────────────────────────────
+def build_graph(checkpointer=None):
+    g = StateGraph(PipelineState)
+
+    # 코어
+    for n, fn in [("new_branch", n_new_branch), ("preprocess", n_preprocess),
+                  ("fe_baseline", n_fe_baseline), ("recommend", n_recommend),
+                  ("reco_again", n_reco_again), ("fe_train", n_fe_train),
+                  ("build", n_build), ("release", n_release), ("chain", n_chain),
+                  ("converge", n_converge), ("user_stop", n_user_stop),
+                  ("gate_deploy", n_gate_deploy), ("gate_release", n_gate_release),
+                  ("gate_converge", n_gate_converge),
+                  ("log_run_start", log_sheet("run_start")), ("log_fe", log_sheet("fe")),
+                  ("log_run_done", log_sheet("run_done")), ("log_converge", log_sheet("converge"))]:
+        g.add_node(n, fn)
+
+    # 하네스 (코어 뒤)
+    g.add_node("h_branch", claude_harness("new_branch", lambda s: (s.get("branch", ""), {})))
+    g.add_node("h_base", claude_harness("baseline", lambda s: (s["baseline"]["out"], {"det": s["baseline"]["det"]})))
+    g.add_node("h_reco", claude_harness("reco", lambda s: (", ".join(s.get("candidates", [])), {"n": len(s.get("candidates", []))})))
+    g.add_node("h_fe", claude_harness("fe", lambda s: ("\n".join(s["r"].get("summary", [])), s["r"].get("fe_stats", {}))))
+    g.add_node("h_build", claude_harness("build", lambda s: ("\n".join(s.get("build_summary", [])), {})))
+    g.add_node("h_release", claude_harness("release", lambda s: (s["branch"], {"det": s["r"].get("det_str")})))
+    g.add_node("h_chain", claude_harness("chain", lambda s: (", ".join(s.get("current_extra", [])), {})))
+
+    # 배선
+    g.add_edge(START, "new_branch")
+    g.add_edge("new_branch", "log_run_start")
+    g.add_edge("log_run_start", "h_branch")
+    g.add_conditional_edges("h_branch", route_after_branch_h,
+                            {"preprocess": "preprocess", "fe_baseline": "fe_baseline",
+                             "user_stop": "user_stop", "END": END})
+    g.add_conditional_edges("preprocess", route_after_preprocess,
+                            {"fe_baseline": "fe_baseline", "END": END})
+
+    g.add_edge("fe_baseline", "h_base")
+    g.add_conditional_edges("h_base", _route_harness("recommend"),
+                            {"recommend": "recommend", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_edge("recommend", "h_reco")
+    g.add_conditional_edges("h_reco", _route_harness("fe_train"),
+                            {"fe_train": "fe_train", "user_stop": "user_stop"})
+
+    g.add_edge("fe_train", "log_fe")
+    g.add_edge("log_fe", "h_fe")
+    g.add_conditional_edges("h_fe", route_after_fe,
+                            {"gate_deploy": "gate_deploy", "gate_converge": "gate_converge",
+                             "reco_again": "reco_again", "fe_baseline": "fe_baseline",
+                             "user_stop": "user_stop"})
+    g.add_edge("reco_again", "recommend")
+
+    g.add_conditional_edges("gate_deploy", route_gate_deploy,
+                            {"build": "build", "fe_baseline": "fe_baseline", "user_stop": "user_stop"})
+    g.add_edge("build", "h_build")
+    g.add_conditional_edges("h_build", _route_harness("gate_release"),
+                            {"gate_release": "gate_release", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("gate_release", route_gate_release,
+                            {"release": "release", "user_stop": "user_stop"})
+    g.add_edge("release", "h_release")
+    g.add_conditional_edges("h_release", _route_harness("log_run_done"),
+                            {"log_run_done": "log_run_done", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_edge("log_run_done", "chain")
+    g.add_edge("chain", "h_chain")
+    g.add_conditional_edges("h_chain", _route_harness("new_branch"),
+                            {"new_branch": "new_branch", "fe_train": "fe_train", "user_stop": "user_stop"})
+
+    g.add_conditional_edges("gate_converge", route_gate_converge,
+                            {"converge": "converge", "user_stop": "user_stop"})
+    g.add_edge("converge", "log_converge")
+    g.add_edge("log_converge", END)
+    g.add_edge("user_stop", END)
+
+    return g.compile(checkpointer=checkpointer or MemorySaver())
+
+
+def route_after_branch_h(state: PipelineState) -> str:
+    """new_branch 하네스 verdict 먼저(stop), 그다음 max_runs/전처리 분기."""
+    if state.get("decision") == "stop":
+        return "user_stop"
+    return route_after_branch(state)
+
+
+# ─────────────────────────────────────────────
+# Runner + main
+# ─────────────────────────────────────────────
+def run_pipeline(graph, init: PipelineState, config: dict):
+    out = graph.invoke(init, config=config)
+    while "__interrupt__" in out:
+        payload = out["__interrupt__"][0].value
+        decision = RT.bot.wait_approval(payload["prompt"], payload["summary"])
+        out = graph.invoke(Command(resume=decision), config=config)
+    return out
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model",           default="dcdetect")
-    parser.add_argument("--epochs",          type=int, default=5)
-    parser.add_argument("--max_mmsi",        type=int, default=500)
-    parser.add_argument("--base_dir",        default="D:/")
-    parser.add_argument("--raw_dir",         default="D:/ais_data/raw/2025")
-    parser.add_argument("--data_file",       default="D:/ais_data/preprocessed/2025/ais_preprocessed_2025.csv")
-    parser.add_argument("--skip_preprocess", action="store_true")
-    parser.add_argument("--holdout_file",    default=None,
-                        help="FP=1%% 측정용 별도 전처리 파일 (학습 데이터와 완전 분리)")
-    parser.add_argument("--min_gain",        type=float, default=3.0,
-                        help="FE 채택 임계 목적점수 향상량 (기본: 3.0, 테스트 시 0.1)")
-    parser.add_argument("--max_candidates",  type=int, default=None,
-                        help="Greedy 후보 수 제한 (앞 N개만 탐색, 속도용)")
-    parser.add_argument("--scan_ratio",      type=float, default=1.0,
-                        help="후보 스캔 학습 표본 비율 (예 0.4, 채택본은 풀 재학습). 1.0=풀")
-    parser.add_argument("--candidates",      nargs="*", default=None,
-                        help="탐색 후보 피처 명시 (큐레이션 추천 10개 등). 미지정=전체 20개")
-    parser.add_argument("--n_anom",          type=int, default=None,
-                        help="시나리오당 이상 시퀀스 수. 미지정 시 max_mmsi 와 동일 (노이즈↓)")
-    parser.add_argument("--overall_tol",     type=float, default=1.0,
-                        help="채택 회귀 가드: 전체 FP1 이 이 값(pp) 넘게 하락하면 채택 거부")
-    parser.add_argument("--auto_approve",    action="store_true",
-                        help="Slack 승인 대기 없이 모든 단계 자동 approve (테스트용)")
-    parser.add_argument("--max_runs",        type=int, default=50,
-                        help="브랜치 체이닝 안전 상한 (수렴 전 무한 반복 방지, 기본 50)")
-    parser.add_argument("--build_plugin",    action="store_true",
-                        help="WSL 로 플러그인 tar.gz 빌드 시도 (기본 off — 정본 빌드는 native Linux)")
-    args = parser.parse_args()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", default="dcdetect")
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--max_mmsi", type=int, default=500)
+    p.add_argument("--base_dir", default="D:/")
+    p.add_argument("--raw_dir", default="D:/ais_data/raw/2025")
+    p.add_argument("--data_file", default="D:/ais_data/preprocessed/2025/ais_preprocessed_2025.csv")
+    p.add_argument("--skip_preprocess", action="store_true")
+    p.add_argument("--holdout_file", default=None)
+    p.add_argument("--min_gain", type=float, default=3.0)
+    p.add_argument("--max_candidates", type=int, default=None)
+    p.add_argument("--scan_ratio", type=float, default=1.0)
+    p.add_argument("--candidates", nargs="*", default=None)
+    p.add_argument("--invent", type=int, default=0, help="claude 피처 추천 N개 (0=비활성)")
+    p.add_argument("--invent_rounds", type=int, default=1, help="수렴 시 재추천 라운드 상한")
+    p.add_argument("--n_anom", type=int, default=None)
+    p.add_argument("--overall_tol", type=float, default=1.0)
+    p.add_argument("--auto_approve", action="store_true")
+    p.add_argument("--max_runs", type=int, default=50)
+    p.add_argument("--build_plugin", action="store_true")
+    p.add_argument("--no_harness", action="store_true", help="모든 하네스 끔")
+    args = p.parse_args()
 
-    global _AUTO_APPROVE
-    _AUTO_APPROVE = args.auto_approve
+    steps._AUTO_APPROVE = args.auto_approve
+    if args.no_harness:
+        HARNESS_ON.clear()
 
-    cfg = load_config()
+    cfg = steps.load_config()
+    RT.bot = _sb.SlackPipelineBot(cfg["slack"]["bot_token"], cfg["slack"]["app_token"],
+                                  cfg["slack"]["channel"])
+    RT.sheet = _sh.PipelineSheets(cfg["google_sheets"]["credentials_file"],
+                                  cfg["google_sheets"]["sheet_id"])
+    RT.args = args
 
-    bot   = _sb.SlackPipelineBot(
-        cfg["slack"]["bot_token"],
-        cfg["slack"]["app_token"],
-        cfg["slack"]["channel"]
-    )
-    sheet = _sh.PipelineSheets(
-        cfg["google_sheets"]["credentials_file"],
-        cfg["google_sheets"]["sheet_id"],
-    )
-
-    # FE-only 체이닝: 브랜치마다 Greedy 1피처 채택 → fe_state 갱신 → 새 브랜치
-    #   (dcdetect_001→002→...) → 수렴(채택 없음)하면 종료.
-    #   베이스라인 학습+평가는 FE 내부에서 수행. 전처리는 첫 브랜치에서만(--skip_preprocess 아니면).
-    first_iter = True
-    iters = 0
+    init: PipelineState = {
+        "iters": 0, "first_iter": True, "reco_round": 1,
+        "current_extra": steps._load_fe_initial_extra(),
+        "tried_feats": [], "adopted_any": False, "terminate": False,
+    }
+    graph = build_graph()
+    config = {"configurable": {"thread_id": "orchestrator"},
+              "recursion_limit": max(80, args.max_runs * 25)}
     try:
-        while iters < args.max_runs:
-            iters += 1
-            run_num = git.get_next_run_num(args.model)
-            branch  = git.create_branch(args.model, run_num)
-
-            sheet.log_run_start(branch, args.model, args.epochs, args.max_mmsi,
-                                data_file=args.data_file)
-            bot.log_run_start(branch, {
-                "모델": args.model,
-                "epochs": args.epochs,
-                "max_mmsi": args.max_mmsi,
-                "데이터": args.data_file,
-                "base_dir": args.base_dir,
-                "베이스 피처": f"{len(BASE_FEATURES)}개",
-                "출발 피처": f"{len(_load_fe_initial_extra())}개 (기채택)",
-            })
-
-            run_preprocess = first_iter and not args.skip_preprocess
-            stages = (["전처리"] if run_preprocess else []) + ["피처 엔지니어링 학습"]
-            total_steps = len(stages)
-
-            def make_step_info(name: str) -> tuple:
-                idx = stages.index(name)
-                nxt = stages[idx + 1] if idx + 1 < total_steps else "파이프라인 종료"
-                return (idx + 1, total_steps, nxt)
-
-            if run_preprocess:
-                if not stage_preprocess(bot, sheet, branch, args, make_step_info("전처리")):
-                    bot.log("파이프라인 중단", "warning")
-                    return
-            first_iter = False
-
-            fe_result = stage_fe(bot, sheet, branch, args, run_num,
-                                 make_step_info("피처 엔지니어링 학습"))
-
-            sheet.log_run_done(branch, args.model, success=(fe_result is not None))
-
-            if fe_result is None:
-                # 사용자 중단
-                bot.log("파이프라인 중단", "warning")
-                return
-            elif fe_result:
-                # 채택 발생 → fe_state 저장 + 이 브랜치에 커밋(체이닝이 git 히스토리로
-                #   누적되도록) → 다음 브랜치는 이 run 브랜치를 base 로 분기.
-                _save_fe_initial_extra(fe_result)
-                git.commit_results(
-                    [FE_STATE_FILE],
-                    f"chore(fe): {branch} fe_state 갱신 ({len(fe_result)}피처 누적)",
-                    branch=branch,
-                )
-                next_run = git.get_next_run_num(args.model)
-                bot.log(
-                    f"🔁 채택 완료 ({', '.join(fe_result)}) → "
-                    f"{args.model}_{next_run:03d} 브랜치로 자동 재시작 (base={branch})",
-                    "피처개선"
-                )
-                continue
-            else:
-                # 수렴 — 채택 없음 → 종료
-                bot.log_stage_result(
-                    "파이프라인 완료 — 수렴",
-                    [f"브랜치: {branch}", "모든 후보 탐색 완료 — 추가 채택 없음"],
-                    success=True
-                )
-                return
-        else:
-            # max_runs 도달 (수렴 전 안전 상한)
-            bot.log(f"⚠️ 안전 상한 도달: {args.max_runs} run 실행 후 종료 (--max_runs 로 조정)",
-                    "warning")
+        run_pipeline(graph, init, config)
     finally:
-        # 크래시/정상/중단 어느 경로든 작업 브랜치를 develop 으로 복구
         try:
             git.checkout("develop")
         except Exception as e:

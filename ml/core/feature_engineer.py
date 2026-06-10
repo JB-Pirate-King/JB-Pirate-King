@@ -304,6 +304,22 @@ CANDIDATE_FEATURES: dict = {
 }
 
 
+# ── 동적 후보 (orchestrator n_recommend 가 claude -p 로 생성) ──────────
+# reco 노드가 약세 진단 → 새 피처 lambda 를 ml/dynamic_candidates.py 에
+# DYNAMIC_FEATURES dict 로 써둔다. 여기서 이 모듈 네임스페이스로 exec → lambda 가
+# _B / _ang_diff / math 를 그대로 참조 → CANDIDATE_FEATURES 에 병합. 파일 없으면 무시.
+_DYN_PATH = os.path.join(os.path.dirname(__file__), "..", "dynamic_candidates.py")
+if os.path.exists(_DYN_PATH):
+    try:
+        with open(_DYN_PATH, encoding="utf-8") as _df:
+            exec(_df.read(), globals())
+        _dyn = globals().get("DYNAMIC_FEATURES", {})
+        CANDIDATE_FEATURES.update(_dyn)
+        print(f"[동적후보] {len(_dyn)}개 로드: {list(_dyn)}")
+    except Exception as _e:
+        print(f"[동적후보] 로드 실패(무시): {_e}")
+
+
 # ── 편향 제거용 스케일러 ─────────────────────────────────────────
 class ClippedMinMaxScaler:
     """1~99 퍼센타일 클리핑 후 MinMaxScaling.
