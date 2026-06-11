@@ -1,6 +1,6 @@
 ---
 source_file: AISIDS사업계획서PDF.pdf
-last_synced: 2026-06-11 19:48
+last_synced: 2026-06-12 00:55
 tags: [notion-sync, attachment]
 ---
 
