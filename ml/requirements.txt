@@ -12,6 +12,7 @@ tqdm
 gspread                 # Google Sheets 기록
 google-auth             # 서비스계정 인증 (google.oauth2)
 slack_bolt              # Slack 봇 (로그/승인/Claude 질의)
+langgraph               # orchestrator.py StateGraph (interrupt 게이트/체크포인트)
 
 # ── 모델 export ──
 onnx                    # ONNX 변환 검증 (torch.onnx.export 사용)
