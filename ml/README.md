@@ -16,7 +16,7 @@ ml/
 │   ├── feature_engineer.py  # DCdetect Greedy FE + ONNX export ★
 │   └── patch_plugin.py      # C++ plugin auto-patch
 ├── integrations/            # External integrations
-│   ├── slack_bot.py         # Slack bot (logs, button approval, Claude queries)
+│   ├── slack_bot.py         # Slack bot (logs, button approval)
 │   ├── sheets.py            # Google Sheets logging
 │   ├── notify.py            # Discord + Notion reports
 │   └── git_manager.py       # Auto branch creation / commit

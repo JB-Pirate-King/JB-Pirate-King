@@ -62,7 +62,7 @@ JB-Pirate-King/
 │   │   ├── feature_engineer.py # DCdetect feature engineering (Greedy + ONNX export)
 │   │   └── patch_plugin.py     # C++ plugin auto-patch (scaler features → codegen) ★
 │   ├── integrations/           # External integrations
-│   │   ├── slack_bot.py        # Slack bot (logs, button approval, Claude queries)
+│   │   ├── slack_bot.py        # Slack bot (logs, button approval)
 │   │   ├── sheets.py           # Google Sheets logging
 │   │   ├── notify.py           # Discord webhook + Notion reports
 │   │   └── git_manager.py      # Auto branch creation / commit
@@ -272,6 +272,9 @@ Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
 
 `orchestrator.py` is a LangGraph `StateGraph` (control flow); the heavy execution functions
 live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md` / `pipeline_full.png`.
+
+> **노드 단위 상세 문서**: [`ml/PIPELINE.md`](ml/PIPELINE.md) — 각 노드 설명, 라우팅, State,
+> Mermaid + 자동 렌더 구조도(`pipeline_langgraph.png`). LangGraph 관점 입문용.
 
 - **pipeline_steps.py** — `run_cmd`, output parsers, `claude_analyze`, `stage_preprocess`,
   `stage_build_plugin`, `stage_release`, `_fe_train_eval` (greedy 1-step train+eval+parse+log),
