@@ -172,7 +172,7 @@ def _parse_fe(out: str) -> list[str]:
 # ─────────────────────────────────────────────
 
 def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
-                   extra: dict = None) -> list[str]:
+                   extra: dict = None, model: str = None) -> list[str]:
     """claude -p 로 단계 결과 분석 → Slack 메시지 라인 목록 반환.
     [피처개선] 단계는 매우 상세한 다중 섹션 분석, 그 외는 간결 분석."""
     extra_str = json.dumps(extra or {}, ensure_ascii=False)
@@ -214,10 +214,12 @@ def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
         )
         timeout = 120
 
+    cmd = ["claude", "-p", prompt, "--output-format", "text"]
+    if model:
+        cmd += ["--model", model]
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -307,7 +309,8 @@ def stage_preprocess(bot, sheet, branch, args, step_info: tuple):
         )
         elapsed = time.time() - t0
         details  = _parse_preprocess(out)
-        analysis = claude_analyze("전처리", out, ret == 0, elapsed)
+        analysis = claude_analyze("전처리", out, ret == 0, elapsed,
+                                  model=getattr(args, "claude_model", None))
 
         hdr = _step_header(cur, total, "전처리", next_name)
         if ret != 0:
@@ -646,11 +649,11 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
         # 최종 FP별 평균: "FP=1%: X%  FP=5%: Y%  FP=10%: Z%"
         mfp = re.search(r"FP=1%:\s*([\d.]+)%\s+FP=5%:\s*([\d.]+)%\s+FP=10%:\s*([\d.]+)%", s)
         if mfp:
-            bot.log(
-                f"📈 *최종 탐지율* — FP=1%: *{mfp.group(1)}%*  ·  "
-                f"FP=5%: {mfp.group(2)}%  ·  FP=10%: {mfp.group(3)}%",
-                "피처개선"
-            )
+            bot.log_metrics("최종 탐지율 (FP 레벨별)", {
+                "FP = 1%  (배포 기준)": f"{mfp.group(1)}%",
+                "FP = 5%": f"{mfp.group(2)}%",
+                "FP = 10%": f"{mfp.group(3)}%",
+            }, emoji="📈")
             return
 
         # 최종 [FP≈N%] 평균 (참고)
@@ -762,7 +765,8 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
 
     if ret != 0:
         fe_details = _parse_fe(out)
-        analysis = claude_analyze("피처개선", out, False, elapsed)
+        analysis = claude_analyze("피처개선", out, False, elapsed,
+                                  model=getattr(args, "claude_model", None))
         summary = (["❌ 피처 엔지니어링 실패", f"소요: {elapsed:.0f}s"]
                    + fe_details + ["─"] + analysis)
         bot.log_stage_result("피처개선", summary, success=False)
@@ -822,7 +826,7 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
     analysis = claude_analyze("피처개선", out, bool(newly_adopted), elapsed, {
         "newly_adopted": newly_adopted,
         "det_rate": det_rate, "baseline_det": baseline_det, "n_feat": n_feat
-    })
+    }, model=getattr(args, "claude_model", None))
     bot.log("\n".join(analysis), "피처개선")
 
     if candidates:

@@ -90,12 +90,15 @@ class PipelineState(TypedDict, total=False):
 # 하네스 (claude -p 분석·판정) 노드 팩토리
 # ─────────────────────────────────────────────
 def _claude_json(prompt: str, timeout: int = 120,
-                 session: Optional[str] = None, first: bool = False) -> Optional[dict]:
+                 session: Optional[str] = None, first: bool = False,
+                 model: Optional[str] = None) -> Optional[dict]:
     """claude -p --output-format json 호출 → dict. 실패 시 None.
 
     session 지정 시 브랜치 세션에 묶음: 첫 호출(first=True)은 --session-id 로
     세션 생성, 이후는 --resume 로 같은 대화를 이어가 맥락이 누적된다."""
     cmd = ["claude", "-p", prompt, "--output-format", "json"]
+    if model:
+        cmd += ["--model", model]
     if session:
         cmd += (["--session-id", session] if first else ["--resume", session])
     try:
@@ -125,7 +128,8 @@ def _branch_claude(prompt: str, timeout: int = 120) -> Optional[dict]:
     세션 id 가 없으면(미설정) stateless 단발 호출로 폴백."""
     sid = RT.claude_sid
     first = not RT.claude_started
-    out = _claude_json(prompt, timeout, session=sid, first=first)
+    model = getattr(RT.args, "claude_model", None)   # 브랜치 세션 전체 동일 모델
+    out = _claude_json(prompt, timeout, session=sid, first=first, model=model)
     if sid:
         RT.claude_started = True   # 생성 시도 후엔 항상 resume (턴은 이미 기록됨)
     return out
@@ -577,6 +581,10 @@ def main():
     p.add_argument("--max_runs", type=int, default=50)
     p.add_argument("--build_plugin", action="store_true")
     p.add_argument("--no_harness", action="store_true", help="모든 하네스 끔")
+    p.add_argument("--claude_model", default="sonnet",
+                   help="하네스/추천 claude 모델 (브랜치 세션 전체 공통). "
+                        "기본 'sonnet'(4.6) — verdict/추천엔 충분, Opus 대비 비용↓. "
+                        "'opus'로 올리거나 'haiku'로 더 낮춤.")
     args = p.parse_args()
 
     steps._AUTO_APPROVE = args.auto_approve
@@ -586,6 +594,7 @@ def main():
     cfg = steps.load_config()
     RT.bot = _sb.SlackPipelineBot(cfg["slack"]["bot_token"], cfg["slack"]["app_token"],
                                   cfg["slack"]["channel"])
+
     RT.sheet = _sh.PipelineSheets(cfg["google_sheets"]["credentials_file"],
                                   cfg["google_sheets"]["sheet_id"])
     RT.args = args
