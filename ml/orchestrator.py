@@ -21,7 +21,7 @@ import json
 import os
 import subprocess
 import sys
-import time
+import uuid
 from pathlib import Path
 from typing import Optional, TypedDict
 
@@ -55,6 +55,8 @@ class _Runtime:
     bot = None
     sheet = None
     args = None
+    claude_sid = None        # 브랜치당 claude 세션 id (노드 간 맥락 누적)
+    claude_started = False   # 해당 세션 첫 호출 여부 (--session-id vs --resume)
 
 RT = _Runtime()
 
@@ -87,11 +89,18 @@ class PipelineState(TypedDict, total=False):
 # ─────────────────────────────────────────────
 # 하네스 (claude -p 분석·판정) 노드 팩토리
 # ─────────────────────────────────────────────
-def _claude_json(prompt: str, timeout: int = 120) -> Optional[dict]:
-    """claude -p --output-format json 호출 → dict. 실패 시 None."""
+def _claude_json(prompt: str, timeout: int = 120,
+                 session: Optional[str] = None, first: bool = False) -> Optional[dict]:
+    """claude -p --output-format json 호출 → dict. 실패 시 None.
+
+    session 지정 시 브랜치 세션에 묶음: 첫 호출(first=True)은 --session-id 로
+    세션 생성, 이후는 --resume 로 같은 대화를 이어가 맥락이 누적된다."""
+    cmd = ["claude", "-p", prompt, "--output-format", "json"]
+    if session:
+        cmd += (["--session-id", session] if first else ["--resume", session])
     try:
         out = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "json"],
+            cmd,
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=timeout,
         )
@@ -106,6 +115,20 @@ def _claude_json(prompt: str, timeout: int = 120) -> Optional[dict]:
     except Exception as e:
         print(f"[하네스] claude 호출 실패: {e}")
     return None
+
+
+def _branch_claude(prompt: str, timeout: int = 120) -> Optional[dict]:
+    """브랜치당 claude 세션 1개를 유지하며 호출 — 노드 간 맥락 누적 + 캐시 재사용.
+
+    첫 호출은 --session-id 로 RT.claude_sid 세션을 만들고, 이후는 --resume 로
+    이어붙인다. 같은 브랜치의 추천/하네스가 베이스라인·채택 결과를 기억한 채 판정한다.
+    세션 id 가 없으면(미설정) stateless 단발 호출로 폴백."""
+    sid = RT.claude_sid
+    first = not RT.claude_started
+    out = _claude_json(prompt, timeout, session=sid, first=first)
+    if sid:
+        RT.claude_started = True   # 생성 시도 후엔 항상 resume (턴은 이미 기록됨)
+    return out
 
 
 def _harness_prompt(stage: str, text: str, extra: dict) -> str:
@@ -127,7 +150,7 @@ def claude_harness(stage: str, ctx_fn):
         if stage not in HARNESS_ON:
             return {"decision": "continue"}
         text, extra = ctx_fn(state)
-        v = _claude_json(_harness_prompt(stage, text, extra)) or {
+        v = _branch_claude(_harness_prompt(stage, text, extra)) or {
             "assessment": "분석 불가(claude 없음)", "verdict": "continue", "reason": "fallback"}
         verdict = v.get("verdict", "continue")
         RT.bot.log(
@@ -209,11 +232,15 @@ def _step_info(name: str, run_preprocess: bool) -> tuple:
 def n_new_branch(state: PipelineState) -> dict:
     run_num = git.get_next_run_num(RT.args.model)
     branch = git.create_branch(RT.args.model, run_num)
+    # 새 브랜치마다 새 claude 세션 — 노드 간 맥락은 누적하되 브랜치 간엔 격리.
+    RT.claude_sid = str(uuid.uuid4())
+    RT.claude_started = False
     RT.bot.log_run_start(branch, {
         "모델": RT.args.model, "epochs": RT.args.epochs, "max_mmsi": RT.args.max_mmsi,
         "데이터": RT.args.data_file, "base_dir": RT.args.base_dir,
         "베이스 피처": f"{len(steps.BASE_FEATURES)}개",
         "출발 피처": f"{len(state.get('current_extra', []))}개 (기채택)",
+        "claude세션": RT.claude_sid[:8],
     })
     return {"run_num": run_num, "branch": branch, "iters": state.get("iters", 0) + 1}
 
@@ -271,7 +298,7 @@ def n_recommend(state: PipelineState) -> dict:
     """claude 피처 추천 → 검증 → dynamic_candidates.py 기록 → 후보풀 확장."""
     weak = state.get("baseline", {}).get("weak", "")
     tried = state.get("tried_feats", [])
-    arr = _claude_json(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")), timeout=240)
+    arr = _branch_claude(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")), timeout=240)
     cands = _validate_recos(arr if isinstance(arr, list) else [])
     if cands:
         _write_dynamic_candidates(cands)

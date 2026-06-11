@@ -232,7 +232,6 @@ class PipelineSheets:
             self._use(model)
         gain = (best_det - baseline_det) if (best_det is not None and baseline_det is not None) else None
         adopted_str = ", ".join(adopted) if adopted else "채택없음"
-        features_str = ", ".join(all_features) if all_features else adopted_str
         elapsed_str = f"{elapsed_sec:.0f}s" if elapsed_sec else ""
         step_label = f"FE Step {fe_step}" if fe_step else "피처 엔지니어링 학습"
 
@@ -337,7 +336,7 @@ class PipelineSheets:
         ])
 
 
-def from_config(config_path: str = "ml/pipeline_config.json") -> "PipelineSheets":
+def from_config(config_path: str = "ml/config/pipeline_config.json") -> "PipelineSheets":
     with open(config_path, encoding="utf-8") as f:
         cfg = json.load(f)
     return PipelineSheets(

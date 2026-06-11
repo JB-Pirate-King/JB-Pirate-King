@@ -351,7 +351,7 @@ class SlackPipelineBot:
         return self._decision
 
 
-def from_config(config_path: str = "ml/pipeline_config.json") -> SlackPipelineBot:
+def from_config(config_path: str = "ml/config/pipeline_config.json") -> SlackPipelineBot:
     with open(config_path, encoding="utf-8") as f:
         cfg = json.load(f)
     return SlackPipelineBot(

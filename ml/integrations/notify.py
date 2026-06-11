@@ -44,7 +44,9 @@ except Exception:
 # Cloudflare(Discord)는 User-Agent 없는 요청을 1010 코드로 차단
 _UA = "Mozilla/5.0 (compatible; JB-Pirate-King-notify/1.0)"
 
-_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify_config.json")
+# ml/config/notify_config.json (integrations/ 의 부모 = ml/, 그 아래 config/)
+_CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "config", "notify_config.json")
 
 
 # ── 설정 로드 ──────────────────────────────────────────────────────

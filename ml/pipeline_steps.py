@@ -11,7 +11,6 @@ AIS 파이프라인 — 공용 실행 함수 라이브러리 (steps).
 
 > 직접 실행 진입점 아님. `python -m ml.orchestrator` 로 그래프를 돌린다.
 """
-import argparse
 import json
 import os
 import re
@@ -24,11 +23,9 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-import ml.integrations.slack_bot as _sb
-import ml.integrations.sheets as _sh
 import ml.integrations.git_manager as git
 
-CONFIG_PATH = "ml/pipeline_config.json"
+CONFIG_PATH = "ml/config/pipeline_config.json"
 
 from ml.core.constants import BASE_FEATURES   # 단일 출처 (ml/core/constants.py)
 
@@ -536,7 +533,7 @@ def stage_release(bot, args, branch: str, run_num: int,
         bot.log(f"⚠ 릴리스 실패 (수동 생성 필요)\n{out[-300:]}", "릴리스")
 
 
-FE_STATE_FILE = "ml/fe_state.json"
+FE_STATE_FILE = "ml/config/fe_state.json"
 
 
 def _load_fe_initial_extra() -> list[str]:

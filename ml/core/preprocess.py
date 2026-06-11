@@ -30,7 +30,6 @@ import glob
 import io
 import math
 import os
-import statistics
 import sys
 from datetime import datetime
 
@@ -427,7 +426,7 @@ def process_file(input_path: str, output_path: str, out_cols: list) -> dict:
     with open(TEMP_FILE, "w", newline="", encoding="utf-8") as tmp:
         writer = csv.DictWriter(tmp, fieldnames=USE_COLS, extrasaction="ignore")
         writer.writeheader()
-        total = iter_all_files([input_path], writer)
+        iter_all_files([input_path], writer)
 
     # 정렬
     with open(TEMP_FILE, "r", encoding="utf-8") as f:
