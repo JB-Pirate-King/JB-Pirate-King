@@ -1,10 +1,10 @@
 ---
 notion_url: https://www.notion.so/378be08098308077bca6f7b3cfa300e6
-last_synced: 2026-06-07 23:36
+last_synced: 2026-06-11 18:14
 tags: [notion-sync]
 ---
 
-# ais_ids_pi 개발 환경 구축 (1)
+# ais_ids_pi 개발 환경 구축
 
 버츄얼 박스 우분투 24.04 LTS 환경 
 
