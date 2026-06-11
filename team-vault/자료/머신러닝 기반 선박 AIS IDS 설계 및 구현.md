@@ -1,6 +1,6 @@
 ---
 source_file: 머신러닝 기반 선박 AIS IDS 설계 및 구현.pdf
-last_synced: 2026-06-11 18:23
+last_synced: 2026-06-11 19:42
 tags: [notion-sync, attachment]
 ---
 
