@@ -179,7 +179,12 @@ SEQ_LEN = 10
 
 Base 12 + extra 12 = **24 features**
 Extra: `sog_vec_kn, lowspeed_crab, cog_change, cog_move_diff, dist_speed_err, dist_speed_ratio, accel, anchor_suspicion, heading_rate, heading_change, speed_ratio, anchored_excess_speed`
-Best detection rate: dcdetect_011 → **83.5% (FP=1%, 23 features)**
+Best detection rate in this run series: dcdetect_011 → 83.5% (FP=1%, 23 features)
+
+> 🧊 **Official frozen numbers (final presentation)**: dcdetect **20 features (FE Iter8)** —
+> FP=1% **91.9%** · FP=5% 97.6% · FP=10% 98.7%. Model backup: GitHub release
+> `models/2026-06-05` + `D:\ais_models\dcdetect\`. Do NOT quote older numbers (83.5% etc.)
+> in any presentation material. Single source of truth: `team-vault/발표 마스터플랜.md`.
 
 ---
 
