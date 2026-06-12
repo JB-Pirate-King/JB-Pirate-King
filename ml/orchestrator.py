@@ -1,7 +1,7 @@
 """
 AIS 파이프라인 오케스트레이터 — LangGraph 완전판.
 
-구조 (상세: ml/PIPELINE.md, 렌더: pipeline_langgraph.png):
+구조 (상세: ml/PIPELINE.md, 렌더: ml/pipeline_langgraph.png):
   - claude 피처 추천(reco) 노드: 약세 진단 → claude 가 새 후보 피처 발명·검증 → 후보풀 확장.
     수렴(채택0) 시 다른 각도로 재추천 루프(라운드 상한).
   - 노드별 판정: 각 compute 노드 뒤 claude -p 판정 → 분석·판정(continue/retry/stop).

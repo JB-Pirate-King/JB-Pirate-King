@@ -83,18 +83,25 @@
 
 `build_graph().get_graph().draw_mermaid_png()` 로 컴파일된 그래프에서 직접 추출.
 
-![LangGraph 파이프라인 구조](../pipeline_langgraph.png)
+![LangGraph 파이프라인 구조](pipeline_langgraph.png)
 
-> 재생성 (노드 텍스트 검정·볼드):
-> ```python
-> from ml.orchestrator import build_graph
-> from langchain_core.runnables.graph import NodeStyles
-> png = build_graph().get_graph().draw_mermaid_png(node_colors=NodeStyles(
->     default='fill:#f2f0ff,color:#000000,font-weight:bold,line-height:1.2',
->     first='fill-opacity:0,color:#000000,font-weight:bold',
->     last='fill:#bfb6fc,color:#000000,font-weight:bold'))
-> open('pipeline_langgraph.png', 'wb').write(png)
+| 색 | 그룹 | 노드 | 역할 |
+|---|---|---|---|
+| 🟢 초록 | compute | new_branch · preprocess · fe_baseline · reco_again · fe_train · build · release · chain · converge | 실제 일하는 노드 — 브랜치/전처리/진단/FE/빌드/릴리즈/체인 |
+| 🩷 분홍 | reco | recommend | claude 피처 발명 (opus) — 약세 겨냥 새 lambda |
+| 🟣 보라 | judge | j_branch ~ j_chain (7) | claude 판정 (sonnet) — continue/retry/stop 라우팅 |
+| 🟡 노랑 | gate | gate_deploy · gate_release · gate_converge | 사람 승인 (`interrupt()`/auto_approve) — 비가역 관문 |
+| 🔵 파랑 | log | log_run_start · log_fe · log_run_done · log_converge · readme | 기록 — Sheets + 루트 README 결과표 |
+| 🔴 빨강 | stop | user_stop | 중단 종착 — stop verdict/게이트 거부 수렴점 |
+
+> 읽는 법: **초록이 일하고 → 보라가 심사하고 → 노랑이 사람 허락 받고 → 파랑이 적는다.**
+> 분홍이 아이디어를 내고, 틀어지면 빨강으로. 매핑은 `ml/scripts/render_graph.py` 의 GROUPS/STYLES.
+
+> 재생성 (노드 성격별 색상 — 초록 compute · 분홍 recommend · 보라 judge · 노랑 gate · 파랑 log · 빨강 stop):
+> ```bash
+> python -m ml.scripts.render_graph    # repo 루트에서 — ml/pipeline_langgraph.png 갱신
 > ```
+> 노드 분류/색상은 `ml/scripts/render_graph.py` 의 GROUPS/STYLES — 새 노드 추가 시 미분류 경고가 뜬다.
 
 ### 주석 달린 Mermaid (라우팅 레이블 포함)
 
