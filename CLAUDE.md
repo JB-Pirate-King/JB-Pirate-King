@@ -271,7 +271,7 @@ Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
 ## LangGraph Orchestrator (`ml/orchestrator.py`)
 
 `orchestrator.py` is a LangGraph `StateGraph` (control flow); the heavy execution functions
-live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md` / `pipeline_langgraph.png`.
+live in `ml/pipeline_steps.py` (shared step library). Design diagram: `pipeline_langgraph.png`.
 
 > **노드 단위 상세 문서**: [`ml/PIPELINE.md`](ml/PIPELINE.md) — 각 노드 설명, 라우팅, State,
 > Mermaid + 자동 렌더 구조도(`pipeline_langgraph.png`). LangGraph 관점 입문용.

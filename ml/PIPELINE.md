@@ -10,11 +10,11 @@
 - **1 run = 1 git 브랜치 = 피처 1개 채택 시도** (`dcdetect_001`, `_002`, …).
 - 채택에 성공하면 **체인**(그래프 사이클)으로 다음 브랜치를 시작하고, 더 이상
   목적점수 이득이 없으면 **수렴**하여 종료한다.
-- 각 compute 노드 뒤에는 **판정(judge)** 노드 — claude 가가 붙어 `continue / retry / stop`
-  으로 라우팅한다.
+- 각 compute 노드 뒤에는 **판정(judge)** 노드가 붙어 claude 가 `continue / retry / stop`
+  으로 라우팅한다 (LLM-as-judge).
 - 비가역 단계(배포·커밋·수렴)에는 **게이트**(`interrupt()` 또는 `--auto_approve`)가 있다.
-- claude 호출(추천·판정·분석)은 **브랜치당 세션 1개**를 공유하며 기본 모델은 **Sonnet 4.6**
-  (`--claude_model` 로 변경).
+- claude 호출(추천·판정·분석)은 **브랜치당 세션 1개**를 공유. 모델은 역할별 분리 —
+  판정/지식요약 `--claude_model`(기본 sonnet), 피처발명/상세분석 `--claude_model_heavy`(기본 opus).
 
 ```
 새 브랜치 ─▶ 베이스 진단 ─▶ 피처 발명 ─▶ FE 학습/채택 ─▶ 배포 게이트
@@ -122,9 +122,10 @@ flowchart TD
         recommend --> j_reco{{j_reco 판정}}
         reco_again[reco_again<br/>라운드+1] --> recommend
     end
-    j_base -.->|retry| fe_train
+    j_base -.->|retry| fe_baseline
     j_base -.->|stop| user_stop
     j_reco -.->|continue| fe_train
+    j_reco -.->|retry| recommend
     j_reco -.->|stop| user_stop
 
     subgraph FE[피처 엔지니어링]
@@ -148,17 +149,18 @@ flowchart TD
     end
     gate_deploy -.->|retry| fe_baseline
     gate_deploy -.->|stop| user_stop
-    j_build -.->|retry| fe_train
+    j_build -.->|retry| build
     j_build -.->|stop| user_stop
     gate_release -.->|stop| user_stop
-    j_release -.->|retry| fe_train
+    j_release -.->|retry| release
     j_release -.->|stop| user_stop
 
-    log_run_done --> chain[chain<br/>fe_state 저장·커밋]
+    log_run_done --> readme[readme<br/>루트 README 결과표 갱신]
+    readme --> chain[chain<br/>fe_state 저장·커밋]
     chain --> j_chain{{j_chain 판정}}
     j_chain -.->|continue·상한미달 사이클| new_branch
     j_chain -.->|상한 도달| END4([END])
-    j_chain -.->|retry| fe_train
+    j_chain -.->|retry| chain
     j_chain -.->|stop| user_stop
 
     gate_converge[/gate_converge<br/>수렴 종료 승인/] -.->|approve| converge[converge]
@@ -190,6 +192,7 @@ graph TD;
 	fe_train(fe_train)
 	build(build)
 	release(release)
+	readme(readme)
 	chain(chain)
 	converge(converge)
 	user_stop(user_stop)
@@ -221,18 +224,18 @@ graph TD;
 	gate_deploy -.-> user_stop;
 	gate_release -.-> release;
 	gate_release -.-> user_stop;
-	j_base -.-> fe_train;
+	j_base -.-> fe_baseline;
 	j_base -.-> recommend;
 	j_base -.-> user_stop;
-	j_branch -. END .-> __end__;
+	j_branch -.  END  .-> __end__;
 	j_branch -.-> fe_baseline;
 	j_branch -.-> preprocess;
 	j_branch -.-> user_stop;
-	j_build -.-> fe_train;
+	j_build -.-> build;
 	j_build -.-> gate_release;
 	j_build -.-> user_stop;
-	j_chain -. END .-> __end__;
-	j_chain -.-> fe_train;
+	j_chain -.  END  .-> __end__;
+	j_chain -.-> chain;
 	j_chain -.-> new_branch;
 	j_chain -.-> user_stop;
 	j_fe -.-> fe_baseline;
@@ -241,16 +244,18 @@ graph TD;
 	j_fe -.-> reco_again;
 	j_fe -.-> user_stop;
 	j_reco -.-> fe_train;
+	j_reco -.-> recommend;
 	j_reco -.-> user_stop;
-	j_release -.-> fe_train;
 	j_release -.-> log_run_done;
+	j_release -.-> release;
 	j_release -.-> user_stop;
 	log_fe --> j_fe;
-	log_run_done --> chain;
+	log_run_done --> readme;
 	log_run_start --> j_branch;
 	new_branch --> log_run_start;
-	preprocess -. END .-> __end__;
+	preprocess -.  END  .-> __end__;
 	preprocess -.-> fe_baseline;
+	readme --> chain;
 	reco_again --> recommend;
 	recommend --> j_reco;
 	release --> j_release;
@@ -282,6 +287,7 @@ graph TD;
 | `fe_train` | `n_fe_train` — orchestrator.py:350<br/>→ `_fe_train_eval` pipeline_steps.py:557 | **핵심**: 후보 스캔 → 목적점수 ≥`min_gain` 최선 1개 채택 → 재학습(model_best) → 순열중요도 → 최종 FP1/5/10 → 임계값 → 배포 export. `feature_engineer` 1 subprocess | `r{newly_adopted,full_extra,det_rate,summary,fe_stats,…}` |
 | `build` | `n_build` — orchestrator.py:360<br/>→ `_fe_build_and_release` pipeline_steps.py:884 (→ `stage_build_plugin`:344) | C++ 플러그인 패치(`patch_plugin`) + 모델 파일 복사 → `ais_ids_pi/data/` | `commit_files`, `build_summary` |
 | `release` | `n_release` — orchestrator.py:366<br/>→ `_fe_commit_release` pipeline_steps.py:901 (→ `stage_release`:464) | 채택 커밋 + GitHub 릴리즈(`gh release`, prerelease `run/dcdetect_NNN`) | — |
+| `readme` | `n_readme` | **claude 노드** — 루트 `README.md` Run Results 표에 이번 run 행 추가 (수치는 FE JSON, Note 는 브랜치 세션 claude 한 줄) → run 브랜치에 커밋 | — |
 | `chain` | `n_chain` | `fe_state.json` 저장 + **채택 lambda 를 `adopted_features.py` 에 영속화** → 함께 커밋 → 다음 브랜치로 사이클 | `current_extra`, `adopted_any` |
 | `converge` | `n_converge` — orchestrator.py:383 | 수렴 완료 로그 | `terminate` |
 | `user_stop` | `n_user_stop` — orchestrator.py:389 | 중단 — Sheets 실패기록 + 종료 | `terminate` |
@@ -310,7 +316,7 @@ claude 호출은 `_branch_claude`(orchestrator.py:123) → `_claude_json`(orches
 `JUDGE_ON` 에 든 stage 만 동작(`--no_judge` 로 전체 off).
 
 동작: 해당 노드 결과를 claude 에 주고 `{assessment, verdict, reason, suggestion}` JSON 받음 →
-`_route_judge`: **stop→user_stop / retry→fe_train / 그외→다음 노드**.
+`_route_judge`: **stop→user_stop / retry→직전 노드 재실행 / 그외→다음 노드**.
 
 프롬프트(`_judge_prompt`)는 공통 템플릿에 **stage별 판정 포인트**(`STAGE_FOCUS`)를 주입한다 —
 baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 파일·피처수 일치하나" 처럼
@@ -328,7 +334,7 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 |---|---|---|
 | `route_after_branch_j` orchestrator.py:542 (→`route_after_branch`:418) | j_branch 뒤 | stop이면 user_stop, 아니면 max_runs 체크 → preprocess/fe_baseline/END |
 | `route_after_preprocess` orchestrator.py:425 | preprocess 뒤 | terminate면 END, 아니면 fe_baseline |
-| `_route_judge(next)` orchestrator.py:170 | 대부분 판정 | stop→user_stop / retry→fe_train / else→next |
+| `_route_judge(next, retry_to)` | 대부분 판정 | stop→user_stop / **retry→직전 노드 재실행** / else→next |
 | `route_after_fe` orchestrator.py:429 | j_fe 뒤 | verdict + 채택여부 결합 (위 설명) |
 | `route_gate_deploy` / `route_gate_release` / `route_gate_converge` | 각 게이트 뒤 | approve→진행 / 그외→user_stop(deploy는 retry→fe_baseline) |
 | `route_after_chain` | j_chain 뒤 | stop/retry 우선 → `iters >= max_runs` 면 **빈 브랜치 안 만들고 END** → 아니면 new_branch (사이클) |
@@ -358,9 +364,15 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 
 - **사이클**: `release → log_run_done → chain → j_chain → new_branch` (다음 브랜치 시작).
   `recursion_limit = max(80, max_runs × 25)`, `--max_runs`(기본 50)로 무한루프 방지.
-- **수렴 종료**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`(라운드 남으면 재추천)
-  → 끝나면 `gate_converge → converge → END`.
+- **수렴 종료 (횟수 기준)**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`
+  으로 다른 각도 재추천 — **브랜치당 `--invent_rounds`(기본 2) 라운드 소진 후에야**
+  `gate_converge → converge → END`. 단발 미채택 = 즉시 종료가 아님.
+- **베이스라인 캐시**: `fe_baseline`(diagnose) 결과 JSON 을 `fe_train` 이 `--baseline_cache` 로
+  재사용 — 같은 피처셋이면 베이스라인 재학습 생략 (브랜치당 1회 학습). 재추천 라운드 비용은
+  후보 N개 학습만.
 - **세션 격리**: 브랜치마다 새 claude 세션(uuid). 브랜치 내 노드는 맥락 공유, 브랜치 간엔 격리.
+- **thread_id**: run 마다 `orchestrator-{시각}` 발급 (stdout/로그에 출력) — LangSmith Threads 뷰에서
+  run 별로 분리되고, SqliteSaver 도입 시 크래시 재개 키로 쓴다. (고정값이면 전 run 이 한 스레드로 합쳐짐)
 - **develop 복구**: `main()` 의 `finally` 에서 항상 `git checkout develop`.
 
 ---
@@ -375,10 +387,22 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 세션 누적 순서: ① 지식 주입 → ② 판정들 → ③ 피처 추천 → ④ claude_analyze(FE 상세분석)
 — 전부 한 대화. 턴마다 모델만 바꿔 resume (맥락 유지 검증됨).
 
-| 경로 | 모델 | 플래그 |
-|---|---|---|
-| 피처 발명(recommend) · FE 상세분석(claude_analyze) | **Opus 4.8** | `--claude_model_heavy` (기본 opus) |
-| 판정 verdict ×7 · 지식주입/요약 | **Sonnet 4.6** | `--claude_model` (기본 sonnet) |
+노드별 모델 배치 (기본값). 원칙: **판정·요약·한줄노트 = sonnet** (잦고 가벼움) /
+**발명·심층분석 = opus** (추론 가치). 전부 같은 브랜치 세션을 모델만 바꿔 resume.
+
+| claude 호출 노드 | 하는 일 | 모델 | 플래그 |
+|---|---|---|---|
+| `j_branch` | 브랜치 생성 점검 verdict | Sonnet 4.6 | `--claude_model` |
+| `j_base` | 베이스라인 진단 verdict | Sonnet 4.6 | 〃 |
+| `j_reco` | 추천 후보 타당성 verdict | Sonnet 4.6 | 〃 |
+| `j_fe` | FE 채택 결과 verdict (라우팅 결합) | Sonnet 4.6 | 〃 |
+| `j_build` | 빌드 산출 점검 verdict | Sonnet 4.6 | 〃 |
+| `j_release` | 릴리즈 점검 verdict | Sonnet 4.6 | 〃 |
+| `j_chain` | 체인 상태 점검 verdict | Sonnet 4.6 | 〃 |
+| 지식주입+요약 (`_prime_session`) | team-vault 시드 + 한국어 요약 | Sonnet 4.6 | 〃 |
+| `readme` | 루트 README Run Results Note 한 줄 | Sonnet 4.6 | 〃 |
+| **`recommend`** | **새 피처 lambda 발명** | **Opus 4.8** | `--claude_model_heavy` |
+| **`claude_analyze`** | **FE 상세분석** (전처리/FE 실패/FE 성공 3지점) | **Opus 4.8** | 〃 |
 
 ### 도메인 지식 주입 (`--knowledge`, 기본 on)
 
@@ -417,7 +441,7 @@ python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
 
 # 주요 플래그
 #   --invent N                추천 피처 개수 (기본 5)
-#   --invent_rounds N         수렴 시 재추천 라운드 상한
+#   --invent_rounds N         브랜치당 추천 라운드 상한 (기본 2 — 미채택이어도 재추천 후 수렴)
 #   --no_judge              모든 판정 끔
 #   --claude_model M          경량 모델 — 판정·지식요약 (기본 sonnet)
 #   --claude_model_heavy M    심층 모델 — 피처발명·상세분석 (기본 opus)

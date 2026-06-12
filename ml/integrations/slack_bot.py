@@ -145,8 +145,12 @@ class SlackPipelineBot:
         pairs: dict 또는 (라벨, 값) 리스트."""
         head = {"type": "section",
                 "text": {"type": "mrkdwn", "text": f"{emoji} *{title}*"}}
+        # text 는 알림 미리보기 + 파일 로그(_post)에 쓰임 — 수치를 직렬화해 포함
+        # (제목만 쓰면 그리드 수치가 로그 파일에서 유실됨).
+        items = list(pairs.items() if isinstance(pairs, dict) else pairs)
+        flat = f"{emoji} {title} — " + " · ".join(f"{k}: {v}" for k, v in items)
         self._post(
-            channel=self.channel, text=title,
+            channel=self.channel, text=flat,
             blocks=[head, self._fields(pairs), self._context(f"🕐 {self._now()}")],
         )
 

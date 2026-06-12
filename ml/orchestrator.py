@@ -1,7 +1,7 @@
 """
 AIS 파이프라인 오케스트레이터 — LangGraph 완전판.
 
-graph.md 구조도 반영:
+구조 (상세: ml/PIPELINE.md, 렌더: pipeline_langgraph.png):
   - claude 피처 추천(reco) 노드: 약세 진단 → claude 가 새 후보 피처 발명·검증 → 후보풀 확장.
     수렴(채택0) 시 다른 각도로 재추천 루프(라운드 상한).
   - 노드별 판정: 각 compute 노드 뒤 claude -p 판정 → 분석·판정(continue/retry/stop).
@@ -300,14 +300,17 @@ def claude_judge(stage: str, ctx_fn):
     return node
 
 
-def _route_judge(continue_to: str):
-    """판정 verdict → continue_to / fe_train(retry) / user_stop(stop)."""
+def _route_judge(continue_to: str, retry_to: str):
+    """판정 verdict → continue_to / retry_to / user_stop(stop).
+
+    retry 는 **직전 노드 재실행** — 예전엔 일률 fe_train 으로 보내
+    j_base retry 가 후보 0인 채 스캔에 진입하는 등 비논리적이었다."""
     def route(state: PipelineState) -> str:
         d = state.get("decision", "continue")
         if d == "stop":
             return "user_stop"
         if d == "retry":
-            return "fe_train"
+            return retry_to
         return continue_to
     return route
 
@@ -386,7 +389,9 @@ def n_new_branch(state: PipelineState) -> dict:
         "출발 피처": f"{len(state.get('current_extra', []))}개 (기채택)",
         "claude세션": RT.claude_sid[:8],
     })
-    return {"run_num": run_num, "branch": branch, "iters": state.get("iters", 0) + 1}
+    # reco_round 는 브랜치 단위 리셋 — 각 브랜치가 invent_rounds 만큼 재추천 기회를 가짐
+    return {"run_num": run_num, "branch": branch,
+            "iters": state.get("iters", 0) + 1, "reco_round": 1}
 
 
 def n_preprocess(state: PipelineState) -> dict:
@@ -541,6 +546,58 @@ def n_release(state: PipelineState) -> dict:
     return {}
 
 
+def n_readme(state: PipelineState) -> dict:
+    """릴리즈 후 루트 README.md 의 Run Results 표에 이번 run 결과 행 추가 (claude 노드).
+
+    수치는 FE 산출 JSON 에서 코드로 뽑고, Note 한 줄은 브랜치 세션(지식·판정·분석 누적)을
+    --resume 한 claude 가 작성. README 는 run 브랜치에 커밋된다."""
+    r = state.get("r", {})
+    fe = r.get("fe_stats", {})
+    # FP5/10 은 fe_stats 에 없어 FE JSON 에서 보강
+    det5 = det10 = None
+    fe_json = steps.WORK_DIR / "feat_eng_iter01.json"
+    if fe_json.exists():
+        try:
+            d = json.loads(fe_json.read_text(encoding="utf-8"))
+            det5, det10 = d.get("det_fp5"), d.get("det_fp10")
+        except Exception:
+            pass
+
+    v = _branch_claude(
+        "Write ONE short Korean sentence (<=80 chars) summarizing this run's outcome and "
+        "the adopted feature's significance, for the project README results table. "
+        'Output ONLY JSON: {"note":"..."}', timeout=60) or {}
+    note = (v.get("note") or "").replace("|", "/").strip()
+
+    base, det = fe.get("baseline_det"), fe.get("det_rate")
+    fmt = lambda x, s="%": (f"{x:.1f}{s}" if isinstance(x, (int, float)) else "-")
+    row = ("| {b} | {d} | {a} | {fp1} | {fp5} | {fp10} | {th} | {nf} | {note} |").format(
+        b=state["branch"], d=time.strftime("%Y-%m-%d"),
+        a=", ".join(f"`{f}`" for f in r.get("newly_adopted", [])) or "-",
+        fp1=(f"{fmt(base)}→{fmt(det)}" + (f" ({det-base:+.1f}pp)" if isinstance(base,(int,float)) and isinstance(det,(int,float)) else "")),
+        fp5=fmt(det5), fp10=fmt(det10),
+        th=(f"{fe.get('threshold'):.6f}" if isinstance(fe.get("threshold"), (int, float)) else "-"),
+        nf=r.get("n_feat", "-"), note=note or "-")
+
+    try:
+        p = Path("README.md")
+        txt = p.read_text(encoding="utf-8")
+        begin, end = "<!-- RUN_RESULTS:BEGIN -->", "<!-- RUN_RESULTS:END -->"
+        head, rest = txt.split(begin, 1)
+        block, tail = rest.split(end, 1)
+        lines = [l for l in block.strip().splitlines() if l.strip()]
+        table_head, rows = lines[:2], lines[2:]          # 헤더 2줄 유지, 최신 행을 위로
+        new_block = "\n".join(table_head + [row] + rows)
+        p.write_text(head + begin + "\n" + new_block + "\n" + end + tail, encoding="utf-8")
+        git.commit_results(["README.md"],
+                           f"docs: {state['branch']} run result → README", branch=state["branch"])
+        RT.bot.log(f"📝 README Run Results 갱신 — {state['branch']}"
+                   + (f"\n  └ {note}" if note else ""), "지식")
+    except Exception as e:
+        print(f"[readme] 갱신 실패(무시): {e}")
+    return {}
+
+
 def n_chain(state: PipelineState) -> dict:
     full_extra = state["r"]["full_extra"]
     steps._save_fe_initial_extra(full_extra)
@@ -607,7 +664,7 @@ def route_after_chain(state: PipelineState) -> str:
     if d == "stop":
         return "user_stop"
     if d == "retry":
-        return "fe_train"
+        return "chain"   # 직전 노드 재실행 (fe_state 저장은 멱등)
     if state.get("iters", 0) >= RT.args.max_runs:
         RT.bot.log(f"⚠️ 안전 상한 {RT.args.max_runs} 도달 — 체이닝 종료", "warning")
         return "END"
@@ -630,9 +687,10 @@ def route_after_fe(state: PipelineState) -> str:
         return "fe_baseline"           # 실패 → 재진단/재시도
     if r.get("newly_adopted"):
         return "gate_deploy"
-    # 수렴: 추천 라운드 남으면 재추천, 아니면 종료 게이트
+    # 수렴 판단에 횟수 기준: 이 브랜치에서 미채택이라도 invent_rounds 까지
+    # 다른 각도로 재추천 (라운드 비용은 baseline_cache 로 후보 학습만).
+    # 모든 라운드 소진 후에야 수렴 게이트로 — 단발 미채택 = 즉시 종료 방지.
     if (RT.args.invent and RT.args.invent > 0
-            and not state.get("adopted_any")
             and state.get("reco_round", 1) < RT.args.invent_rounds):
         return "reco_again"
     return "gate_converge"
@@ -665,7 +723,8 @@ def build_graph(checkpointer=None):
     for n, fn in [("new_branch", n_new_branch), ("preprocess", n_preprocess),
                   ("fe_baseline", n_fe_baseline), ("recommend", n_recommend),
                   ("reco_again", n_reco_again), ("fe_train", n_fe_train),
-                  ("build", n_build), ("release", n_release), ("chain", n_chain),
+                  ("build", n_build), ("release", n_release), ("readme", n_readme),
+                  ("chain", n_chain),
                   ("converge", n_converge), ("user_stop", n_user_stop),
                   ("gate_deploy", n_gate_deploy), ("gate_release", n_gate_release),
                   ("gate_converge", n_gate_converge),
@@ -693,11 +752,11 @@ def build_graph(checkpointer=None):
                             {"fe_baseline": "fe_baseline", "END": END})
 
     g.add_edge("fe_baseline", "j_base")
-    g.add_conditional_edges("j_base", _route_judge("recommend"),
-                            {"recommend": "recommend", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("j_base", _route_judge("recommend", retry_to="fe_baseline"),
+                            {"recommend": "recommend", "fe_baseline": "fe_baseline", "user_stop": "user_stop"})
     g.add_edge("recommend", "j_reco")
-    g.add_conditional_edges("j_reco", _route_judge("fe_train"),
-                            {"fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("j_reco", _route_judge("fe_train", retry_to="recommend"),
+                            {"fe_train": "fe_train", "recommend": "recommend", "user_stop": "user_stop"})
 
     g.add_edge("fe_train", "log_fe")
     g.add_edge("log_fe", "j_fe")
@@ -710,17 +769,18 @@ def build_graph(checkpointer=None):
     g.add_conditional_edges("gate_deploy", route_gate_deploy,
                             {"build": "build", "fe_baseline": "fe_baseline", "user_stop": "user_stop"})
     g.add_edge("build", "j_build")
-    g.add_conditional_edges("j_build", _route_judge("gate_release"),
-                            {"gate_release": "gate_release", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("j_build", _route_judge("gate_release", retry_to="build"),
+                            {"gate_release": "gate_release", "build": "build", "user_stop": "user_stop"})
     g.add_conditional_edges("gate_release", route_gate_release,
                             {"release": "release", "user_stop": "user_stop"})
     g.add_edge("release", "j_release")
-    g.add_conditional_edges("j_release", _route_judge("log_run_done"),
-                            {"log_run_done": "log_run_done", "fe_train": "fe_train", "user_stop": "user_stop"})
-    g.add_edge("log_run_done", "chain")
+    g.add_conditional_edges("j_release", _route_judge("log_run_done", retry_to="release"),
+                            {"log_run_done": "log_run_done", "release": "release", "user_stop": "user_stop"})
+    g.add_edge("log_run_done", "readme")
+    g.add_edge("readme", "chain")
     g.add_edge("chain", "j_chain")
     g.add_conditional_edges("j_chain", route_after_chain,
-                            {"new_branch": "new_branch", "fe_train": "fe_train",
+                            {"new_branch": "new_branch", "chain": "chain",
                              "user_stop": "user_stop", "END": END})
 
     g.add_conditional_edges("gate_converge", route_gate_converge,
@@ -767,7 +827,9 @@ def main():
     p.add_argument("--scan_ratio", type=float, default=1.0)
     p.add_argument("--candidates", nargs="*", default=None)
     p.add_argument("--invent", type=int, default=5, help="claude 피처 추천 N개")
-    p.add_argument("--invent_rounds", type=int, default=1, help="수렴 시 재추천 라운드 상한")
+    p.add_argument("--invent_rounds", type=int, default=2,
+                   help="브랜치당 추천 라운드 상한 — 미채택이어도 이 횟수까지 다른 각도로 "
+                        "재추천 후에야 수렴 처리 (기본 2; 라운드 비용은 baseline_cache 덕에 후보 학습만)")
     p.add_argument("--n_anom", type=int, default=None)
     p.add_argument("--overall_tol", type=float, default=1.0)
     p.add_argument("--auto_approve", action="store_true")
@@ -814,7 +876,11 @@ def main():
         "tried_feats": [], "adopted_any": False, "terminate": False,
     }
     graph = build_graph()
-    config = {"configurable": {"thread_id": "orchestrator"},
+    # thread_id 를 run 마다 분리 — 고정값이면 LangSmith Threads 뷰에서 모든 run 이
+    # 한 스레드의 턴으로 합쳐져 새 run 이 안 보이는 것처럼 보인다.
+    thread_id = f"orchestrator-{time.strftime('%Y%m%d_%H%M%S')}"
+    print(f"[LangGraph] thread_id={thread_id}")
+    config = {"configurable": {"thread_id": thread_id},
               "recursion_limit": max(80, args.max_runs * 25)}
     try:
         run_pipeline(graph, init, config)

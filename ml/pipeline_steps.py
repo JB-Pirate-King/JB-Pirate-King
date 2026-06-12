@@ -784,7 +784,10 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
          "--scan_ratio", str(args.scan_ratio)]
         + (["--max_candidates", str(args.max_candidates)] if args.max_candidates else [])
         + (["--candidates"] + args.candidates if args.candidates else [])
-        + (["--holdout_file", args.holdout_file] if args.holdout_file else []),
+        + (["--holdout_file", args.holdout_file] if args.holdout_file else [])
+        # fe_baseline(diagnose_only) 결과 재사용 → 베이스라인 재학습 생략 (피처셋 일치 시)
+        + (["--baseline_cache", str(WORK_DIR / "baseline_diag.json")]
+           if (WORK_DIR / "baseline_diag.json").exists() else []),
         progress_cb=fe_progress
     )
     elapsed = time.time() - t0
