@@ -85,7 +85,16 @@
 
 ![LangGraph 파이프라인 구조](../pipeline_langgraph.png)
 
-> 재생성: `python -c "from ml.orchestrator import build_graph; open('pipeline_langgraph.png','wb').write(build_graph().get_graph().draw_mermaid_png())"`
+> 재생성 (노드 텍스트 검정·볼드):
+> ```python
+> from ml.orchestrator import build_graph
+> from langchain_core.runnables.graph import NodeStyles
+> png = build_graph().get_graph().draw_mermaid_png(node_colors=NodeStyles(
+>     default='fill:#f2f0ff,color:#000000,font-weight:bold,line-height:1.2',
+>     first='fill-opacity:0,color:#000000,font-weight:bold',
+>     last='fill:#bfb6fc,color:#000000,font-weight:bold'))
+> open('pipeline_langgraph.png', 'wb').write(png)
+> ```
 
 ### 주석 달린 Mermaid (라우팅 레이블 포함)
 
