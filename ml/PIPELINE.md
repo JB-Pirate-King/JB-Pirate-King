@@ -10,10 +10,10 @@
 - **1 run = 1 git 브랜치 = 피처 1개 채택 시도** (`dcdetect_001`, `_002`, …).
 - 채택에 성공하면 **체인**(그래프 사이클)으로 다음 브랜치를 시작하고, 더 이상
   목적점수 이득이 없으면 **수렴**하여 종료한다.
-- 각 compute 노드 뒤에는 **하네스**(claude 판정) 노드가 붙어 `continue / retry / stop`
+- 각 compute 노드 뒤에는 **판정(judge)** 노드 — claude 가가 붙어 `continue / retry / stop`
   으로 라우팅한다.
 - 비가역 단계(배포·커밋·수렴)에는 **게이트**(`interrupt()` 또는 `--auto_approve`)가 있다.
-- claude 호출(추천·하네스·분석)은 **브랜치당 세션 1개**를 공유하며 기본 모델은 **Sonnet 4.6**
+- claude 호출(추천·판정·분석)은 **브랜치당 세션 1개**를 공유하며 기본 모델은 **Sonnet 4.6**
   (`--claude_model` 로 변경).
 
 ```
@@ -32,7 +32,7 @@
 ### 제어흐름 & 실행 (루트)
 | 파일 | 역할 |
 |---|---|
-| `orchestrator.py` | **LangGraph `StateGraph`** — 노드/엣지/게이트/하네스 제어흐름. 진입점 `python -m ml.orchestrator` |
+| `orchestrator.py` | **LangGraph `StateGraph`** — 노드/엣지/게이트/판정 제어흐름. 진입점 `python -m ml.orchestrator` |
 | `pipeline_steps.py` | 무거운 **실행함수 라이브러리** — `run_cmd`, 출력 파서, `stage_*`, `_fe_train_eval`/`_fe_build_and_release`/`_fe_commit_release`, `claude_analyze`, fe_state io |
 | `dynamic_candidates.py` | **런타임 생성** — `recommend` 노드가 claude 발명 피처를 여기 기록, `feature_engineer` 가 exec 로드 (gitignored) |
 | `build_plugin_wsl.sh` | WSL tar.gz 빌드 (`--build_plugin`, 기본 off) |
@@ -106,60 +106,60 @@ flowchart TD
 
     subgraph BRANCH_INIT[브랜치 시작]
         new_branch[new_branch<br/>브랜치 생성·세션발급] --> log_run_start[log_run_start<br/>Sheets]
-        log_run_start --> h_branch{{h_branch 하네스}}
+        log_run_start --> j_branch{{j_branch 판정}}
     end
 
-    h_branch -.->|preprocess| preprocess[preprocess<br/>raw→csv·첫브랜치만]
-    h_branch -.->|fe_baseline| fe_baseline
-    h_branch -.->|stop| user_stop
-    h_branch -.->|max_runs 초과| END1([END])
+    j_branch -.->|preprocess| preprocess[preprocess<br/>raw→csv·첫브랜치만]
+    j_branch -.->|fe_baseline| fe_baseline
+    j_branch -.->|stop| user_stop
+    j_branch -.->|max_runs 초과| END1([END])
     preprocess -.->|continue| fe_baseline
     preprocess -.->|terminate| END1
 
     subgraph DIAGNOSE_RECO[진단 · 추천]
-        fe_baseline[fe_baseline<br/>베이스 탐지율·약세진단] --> h_base{{h_base 하네스}}
-        h_base -.->|continue| recommend[recommend<br/>claude 피처 N개 발명]
-        recommend --> h_reco{{h_reco 하네스}}
+        fe_baseline[fe_baseline<br/>베이스 탐지율·약세진단] --> j_base{{j_base 판정}}
+        j_base -.->|continue| recommend[recommend<br/>claude 피처 N개 발명]
+        recommend --> j_reco{{j_reco 판정}}
         reco_again[reco_again<br/>라운드+1] --> recommend
     end
-    h_base -.->|retry| fe_train
-    h_base -.->|stop| user_stop
-    h_reco -.->|continue| fe_train
-    h_reco -.->|stop| user_stop
+    j_base -.->|retry| fe_train
+    j_base -.->|stop| user_stop
+    j_reco -.->|continue| fe_train
+    j_reco -.->|stop| user_stop
 
     subgraph FE[피처 엔지니어링]
         fe_train[fe_train<br/>스캔→채택→재학습→중요도→최종평가→export] --> log_fe[log_fe<br/>Sheets]
-        log_fe --> h_fe{{h_fe 하네스}}
+        log_fe --> j_fe{{j_fe 판정}}
     end
 
-    h_fe -.->|채택O| gate_deploy
-    h_fe -.->|채택X·라운드남음| reco_again
-    h_fe -.->|채택X·라운드끝| gate_converge
-    h_fe -.->|실패/retry| fe_baseline
-    h_fe -.->|stop| user_stop
+    j_fe -.->|채택O| gate_deploy
+    j_fe -.->|채택X·라운드남음| reco_again
+    j_fe -.->|채택X·라운드끝| gate_converge
+    j_fe -.->|실패/retry| fe_baseline
+    j_fe -.->|stop| user_stop
 
     subgraph DEPLOY[배포 · 릴리즈]
         gate_deploy[/gate_deploy<br/>배포 승인/] -.->|approve| build[build<br/>C++ 패치·모델 복사]
-        build --> h_build{{h_build 하네스}}
-        h_build -.->|continue| gate_release[/gate_release<br/>커밋·릴리즈 승인/]
+        build --> j_build{{j_build 판정}}
+        j_build -.->|continue| gate_release[/gate_release<br/>커밋·릴리즈 승인/]
         gate_release -.->|approve| release[release<br/>git commit·gh release]
-        release --> h_release{{h_release 하네스}}
-        h_release -.->|continue| log_run_done[log_run_done<br/>Sheets]
+        release --> j_release{{j_release 판정}}
+        j_release -.->|continue| log_run_done[log_run_done<br/>Sheets]
     end
     gate_deploy -.->|retry| fe_baseline
     gate_deploy -.->|stop| user_stop
-    h_build -.->|retry| fe_train
-    h_build -.->|stop| user_stop
+    j_build -.->|retry| fe_train
+    j_build -.->|stop| user_stop
     gate_release -.->|stop| user_stop
-    h_release -.->|retry| fe_train
-    h_release -.->|stop| user_stop
+    j_release -.->|retry| fe_train
+    j_release -.->|stop| user_stop
 
     log_run_done --> chain[chain<br/>fe_state 저장·커밋]
-    chain --> h_chain{{h_chain 하네스}}
-    h_chain -.->|continue·상한미달 사이클| new_branch
-    h_chain -.->|상한 도달| END4([END])
-    h_chain -.->|retry| fe_train
-    h_chain -.->|stop| user_stop
+    chain --> j_chain{{j_chain 판정}}
+    j_chain -.->|continue·상한미달 사이클| new_branch
+    j_chain -.->|상한 도달| END4([END])
+    j_chain -.->|retry| fe_train
+    j_chain -.->|stop| user_stop
 
     gate_converge[/gate_converge<br/>수렴 종료 승인/] -.->|approve| converge[converge]
     gate_converge -.->|stop| user_stop
@@ -167,7 +167,7 @@ flowchart TD
     user_stop[user_stop<br/>중단] --> END3([END])
 ```
 
-> `{{ }}` = 하네스(claude 판정) · `[/ /]` = 게이트(승인) · `[ ]` = compute/로그 노드.
+> `{{ }}` = 판정(judge) · `[/ /]` = 게이트(승인) · `[ ]` = compute/로그 노드.
 
 ### LangGraph 원본 (배선 그대로, 노드명만)
 
@@ -200,19 +200,19 @@ graph TD;
 	log_fe(log_fe)
 	log_run_done(log_run_done)
 	log_converge(log_converge)
-	h_branch(h_branch)
-	h_base(h_base)
-	h_reco(h_reco)
-	h_fe(h_fe)
-	h_build(h_build)
-	h_release(h_release)
-	h_chain(h_chain)
+	j_branch(j_branch)
+	j_base(j_base)
+	j_reco(j_reco)
+	j_fe(j_fe)
+	j_build(j_build)
+	j_release(j_release)
+	j_chain(j_chain)
 	__end__([__end__]):::last
 	__start__ --> new_branch;
-	build --> h_build;
-	chain --> h_chain;
+	build --> j_build;
+	chain --> j_chain;
 	converge --> log_converge;
-	fe_baseline --> h_base;
+	fe_baseline --> j_base;
 	fe_train --> log_fe;
 	gate_converge -.-> converge;
 	gate_converge -.-> user_stop;
@@ -221,39 +221,39 @@ graph TD;
 	gate_deploy -.-> user_stop;
 	gate_release -.-> release;
 	gate_release -.-> user_stop;
-	h_base -.-> fe_train;
-	h_base -.-> recommend;
-	h_base -.-> user_stop;
-	h_branch -. END .-> __end__;
-	h_branch -.-> fe_baseline;
-	h_branch -.-> preprocess;
-	h_branch -.-> user_stop;
-	h_build -.-> fe_train;
-	h_build -.-> gate_release;
-	h_build -.-> user_stop;
-	h_chain -. END .-> __end__;
-	h_chain -.-> fe_train;
-	h_chain -.-> new_branch;
-	h_chain -.-> user_stop;
-	h_fe -.-> fe_baseline;
-	h_fe -.-> gate_converge;
-	h_fe -.-> gate_deploy;
-	h_fe -.-> reco_again;
-	h_fe -.-> user_stop;
-	h_reco -.-> fe_train;
-	h_reco -.-> user_stop;
-	h_release -.-> fe_train;
-	h_release -.-> log_run_done;
-	h_release -.-> user_stop;
-	log_fe --> h_fe;
+	j_base -.-> fe_train;
+	j_base -.-> recommend;
+	j_base -.-> user_stop;
+	j_branch -. END .-> __end__;
+	j_branch -.-> fe_baseline;
+	j_branch -.-> preprocess;
+	j_branch -.-> user_stop;
+	j_build -.-> fe_train;
+	j_build -.-> gate_release;
+	j_build -.-> user_stop;
+	j_chain -. END .-> __end__;
+	j_chain -.-> fe_train;
+	j_chain -.-> new_branch;
+	j_chain -.-> user_stop;
+	j_fe -.-> fe_baseline;
+	j_fe -.-> gate_converge;
+	j_fe -.-> gate_deploy;
+	j_fe -.-> reco_again;
+	j_fe -.-> user_stop;
+	j_reco -.-> fe_train;
+	j_reco -.-> user_stop;
+	j_release -.-> fe_train;
+	j_release -.-> log_run_done;
+	j_release -.-> user_stop;
+	log_fe --> j_fe;
 	log_run_done --> chain;
-	log_run_start --> h_branch;
+	log_run_start --> j_branch;
 	new_branch --> log_run_start;
 	preprocess -. END .-> __end__;
 	preprocess -.-> fe_baseline;
 	reco_again --> recommend;
-	recommend --> h_reco;
-	release --> h_release;
+	recommend --> j_reco;
+	release --> j_release;
 	log_converge --> __end__;
 	user_stop --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
@@ -302,22 +302,22 @@ graph TD;
 
 `log_run_start` / `log_fe` / `log_run_done` / `log_converge` — `log_sheet(kind)` 팩토리(orchestrator.py:185) 1개로 생성.
 
-### 하네스 노드 (claude 판정)
+### 판정 노드 (claude 판정)
 
-`h_branch · h_base · h_reco · h_fe · h_build · h_release · h_chain` — 각 compute 노드 뒤에 붙음.
-`claude_harness(stage, ctx_fn)` 팩토리(orchestrator.py:150)로 생성, `build_graph`(orchestrator.py:469) 안에서 `add_node`.
+`j_branch · j_base · j_reco · j_fe · j_build · j_release · j_chain` — 각 compute 노드 뒤에 붙음.
+`claude_judge(stage, ctx_fn)` 팩토리(orchestrator.py:150)로 생성, `build_graph`(orchestrator.py:469) 안에서 `add_node`.
 claude 호출은 `_branch_claude`(orchestrator.py:123) → `_claude_json`(orchestrator.py:92).
-`HARNESS_ON` 에 든 stage 만 동작(`--no_harness` 로 전체 off).
+`JUDGE_ON` 에 든 stage 만 동작(`--no_judge` 로 전체 off).
 
 동작: 해당 노드 결과를 claude 에 주고 `{assessment, verdict, reason, suggestion}` JSON 받음 →
-`_route_harness`: **stop→user_stop / retry→fe_train / 그외→다음 노드**.
+`_route_judge`: **stop→user_stop / retry→fe_train / 그외→다음 노드**.
 
-프롬프트(`_harness_prompt`)는 공통 템플릿에 **stage별 판정 포인트**(`STAGE_FOCUS`)를 주입한다 —
+프롬프트(`_judge_prompt`)는 공통 템플릿에 **stage별 판정 포인트**(`STAGE_FOCUS`)를 주입한다 —
 baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 파일·피처수 일치하나" 처럼
 단계 고유 기준으로 평가(일률 판정 방지). claude 응답이 ```json 펜스로 와도 `_strip_code_fence`
 로 벗겨 파싱한다.
 
-> `h_fe` 만 예외 — `route_after_fe` 가 하네스 verdict + **채택여부**를 결합해 분기
+> `j_fe` 만 예외 — `route_after_fe` 가 판정 verdict + **채택여부**를 결합해 분기
 > (채택O→gate_deploy / 채택X→reco_again 또는 gate_converge / 실패→fe_baseline).
 
 ---
@@ -326,12 +326,12 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 
 | 함수 (코드 위치) | 위치 | 분기 로직 |
 |---|---|---|
-| `route_after_branch_h` orchestrator.py:542 (→`route_after_branch`:418) | h_branch 뒤 | stop이면 user_stop, 아니면 max_runs 체크 → preprocess/fe_baseline/END |
+| `route_after_branch_j` orchestrator.py:542 (→`route_after_branch`:418) | j_branch 뒤 | stop이면 user_stop, 아니면 max_runs 체크 → preprocess/fe_baseline/END |
 | `route_after_preprocess` orchestrator.py:425 | preprocess 뒤 | terminate면 END, 아니면 fe_baseline |
-| `_route_harness(next)` orchestrator.py:170 | 대부분 하네스 | stop→user_stop / retry→fe_train / else→next |
-| `route_after_fe` orchestrator.py:429 | h_fe 뒤 | verdict + 채택여부 결합 (위 설명) |
+| `_route_judge(next)` orchestrator.py:170 | 대부분 판정 | stop→user_stop / retry→fe_train / else→next |
+| `route_after_fe` orchestrator.py:429 | j_fe 뒤 | verdict + 채택여부 결합 (위 설명) |
 | `route_gate_deploy` / `route_gate_release` / `route_gate_converge` | 각 게이트 뒤 | approve→진행 / 그외→user_stop(deploy는 retry→fe_baseline) |
-| `route_after_chain` | h_chain 뒤 | stop/retry 우선 → `iters >= max_runs` 면 **빈 브랜치 안 만들고 END** → 아니면 new_branch (사이클) |
+| `route_after_chain` | j_chain 뒤 | stop/retry 우선 → `iters >= max_runs` 면 **빈 브랜치 안 만들고 END** → 아니면 new_branch (사이클) |
 | `build_graph` | — | 전체 노드·엣지 배선 (그래프 정의) |
 
 ---
@@ -349,14 +349,14 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 | `candidates`, `tried_feats`, `reco_round` | 발명된 후보·시도이력·추천 라운드 |
 | `r` | `_fe_train_eval` 결과 (채택·탐지율·요약·통계·full_extra) |
 | `commit_files`, `build_summary` | 빌드 산출·요약 |
-| `decision`, `harness` | 하네스/게이트 결정·노드별 하네스 결과 |
+| `decision`, `judge` | 판정/게이트 결정·노드별 판정 결과 |
 | `adopted_any`, `terminate` | 채택 발생 여부·종료 플래그 |
 
 ---
 
 ## 6. 사이클 & 종료
 
-- **사이클**: `release → log_run_done → chain → h_chain → new_branch` (다음 브랜치 시작).
+- **사이클**: `release → log_run_done → chain → j_chain → new_branch` (다음 브랜치 시작).
   `recursion_limit = max(80, max_runs × 25)`, `--max_runs`(기본 50)로 무한루프 방지.
 - **수렴 종료**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`(라운드 남으면 재추천)
   → 끝나면 `gate_converge → converge → END`.
@@ -372,19 +372,19 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 `~/.claude/projects/C--Users-imcas-JB-Pirate-King/<uuid>.jsonl` (완료된 브랜치는
 `claude --resume <uuid>` 로 직접 열람 가능).
 
-세션 누적 순서: ① 지식 주입 → ② 하네스들 → ③ 피처 추천 → ④ claude_analyze(FE 상세분석)
+세션 누적 순서: ① 지식 주입 → ② 판정들 → ③ 피처 추천 → ④ claude_analyze(FE 상세분석)
 — 전부 한 대화. 턴마다 모델만 바꿔 resume (맥락 유지 검증됨).
 
 | 경로 | 모델 | 플래그 |
 |---|---|---|
 | 피처 발명(recommend) · FE 상세분석(claude_analyze) | **Opus 4.8** | `--claude_model_heavy` (기본 opus) |
-| 하네스 verdict ×7 · 지식주입/요약 | **Sonnet 4.6** | `--claude_model` (기본 sonnet) |
+| 판정 verdict ×7 · 지식주입/요약 | **Sonnet 4.6** | `--claude_model` (기본 sonnet) |
 
 ### 도메인 지식 주입 (`--knowledge`, 기본 on)
 
 `KNOWLEDGE_FILES`(team-vault ML/보안 4문서: ML IDS 설계, WISA NMEA flooding, 해상 IDS,
 중간발표)를 합쳐(~26K자) 브랜치 세션 **첫 턴**으로 주입 → claude 가 한국어 요약(주요 공격·
-탐지방식·피처 아이디어)을 반환해 Slack 에 표시. 이후 하네스/추천/분석이 이 지식을 알고 수행.
+탐지방식·피처 아이디어)을 반환해 Slack 에 표시. 이후 판정/추천/분석이 이 지식을 알고 수행.
 끄기: `--no-knowledge`.
 
 ### 채택 피처 lambda 영속화
@@ -400,7 +400,7 @@ feature_engineer 가 시작 시 로드. 없으면 다음 run 의 `--initial_extr
 | 싱크 | 내용 |
 |---|---|
 | **`ml/logs/`** (gitignored) | stdout/stderr tee + 모든 Slack 메시지 text(`[HH:MM:SS][브랜치]` 접두사). 시작 시 `run_{시각}.log`, **브랜치 진입마다 `{branch}_{시각}.log` 로 전환** — 파일당 한 브랜치. 머리에 브랜치 구분선 + 풀 claude 세션 uuid |
-| Slack `#ais-pipeline` | 서술 로그 — 시작그리드·지식요약·하네스 verdict·후보표·게이트 |
+| Slack `#ais-pipeline` | 서술 로그 — 시작그리드·지식요약·판정 verdict·후보표·게이트 |
 | Google Sheets | 구조화 지표 5탭 |
 | LangSmith (`.env` 트레이싱) | 노드 span·라우팅·state·latency (관찰 전용) |
 | `ml/deploy/{branch}/` | 릴리즈 산출물 아카이브 — 모델 3파일은 run 브랜치에 커밋, tar.gz 는 복사만(ignore) |
@@ -418,8 +418,8 @@ python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
 # 주요 플래그
 #   --invent N                추천 피처 개수 (기본 5)
 #   --invent_rounds N         수렴 시 재추천 라운드 상한
-#   --no_harness              모든 하네스 끔
-#   --claude_model M          경량 모델 — 하네스·지식요약 (기본 sonnet)
+#   --no_judge              모든 판정 끔
+#   --claude_model M          경량 모델 — 판정·지식요약 (기본 sonnet)
 #   --claude_model_heavy M    심층 모델 — 피처발명·상세분석 (기본 opus)
 #   --knowledge/--no-knowledge  team-vault 지식 주입 (기본 on)
 #   --max_runs N              브랜치 체인 안전 상한 (기본 50)

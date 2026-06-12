@@ -4,7 +4,7 @@ AIS 파이프라인 오케스트레이터 — LangGraph 완전판.
 graph.md 구조도 반영:
   - claude 피처 추천(reco) 노드: 약세 진단 → claude 가 새 후보 피처 발명·검증 → 후보풀 확장.
     수렴(채택0) 시 다른 각도로 재추천 루프(라운드 상한).
-  - 노드별 하네스: 각 compute 노드 뒤 claude -p 하네스 → 분석·판정(continue/retry/stop).
+  - 노드별 판정: 각 compute 노드 뒤 claude -p 판정 → 분석·판정(continue/retry/stop).
   - 사람 게이트: 비가역(배포·커밋) 단계 interrupt() 승인.
   - Sheets: log_sheet(kind) 팩토리로 DRY 로깅.
 
@@ -45,10 +45,10 @@ import ml.integrations.slack_bot as _sb
 import ml.integrations.sheets as _sh
 import ml.integrations.git_manager as git
 
-# 하네스를 켤 노드 (전체). 비용 줄이려면 일부만 남긴다.
-HARNESS_ON = {"new_branch", "baseline", "reco", "fe", "build", "release", "chain"}
+# 판정(judge)을 켤 노드 (전체). 비용 줄이려면 일부만 남긴다.
+JUDGE_ON = {"new_branch", "baseline", "reco", "fe", "build", "release", "chain"}
 
-# 노드별 하네스 판정 포인트 — 같은 템플릿이지만 단계 고유의 관점을 주입해
+# 노드별 판정 포인트 — 같은 템플릿이지만 단계 고유의 관점을 주입해
 # claude 가 그 단계에 맞는 기준으로 평가하게 한다 (일률 판정 방지).
 STAGE_FOCUS = {
     "new_branch": "Whether branch creation and claude-session init are healthy. Almost always continue (stop only on fatal error).",
@@ -160,14 +160,14 @@ class PipelineState(TypedDict, total=False):
     commit_files: list
     build_summary: list
     # 라우팅
-    decision: str             # 하네스/게이트 결정
-    harness: dict             # 노드별 하네스 결과
+    decision: str             # 판정/게이트 결정
+    judge: dict             # 노드별 판정 결과
     adopted_any: bool
     terminate: bool
 
 
 # ─────────────────────────────────────────────
-# 하네스 (claude -p 분석·판정) 노드 팩토리
+# 판정(judge) 노드 팩토리 — claude -p 분석·판정
 # ─────────────────────────────────────────────
 def _claude_json(prompt: str, timeout: int = 120,
                  session: Optional[str] = None, first: bool = False,
@@ -197,7 +197,7 @@ def _claude_json(prompt: str, timeout: int = 120,
                 return json.loads(_strip_code_fence(inner)) if isinstance(inner, str) else inner
             return data
     except Exception as e:
-        print(f"[하네스] claude 호출 실패: {e}")
+        print(f"[판정] claude 호출 실패: {e}")
     return None
 
 
@@ -217,7 +217,7 @@ def _branch_claude(prompt: str, timeout: int = 120, heavy: bool = False) -> Opti
     """브랜치당 claude 세션 1개를 유지하며 호출 — 노드 간 맥락 누적 + 캐시 재사용.
 
     첫 호출은 --session-id 로 RT.claude_sid 세션을 만들고, 이후는 --resume 로
-    이어붙인다. 같은 브랜치의 추천/하네스가 베이스라인·채택 결과를 기억한 채 판정한다.
+    이어붙인다. 같은 브랜치의 추천/판정가 베이스라인·채택 결과를 기억한 채 판정한다.
     세션 id 가 없으면(미설정) stateless 단발 호출로 폴백.
 
     heavy=True 면 창의/심층 작업용 모델(--claude_model_heavy, 기본 opus) 사용 —
@@ -233,7 +233,7 @@ def _branch_claude(prompt: str, timeout: int = 120, heavy: bool = False) -> Opti
 
 def _prime_session(knowledge: str):
     """브랜치 세션을 도메인 지식으로 시드 — 첫 호출(--session-id)로 지식을 넣어두면
-    이후 하네스/추천이 --resume 로 그 지식을 알고 판정·발명한다.
+    이후 판정/추천이 --resume 로 그 지식을 알고 판정·발명한다.
     JSON 파싱 불필요(응답 무시)하므로 _claude_json 대신 직접 호출."""
     if not (knowledge and RT.claude_sid):
         return
@@ -263,7 +263,7 @@ def _prime_session(knowledge: str):
         print(f"[지식주입] 실패(무시): {e}")
 
 
-def _harness_prompt(stage: str, text: str, extra: dict) -> str:
+def _judge_prompt(stage: str, text: str, extra: dict) -> str:
     focus = STAGE_FOCUS.get(stage, "")
     return (
         f"Analyze the [{stage}] node result of the AIS anomaly-detection ML pipeline and decide the next action.\n\n"
@@ -278,30 +278,30 @@ def _harness_prompt(stage: str, text: str, extra: dict) -> str:
     )
 
 
-def claude_harness(stage: str, ctx_fn):
-    """노드 뒤에 붙는 claude -p 하네스 노드 생성.
-    ctx_fn(state) -> (분석 텍스트, extra dict). HARNESS_ON 에 없으면 무판정(continue)."""
+def claude_judge(stage: str, ctx_fn):
+    """노드 뒤에 붙는 claude -p 판정 노드 생성.
+    ctx_fn(state) -> (분석 텍스트, extra dict). JUDGE_ON 에 없으면 무판정(continue)."""
     def node(state: PipelineState) -> dict:
-        if stage not in HARNESS_ON:
+        if stage not in JUDGE_ON:
             return {"decision": "continue"}
         text, extra = ctx_fn(state)
-        v = _branch_claude(_harness_prompt(stage, text, extra)) or {
+        v = _branch_claude(_judge_prompt(stage, text, extra)) or {
             "assessment": "분석 불가(claude 없음)", "verdict": "continue", "reason": "fallback"}
         verdict = v.get("verdict", "continue")
         sug = (v.get("suggestion") or "").strip()
         has_sug = sug and sug.lower() not in ("없음", "none", "n/a", "-", "null", "없음.")
         RT.bot.log(
-            f"🤖 *[{stage}] 하네스* — {v.get('assessment','')}\n"
+            f"🤖 *[{stage}] 판정* — {v.get('assessment','')}\n"
             f"  → *{verdict}*: {v.get('reason','')}"
             + (f"\n  💡 {sug}" if has_sug else ""),
-            "하네스",
+            "판정",
         )
-        return {"harness": {**state.get("harness", {}), stage: v}, "decision": verdict}
+        return {"judge": {**state.get("judge", {}), stage: v}, "decision": verdict}
     return node
 
 
-def _route_harness(continue_to: str):
-    """하네스 verdict → continue_to / fe_train(retry) / user_stop(stop)."""
+def _route_judge(continue_to: str):
+    """판정 verdict → continue_to / fe_train(retry) / user_stop(stop)."""
     def route(state: PipelineState) -> str:
         d = state.get("decision", "continue")
         if d == "stop":
@@ -601,7 +601,7 @@ def route_after_branch(state: PipelineState) -> str:
 
 def route_after_chain(state: PipelineState) -> str:
     """체인 후 라우팅 — 다음 브랜치를 **생성하기 전에** max_runs 가드.
-    하네스 verdict 우선(stop/retry), 그다음 상한 도달 시 빈 브랜치를 만들지 않고 종료.
+    판정 verdict 우선(stop/retry), 그다음 상한 도달 시 빈 브랜치를 만들지 않고 종료.
     (전엔 new_branch 가 빈 브랜치를 만든 뒤 route_after_branch 가 END 처리해 낭비 브랜치가 생겼다.)"""
     d = state.get("decision", "continue")
     if d == "stop":
@@ -619,7 +619,7 @@ def route_after_preprocess(state: PipelineState) -> str:
 
 
 def route_after_fe(state: PipelineState) -> str:
-    """하네스 verdict + 채택여부 결합 라우팅."""
+    """판정 verdict + 채택여부 결합 라우팅."""
     d = state.get("decision", "continue")
     if d == "stop":
         return "user_stop"
@@ -673,35 +673,35 @@ def build_graph(checkpointer=None):
                   ("log_run_done", log_sheet("run_done")), ("log_converge", log_sheet("converge"))]:
         g.add_node(n, fn)
 
-    # 하네스 (코어 뒤)
-    g.add_node("h_branch", claude_harness("new_branch", lambda s: (s.get("branch", ""), {})))
-    g.add_node("h_base", claude_harness("baseline", lambda s: (s["baseline"]["out"], {"det": s["baseline"]["det"]})))
-    g.add_node("h_reco", claude_harness("reco", lambda s: (", ".join(s.get("candidates", [])), {"n": len(s.get("candidates", []))})))
-    g.add_node("h_fe", claude_harness("fe", lambda s: ("\n".join(s["r"].get("summary", [])), s["r"].get("fe_stats", {}))))
-    g.add_node("h_build", claude_harness("build", lambda s: ("\n".join(s.get("build_summary", [])), {})))
-    g.add_node("h_release", claude_harness("release", lambda s: (s["branch"], {"det": s["r"].get("det_str")})))
-    g.add_node("h_chain", claude_harness("chain", lambda s: (", ".join(s.get("current_extra", [])), {})))
+    # 판정 (코어 뒤)
+    g.add_node("j_branch", claude_judge("new_branch", lambda s: (s.get("branch", ""), {})))
+    g.add_node("j_base", claude_judge("baseline", lambda s: (s["baseline"]["out"], {"det": s["baseline"]["det"]})))
+    g.add_node("j_reco", claude_judge("reco", lambda s: (", ".join(s.get("candidates", [])), {"n": len(s.get("candidates", []))})))
+    g.add_node("j_fe", claude_judge("fe", lambda s: ("\n".join(s["r"].get("summary", [])), s["r"].get("fe_stats", {}))))
+    g.add_node("j_build", claude_judge("build", lambda s: ("\n".join(s.get("build_summary", [])), {})))
+    g.add_node("j_release", claude_judge("release", lambda s: (s["branch"], {"det": s["r"].get("det_str")})))
+    g.add_node("j_chain", claude_judge("chain", lambda s: (", ".join(s.get("current_extra", [])), {})))
 
     # 배선
     g.add_edge(START, "new_branch")
     g.add_edge("new_branch", "log_run_start")
-    g.add_edge("log_run_start", "h_branch")
-    g.add_conditional_edges("h_branch", route_after_branch_h,
+    g.add_edge("log_run_start", "j_branch")
+    g.add_conditional_edges("j_branch", route_after_branch_j,
                             {"preprocess": "preprocess", "fe_baseline": "fe_baseline",
                              "user_stop": "user_stop", "END": END})
     g.add_conditional_edges("preprocess", route_after_preprocess,
                             {"fe_baseline": "fe_baseline", "END": END})
 
-    g.add_edge("fe_baseline", "h_base")
-    g.add_conditional_edges("h_base", _route_harness("recommend"),
+    g.add_edge("fe_baseline", "j_base")
+    g.add_conditional_edges("j_base", _route_judge("recommend"),
                             {"recommend": "recommend", "fe_train": "fe_train", "user_stop": "user_stop"})
-    g.add_edge("recommend", "h_reco")
-    g.add_conditional_edges("h_reco", _route_harness("fe_train"),
+    g.add_edge("recommend", "j_reco")
+    g.add_conditional_edges("j_reco", _route_judge("fe_train"),
                             {"fe_train": "fe_train", "user_stop": "user_stop"})
 
     g.add_edge("fe_train", "log_fe")
-    g.add_edge("log_fe", "h_fe")
-    g.add_conditional_edges("h_fe", route_after_fe,
+    g.add_edge("log_fe", "j_fe")
+    g.add_conditional_edges("j_fe", route_after_fe,
                             {"gate_deploy": "gate_deploy", "gate_converge": "gate_converge",
                              "reco_again": "reco_again", "fe_baseline": "fe_baseline",
                              "user_stop": "user_stop"})
@@ -709,17 +709,17 @@ def build_graph(checkpointer=None):
 
     g.add_conditional_edges("gate_deploy", route_gate_deploy,
                             {"build": "build", "fe_baseline": "fe_baseline", "user_stop": "user_stop"})
-    g.add_edge("build", "h_build")
-    g.add_conditional_edges("h_build", _route_harness("gate_release"),
+    g.add_edge("build", "j_build")
+    g.add_conditional_edges("j_build", _route_judge("gate_release"),
                             {"gate_release": "gate_release", "fe_train": "fe_train", "user_stop": "user_stop"})
     g.add_conditional_edges("gate_release", route_gate_release,
                             {"release": "release", "user_stop": "user_stop"})
-    g.add_edge("release", "h_release")
-    g.add_conditional_edges("h_release", _route_harness("log_run_done"),
+    g.add_edge("release", "j_release")
+    g.add_conditional_edges("j_release", _route_judge("log_run_done"),
                             {"log_run_done": "log_run_done", "fe_train": "fe_train", "user_stop": "user_stop"})
     g.add_edge("log_run_done", "chain")
-    g.add_edge("chain", "h_chain")
-    g.add_conditional_edges("h_chain", route_after_chain,
+    g.add_edge("chain", "j_chain")
+    g.add_conditional_edges("j_chain", route_after_chain,
                             {"new_branch": "new_branch", "fe_train": "fe_train",
                              "user_stop": "user_stop", "END": END})
 
@@ -732,8 +732,8 @@ def build_graph(checkpointer=None):
     return g.compile(checkpointer=checkpointer or MemorySaver())
 
 
-def route_after_branch_h(state: PipelineState) -> str:
-    """new_branch 하네스 verdict 먼저(stop), 그다음 max_runs/전처리 분기."""
+def route_after_branch_j(state: PipelineState) -> str:
+    """new_branch 판정 verdict 먼저(stop), 그다음 max_runs/전처리 분기."""
     if state.get("decision") == "stop":
         return "user_stop"
     return route_after_branch(state)
@@ -773,9 +773,9 @@ def main():
     p.add_argument("--auto_approve", action="store_true")
     p.add_argument("--max_runs", type=int, default=50)
     p.add_argument("--build_plugin", action="store_true")
-    p.add_argument("--no_harness", action="store_true", help="모든 하네스 끔")
+    p.add_argument("--no_judge", action="store_true", help="모든 판정 끔")
     p.add_argument("--claude_model", default="sonnet",
-                   help="경량 claude 모델 — 하네스 verdict·지식주입/요약. 기본 'sonnet'.")
+                   help="경량 claude 모델 — 판정 verdict·지식주입/요약. 기본 'sonnet'.")
     p.add_argument("--claude_model_heavy", default="opus",
                    help="심층 claude 모델 — 피처 발명(recommend)·FE 상세분석(claude_analyze). "
                         "기본 'opus'. 같은 브랜치 세션을 모델만 바꿔 resume (맥락 유지).")
@@ -793,8 +793,8 @@ def main():
     print(f"[로그] {_LOG['path']}")
 
     steps._AUTO_APPROVE = args.auto_approve
-    if args.no_harness:
-        HARNESS_ON.clear()
+    if args.no_judge:
+        JUDGE_ON.clear()
 
     cfg = steps.load_config()
     RT.bot = _sb.SlackPipelineBot(cfg["slack"]["bot_token"], cfg["slack"]["app_token"],
