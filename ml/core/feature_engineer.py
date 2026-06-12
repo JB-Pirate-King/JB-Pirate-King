@@ -30,9 +30,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
 # ── 경로 설정 (ml/ 폴더 기준) ─────────────────────────────────────
@@ -59,7 +57,6 @@ from train_benchmark import (
     make_loaders,
     train_standard,
     SEED,
-    VAL_RATIO,
 )
 
 # FE 지원 모델 (모두 단일 재구성 AE → 점수 ((out-x)^2).mean() / 제네릭 ONNX export 호환).
@@ -531,7 +528,6 @@ def evaluate(
 
     # extra_fp 출력 (FP=1% 도 같은 [FP≈N%] 형식으로 함께 표기 → Slack 일관성)
     if extra_fp:
-        W = 52
         print(f"\n  [FP≈1%] 평균 탐지율 {float(np.mean(all_dets)):.1f}%")
         for fp in sorted(extra_fp):
             sc_dets = extra_results[fp]

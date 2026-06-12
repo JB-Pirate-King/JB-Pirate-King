@@ -16,17 +16,23 @@ ml/
 │   ├── feature_engineer.py  # DCdetect Greedy FE + ONNX export ★
 │   └── patch_plugin.py      # C++ plugin auto-patch
 ├── integrations/            # External integrations
-│   ├── slack_bot.py         # Slack bot (logs, button approval, Claude queries)
+│   ├── slack_bot.py         # Slack bot (logs, button approval)
 │   ├── sheets.py            # Google Sheets logging
 │   ├── notify.py            # Discord + Notion reports
 │   └── git_manager.py       # Auto branch creation / commit
-├── orchestrator.py          # Full pipeline entry point ★
-├── orchestrator_lg.py       # LangGraph port (interrupt-gated HITL) ★
-├── reset_sheets.py          # Utility: clear all Google Sheets tabs (keep headers)
-├── fe_state.json            # FE starting features (initial_extra)
-├── auto_feat_eng.py         # FE automation loop
-├── build_3yr_dataset.py     # 2023–2025 balanced dataset builder
-└── download_ais.py          # AIS raw data downloader
+├── scripts/                 # Standalone CLI tools (run directly, not imported)
+│   ├── auto_feat_eng.py     # FE automation loop
+│   ├── build_3yr_dataset.py # 2023–2025 balanced dataset builder
+│   ├── download_ais.py      # AIS raw data downloader
+│   └── reset_sheets.py      # Utility: clear all Google Sheets tabs (keep headers)
+├── config/                  # Config + state (secrets gitignored)
+│   ├── pipeline_config.json         # Slack/Sheets config (gitignored)
+│   ├── pipeline_config.example.json # Template (tracked)
+│   ├── google_credentials.json      # GCP service account (gitignored)
+│   ├── notify_config.json           # Discord/Notion tokens (gitignored)
+│   └── fe_state.json                # FE starting features / initial_extra (tracked)
+├── orchestrator.py          # LangGraph orchestrator entry point ★
+└── pipeline_steps.py        # Shared step library ★
 ```
 
 ---

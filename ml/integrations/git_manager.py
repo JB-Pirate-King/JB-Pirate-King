@@ -29,8 +29,11 @@ def get_next_run_num(model: str) -> int:
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=30,
     )
-    branches = _run(["git", "branch", "-a"]).splitlines()
-    pattern = re.compile(rf"^\s*(?:remotes/(?:origin|upstream)/)?{re.escape(model)}_(\d+)$")
+    # %(refname:short) 사용 — 현재 브랜치 '* ' 마커/remotes/ 접두사 없이 순수 이름.
+    # ('git branch -a' 는 현재 브랜치를 '* name' 으로 출력해 ^\s* 정규식이 빼먹어,
+    #  원격 ref 가 없을 때 같은 번호를 재발급(001 중복)하는 버그가 있었다.)
+    branches = _run(["git", "branch", "-a", "--format=%(refname:short)"]).splitlines()
+    pattern = re.compile(rf"^(?:(?:origin|upstream)/)?{re.escape(model)}_(\d+)$")
     nums = []
     for b in branches:
         m = pattern.match(b)

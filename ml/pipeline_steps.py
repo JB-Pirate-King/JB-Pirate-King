@@ -11,7 +11,6 @@ AIS 파이프라인 — 공용 실행 함수 라이브러리 (steps).
 
 > 직접 실행 진입점 아님. `python -m ml.orchestrator` 로 그래프를 돌린다.
 """
-import argparse
 import json
 import os
 import re
@@ -24,11 +23,9 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-import ml.integrations.slack_bot as _sb
-import ml.integrations.sheets as _sh
 import ml.integrations.git_manager as git
 
-CONFIG_PATH = "ml/pipeline_config.json"
+CONFIG_PATH = "ml/config/pipeline_config.json"
 
 from ml.core.constants import BASE_FEATURES   # 단일 출처 (ml/core/constants.py)
 
@@ -175,7 +172,7 @@ def _parse_fe(out: str) -> list[str]:
 # ─────────────────────────────────────────────
 
 def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
-                   extra: dict = None) -> list[str]:
+                   extra: dict = None, model: str = None) -> list[str]:
     """claude -p 로 단계 결과 분석 → Slack 메시지 라인 목록 반환.
     [피처개선] 단계는 매우 상세한 다중 섹션 분석, 그 외는 간결 분석."""
     extra_str = json.dumps(extra or {}, ensure_ascii=False)
@@ -184,14 +181,16 @@ def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
         # FE 결과: 후보 평가표·시나리오·중요도가 출력 뒤쪽에 있어 충분히 길게 전달
         last_lines = "\n".join(out.splitlines()[-150:])
         prompt = (
-            "당신은 AIS 선박 이상탐지(비지도 재구성 오토인코더 DCdetect) ML 파이프라인의 "
-            "수석 분석가입니다. 방금 끝난 [피처 엔지니어링] 단계 결과를 **매우 상세히** 분석하세요.\n\n"
-            f"성공: {'예' if success else '아니오'} | 소요: {elapsed:.0f}초\n"
-            f"핵심 지표(JSON): {extra_str}\n\n"
-            f"=== 실행 출력 (마지막 150줄: 베이스라인·후보별 탐지율/목적점수·채택·재학습·최종 FP1/5/10·순열중요도) ===\n"
+            "You are the lead analyst of an AIS ship anomaly-detection ML pipeline "
+            "(unsupervised reconstruction autoencoder, DCdetect). Analyze the just-finished "
+            "[feature engineering] stage result in **great detail**.\n\n"
+            f"Success: {'yes' if success else 'no'} | Elapsed: {elapsed:.0f}s\n"
+            f"Key metrics (JSON): {extra_str}\n\n"
+            "=== Run output (last 150 lines: baseline, per-candidate detection/objective, "
+            "adoption, retrain, final FP1/5/10, permutation importance) ===\n"
             f"{last_lines}\n\n"
-            "아래 5개 항목을 한국어로, 각 항목 3~5문장씩 **구체적 수치를 인용**하며 상세히 작성하세요 "
-            "(전체 1500자 내외, 항목 번호와 제목 유지):\n"
+            "Write the answer in KOREAN (shown to the operator in Slack), each item 3-5 sentences "
+            "**citing concrete numbers**, ~1500 chars total, keeping the item numbers and titles:\n"
             "1. 📊 결과 평가: 베이스라인→최종 탐지율 변화(pp), 채택 피처 수, FP=1/5/10 비교. "
             "이번 iter이 성공적인지/미미한지 판단.\n"
             "2. 🧬 채택 피처 분석: 어떤 피처가 채택됐고 목적점수가 왜 올랐는지, "
@@ -206,21 +205,23 @@ def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
     else:
         last_lines = "\n".join(out.splitlines()[-60:])
         prompt = (
-            f"AIS 이상탐지 ML 파이프라인 [{stage}] 단계 결과를 분석해줘.\n\n"
-            f"성공 여부: {'성공' if success else '실패'} | 소요: {elapsed:.0f}초\n"
-            f"추가 정보: {extra_str}\n\n"
-            f"실행 출력 (마지막 60줄):\n{last_lines}\n\n"
-            f"아래 3가지를 한국어로 항목별 2~3문장씩 상세히 답해:\n"
-            f"1. 결과 평가: 정상인지 문제가 있는지, 핵심 수치 해석\n"
-            f"2. 원인/근거: 왜 이 결과가 나왔는지\n"
-            f"3. 다음 행동 추천: continue / retry / stop 중 하나 + 이유\n"
+            f"Analyze the [{stage}] stage result of the AIS anomaly-detection ML pipeline.\n\n"
+            f"Success: {'success' if success else 'failure'} | Elapsed: {elapsed:.0f}s\n"
+            f"Extra info: {extra_str}\n\n"
+            f"Run output (last 60 lines):\n{last_lines}\n\n"
+            "Answer in KOREAN (shown to the operator in Slack), 2-3 sentences per item:\n"
+            "1. 결과 평가: 정상인지 문제가 있는지, 핵심 수치 해석\n"
+            "2. 원인/근거: 왜 이 결과가 나왔는지\n"
+            "3. 다음 행동 추천: continue / retry / stop 중 하나 + 이유\n"
         )
         timeout = 120
 
+    cmd = ["claude", "-p", prompt, "--output-format", "text"]
+    if model:
+        cmd += ["--model", model]
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -310,7 +311,8 @@ def stage_preprocess(bot, sheet, branch, args, step_info: tuple):
         )
         elapsed = time.time() - t0
         details  = _parse_preprocess(out)
-        analysis = claude_analyze("전처리", out, ret == 0, elapsed)
+        analysis = claude_analyze("전처리", out, ret == 0, elapsed,
+                                  model=getattr(args, "claude_model", None))
 
         hdr = _step_header(cur, total, "전처리", next_name)
         if ret != 0:
@@ -536,7 +538,7 @@ def stage_release(bot, args, branch: str, run_num: int,
         bot.log(f"⚠ 릴리스 실패 (수동 생성 필요)\n{out[-300:]}", "릴리스")
 
 
-FE_STATE_FILE = "ml/fe_state.json"
+FE_STATE_FILE = "ml/config/fe_state.json"
 
 
 def _load_fe_initial_extra() -> list[str]:
@@ -649,11 +651,11 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
         # 최종 FP별 평균: "FP=1%: X%  FP=5%: Y%  FP=10%: Z%"
         mfp = re.search(r"FP=1%:\s*([\d.]+)%\s+FP=5%:\s*([\d.]+)%\s+FP=10%:\s*([\d.]+)%", s)
         if mfp:
-            bot.log(
-                f"📈 *최종 탐지율* — FP=1%: *{mfp.group(1)}%*  ·  "
-                f"FP=5%: {mfp.group(2)}%  ·  FP=10%: {mfp.group(3)}%",
-                "피처개선"
-            )
+            bot.log_metrics("최종 탐지율 (FP 레벨별)", {
+                "FP = 1%  (배포 기준)": f"{mfp.group(1)}%",
+                "FP = 5%": f"{mfp.group(2)}%",
+                "FP = 10%": f"{mfp.group(3)}%",
+            }, emoji="📈")
             return
 
         # 최종 [FP≈N%] 평균 (참고)
@@ -765,7 +767,8 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
 
     if ret != 0:
         fe_details = _parse_fe(out)
-        analysis = claude_analyze("피처개선", out, False, elapsed)
+        analysis = claude_analyze("피처개선", out, False, elapsed,
+                                  model=getattr(args, "claude_model", None))
         summary = (["❌ 피처 엔지니어링 실패", f"소요: {elapsed:.0f}s"]
                    + fe_details + ["─"] + analysis)
         bot.log_stage_result("피처개선", summary, success=False)
@@ -825,7 +828,7 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
     analysis = claude_analyze("피처개선", out, bool(newly_adopted), elapsed, {
         "newly_adopted": newly_adopted,
         "det_rate": det_rate, "baseline_det": baseline_det, "n_feat": n_feat
-    })
+    }, model=getattr(args, "claude_model", None))
     bot.log("\n".join(analysis), "피처개선")
 
     if candidates:

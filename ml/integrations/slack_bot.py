@@ -1,18 +1,12 @@
 """
-Slack 파이프라인 봇 — 로그 전송 + 버튼 승인 대기 + Claude 원격 프롬프트
-
-채널에서 !<질문> 또는 ?<질문> 으로 Claude에게 질문 가능:
-  예) !FE 결과 분석해줘
-  예) ?현재 탐지율이 낮은 이유가 뭐야
+Slack 파이프라인 봇 — 로그 전송 + 버튼 승인 대기
 """
-import subprocess
 import sys
 import threading
 import json
 import time
 import uuid
 from datetime import datetime
-from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -73,56 +67,6 @@ class SlackPipelineBot:
         def handle_stop_step(ack, body):
             self._resolve(body, ack, "■ 스텝 종료", "stop_step")
 
-        @self.app.event("message")
-        def handle_message(event, say):
-            text = (event.get("text") or "").strip()
-            bot_id = event.get("bot_id")
-            if bot_id:   # 봇 자신의 메시지 무시
-                return
-            if not (text.startswith("!") or text.startswith("?")):
-                return
-            prompt = text.lstrip("!?").strip()
-            if not prompt:
-                return
-            # 컨텍스트 파일 수집 (최신 FE JSON 있으면 포함)
-            context = self._collect_context()
-            full_prompt = (
-                "AIS 이상탐지 ML 파이프라인 운영 중 질문이 들어왔습니다.\n\n"
-                f"=== 파이프라인 컨텍스트 ===\n{context}\n\n"
-                f"=== 질문 ===\n{prompt}\n\n"
-                "한국어로 간결하게 답변해주세요. (300자 이내)"
-            )
-            say(f"🤖 Claude 분석 중... (`{prompt[:40]}`)")
-            try:
-                result = subprocess.run(
-                    ["claude", "-p", full_prompt, "--output-format", "text"],
-                    capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", timeout=120
-                )
-                answer = result.stdout.strip() if result.returncode == 0 else "(응답 실패)"
-            except FileNotFoundError:
-                answer = "Claude CLI를 찾을 수 없습니다. `claude` 명령어가 PATH에 있는지 확인하세요."
-            except Exception as e:
-                answer = f"오류: {e}"
-            say(f"🤖 *Claude 답변*\n{answer}")
-
-    def _collect_context(self) -> str:
-        """최신 FE JSON + 파이프라인 상태를 컨텍스트 문자열로 반환"""
-        lines = []
-        for search_dir in ["D:/ais_output/feat_eng_iter", "C:/Users/imcas/JB-Pirate-King/ais_output/feat_eng_iter"]:
-            p = Path(search_dir)
-            if p.exists():
-                jsons = sorted(p.glob("feat_eng_iter*.json"))
-                if jsons:
-                    with open(jsons[-1], encoding="utf-8") as f:
-                        data = json.load(f)
-                    lines.append(f"최신 FE 결과 ({jsons[-1].name}):")
-                    lines.append(f"  탐지율: {data.get('best_det', '-')}")
-                    lines.append(f"  채택 피처: {data.get('best_extra', [])}")
-                    lines.append(f"  임계값: {data.get('threshold', '-')}")
-                    break
-        return "\n".join(lines) if lines else "FE 결과 파일 없음"
-
     def _update_buttons(self, body, result_text):
         self.app.client.chat_update(
             channel=body["channel"]["id"],
@@ -164,6 +108,34 @@ class SlackPipelineBot:
         "info": "ℹ️", "success": "✅", "warning": "⚠️", "error": "❌"
     }
 
+    # ── Block Kit 헬퍼 (메시지를 표/그리드로 보기 좋게) ──────────────
+    @staticmethod
+    def _fields(pairs):
+        """dict 또는 (k,v) 리스트 → section fields (2열 그리드, 최대 10쌍).
+        텍스트 줄나열보다 키-값이 칸으로 정렬돼 한눈에 들어온다."""
+        items = list(pairs.items() if isinstance(pairs, dict) else pairs)
+        fields = [{"type": "mrkdwn", "text": f"*{k}*\n{v}"} for k, v in items[:10]]
+        return {"type": "section", "fields": fields}
+
+    @staticmethod
+    def _context(text):
+        """하단 회색 소형 메타 줄 (타임스탬프/행수 등)."""
+        return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+    @staticmethod
+    def _now(fmt="%H:%M:%S"):
+        return datetime.now().strftime(fmt)
+
+    def log_metrics(self, title: str, pairs, emoji: str = "📈", success: bool = True):
+        """지표 묶음을 2열 그리드로 — 탐지율/임계값 등 요약에 사용.
+        pairs: dict 또는 (라벨, 값) 리스트."""
+        head = {"type": "section",
+                "text": {"type": "mrkdwn", "text": f"{emoji} *{title}*"}}
+        self.app.client.chat_postMessage(
+            channel=self.channel, text=title,
+            blocks=[head, self._fields(pairs), self._context(f"🕐 {self._now()}")],
+        )
+
     def log(self, message: str, level: str = "info"):
         # 메시지가 이미 이모지/기호로 시작하면 level 이모지를 덧붙이지 않음 (이중 이모지 방지)
         first = message.lstrip()[:1]
@@ -175,8 +147,7 @@ class SlackPipelineBot:
         )
 
     def log_run_start(self, branch: str, params: dict):
-        """파이프라인 시작 — 굵은 헤더로 구분"""
-        lines = "\n".join(f">  • *{k}*: {v}" for k, v in params.items())
+        """파이프라인 시작 — 헤더 + 파라미터 2열 그리드"""
         self.app.client.chat_postMessage(
             channel=self.channel,
             text=f"🚀 파이프라인 시작: {branch}",
@@ -186,25 +157,23 @@ class SlackPipelineBot:
                     "type": "header",
                     "text": {"type": "plain_text", "text": f"🚀  {branch}  파이프라인 시작"}
                 },
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": lines}
-                },
+                self._fields(params),
+                self._context(f"🕐 {self._now('%Y-%m-%d %H:%M:%S')}"),
                 {"type": "divider"},
             ]
         )
 
     def log_stage_start(self, stage: str, detail: str = ""):
+        """스테이지 시작 — 구분선 + 헤더로 강하게 끊어 묶음 경계를 만든다."""
         emoji = self.STAGE_EMOJI.get(stage, "▶️")
+        blocks = [
+            {"type": "divider"},
+            {"type": "header", "text": {"type": "plain_text", "text": f"{emoji}  {stage}"}},
+        ]
+        if detail:
+            blocks.append(self._context(detail))
         self.app.client.chat_postMessage(
-            channel=self.channel,
-            text=f"{emoji} [{stage}] 시작",
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"{emoji}  *[{stage}] 시작*" + (f"\n> {detail}" if detail else "")}
-                }
-            ]
+            channel=self.channel, text=f"{emoji} [{stage}] 시작", blocks=blocks,
         )
 
     def log_stage_result(self, stage: str, lines: list[str], success: bool):
@@ -218,7 +187,8 @@ class SlackPipelineBot:
                 {
                     "type": "section",
                     "text": {"type": "mrkdwn", "text": f"{emoji}  *[{stage}] {status}*\n{body}"}
-                }
+                },
+                self._context(f"🕐 {self._now()}"),
             ]
         )
 
@@ -226,16 +196,21 @@ class SlackPipelineBot:
         """코드블록 테이블 전송 (긴 정보용)"""
         body = "\n".join(rows)
         # Slack 코드블록 3000자 제한 안전 처리
-        if len(body) > 2800:
+        truncated = len(body) > 2800
+        if truncated:
             body = body[:2800] + "\n... (생략)"
         self.app.client.chat_postMessage(
             channel=self.channel,
             text=title,
-            blocks=[{
-                "type": "section",
-                "text": {"type": "mrkdwn",
-                         "text": f"{emoji} *{title}*\n```\n{body}\n```"}
-            }]
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn",
+                             "text": f"{emoji} *{title}*\n```\n{body}\n```"}
+                },
+                self._context(f"📑 {len(rows)}행" + (" · 일부 생략" if truncated else "")
+                              + f"  ·  🕐 {self._now()}"),
+            ]
         )
 
     # 승인 대기 최대 시간 (초). 초과 시 안전하게 'stop' (자동 배포 방지).
@@ -351,7 +326,7 @@ class SlackPipelineBot:
         return self._decision
 
 
-def from_config(config_path: str = "ml/pipeline_config.json") -> SlackPipelineBot:
+def from_config(config_path: str = "ml/config/pipeline_config.json") -> SlackPipelineBot:
     with open(config_path, encoding="utf-8") as f:
         cfg = json.load(f)
     return SlackPipelineBot(

@@ -21,7 +21,7 @@ import json
 import os
 import subprocess
 import sys
-import time
+import uuid
 from pathlib import Path
 from typing import Optional, TypedDict
 
@@ -47,6 +47,21 @@ import ml.integrations.git_manager as git
 # 하네스를 켤 노드 (전체). 비용 줄이려면 일부만 남긴다.
 HARNESS_ON = {"new_branch", "baseline", "reco", "fe", "build", "release", "chain"}
 
+# 노드별 하네스 판정 포인트 — 같은 템플릿이지만 단계 고유의 관점을 주입해
+# claude 가 그 단계에 맞는 기준으로 평가하게 한다 (일률 판정 방지).
+STAGE_FOCUS = {
+    "new_branch": "Whether branch creation and claude-session init are healthy. Almost always continue (stop only on fatal error).",
+    "baseline":   "Whether the baseline detection rate is a valid FE starting point and the weak scenarios are addressable by feature recommendation. "
+                  "If abnormally low (data/training defect) or broadly 0%, consider retry/stop.",
+    "reco":       "Whether the invented candidates target the weak scenarios and are not duplicate or meaningless. "
+                  "If 0 candidates or all unsuitable, retry.",
+    "fe":         "Whether the adopted feature's objective-score gain is robust (suspect winner's curse / overfitting) "
+                  "and there is no overall FP=1% regression. Zero adoption is a convergence signal, not an error.",
+    "build":      "Whether the C++ patch (5 markers) was applied and the 3 model files were copied without omission, and the feature count (ML_FEATURE_COUNT) matches.",
+    "release":    "Whether the commit and GitHub release artifacts are correct, with no missing attachments.",
+    "chain":      "Whether the adopted feature set was saved to fe_state and the state is ready to continue to the next branch.",
+}
+
 # 추천 피처를 feature_engineer 가 읽는 동적 후보 파일 (feature_engineer 가 exec 로드)
 DYNAMIC_CAND_PATH = "ml/dynamic_candidates.py"
 
@@ -55,6 +70,8 @@ class _Runtime:
     bot = None
     sheet = None
     args = None
+    claude_sid = None        # 브랜치당 claude 세션 id (노드 간 맥락 누적)
+    claude_started = False   # 해당 세션 첫 호출 여부 (--session-id vs --resume)
 
 RT = _Runtime()
 
@@ -87,11 +104,21 @@ class PipelineState(TypedDict, total=False):
 # ─────────────────────────────────────────────
 # 하네스 (claude -p 분석·판정) 노드 팩토리
 # ─────────────────────────────────────────────
-def _claude_json(prompt: str, timeout: int = 120) -> Optional[dict]:
-    """claude -p --output-format json 호출 → dict. 실패 시 None."""
+def _claude_json(prompt: str, timeout: int = 120,
+                 session: Optional[str] = None, first: bool = False,
+                 model: Optional[str] = None) -> Optional[dict]:
+    """claude -p --output-format json 호출 → dict. 실패 시 None.
+
+    session 지정 시 브랜치 세션에 묶음: 첫 호출(first=True)은 --session-id 로
+    세션 생성, 이후는 --resume 로 같은 대화를 이어가 맥락이 누적된다."""
+    cmd = ["claude", "-p", prompt, "--output-format", "json"]
+    if model:
+        cmd += ["--model", model]
+    if session:
+        cmd += (["--session-id", session] if first else ["--resume", session])
     try:
         out = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "json"],
+            cmd,
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=timeout,
         )
@@ -101,22 +128,53 @@ def _claude_json(prompt: str, timeout: int = 120) -> Optional[dict]:
             data = json.loads(raw)
             if isinstance(data, dict) and "result" in data:
                 inner = data["result"]
-                return json.loads(inner) if isinstance(inner, str) else inner
+                # 모델이 ```json … ``` 코드펜스로 감싸 반환하면 json.loads 가 char 0 에서 실패한다.
+                return json.loads(_strip_code_fence(inner)) if isinstance(inner, str) else inner
             return data
     except Exception as e:
         print(f"[하네스] claude 호출 실패: {e}")
     return None
 
 
+def _strip_code_fence(text: str) -> str:
+    """모델 응답에서 ```json … ``` / ``` … ``` 코드펜스를 벗겨 순수 JSON 만 남긴다.
+    펜스가 없으면 원문 그대로. 펜스 안에 JSON 이 있으면 그것만 반환."""
+    t = text.strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
+        t = t[nl + 1:] if nl != -1 else t[3:]   # 첫 줄(```json) 제거
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]                  # 닫는 ``` 제거
+    return t.strip()
+
+
+def _branch_claude(prompt: str, timeout: int = 120) -> Optional[dict]:
+    """브랜치당 claude 세션 1개를 유지하며 호출 — 노드 간 맥락 누적 + 캐시 재사용.
+
+    첫 호출은 --session-id 로 RT.claude_sid 세션을 만들고, 이후는 --resume 로
+    이어붙인다. 같은 브랜치의 추천/하네스가 베이스라인·채택 결과를 기억한 채 판정한다.
+    세션 id 가 없으면(미설정) stateless 단발 호출로 폴백."""
+    sid = RT.claude_sid
+    first = not RT.claude_started
+    model = getattr(RT.args, "claude_model", None)   # 브랜치 세션 전체 동일 모델
+    out = _claude_json(prompt, timeout, session=sid, first=first, model=model)
+    if sid:
+        RT.claude_started = True   # 생성 시도 후엔 항상 resume (턴은 이미 기록됨)
+    return out
+
+
 def _harness_prompt(stage: str, text: str, extra: dict) -> str:
+    focus = STAGE_FOCUS.get(stage, "")
     return (
-        f"AIS 이상탐지 ML 파이프라인 [{stage}] 노드 결과를 분석하고 다음 행동을 판정하라.\n\n"
-        f"핵심지표(JSON): {json.dumps(extra, ensure_ascii=False)}\n\n"
-        f"=== 출력(마지막 부분) ===\n{text[-2500:]}\n\n"
-        "아래 JSON 만 출력(설명 산문 금지):\n"
+        f"Analyze the [{stage}] node result of the AIS anomaly-detection ML pipeline and decide the next action.\n\n"
+        + (f"Judging focus for this stage: {focus}\n\n" if focus else "")
+        + f"Key metrics (JSON): {json.dumps(extra, ensure_ascii=False)}\n\n"
+        f"=== Node output (tail) ===\n{text[-2500:]}\n\n"
+        "Output ONLY the JSON below (no prose). Write assessment/evidence/reason/suggestion in KOREAN "
+        "(they are shown to the operator in Slack):\n"
         '{"assessment":"수치 요약 1~2문장","evidence":"근거","verdict":"continue|retry|stop",'
         '"reason":"판정 근거","suggestion":"있으면 다음 개선 아이디어"}\n'
-        "verdict 규칙: 정상 진행=continue / 일시오류·재실행 권장=retry / 치명·중단 권장=stop."
+        "verdict rules: normal progress=continue / transient error, rerun advised=retry / fatal, stop advised=stop."
     )
 
 
@@ -127,13 +185,15 @@ def claude_harness(stage: str, ctx_fn):
         if stage not in HARNESS_ON:
             return {"decision": "continue"}
         text, extra = ctx_fn(state)
-        v = _claude_json(_harness_prompt(stage, text, extra)) or {
+        v = _branch_claude(_harness_prompt(stage, text, extra)) or {
             "assessment": "분석 불가(claude 없음)", "verdict": "continue", "reason": "fallback"}
         verdict = v.get("verdict", "continue")
+        sug = (v.get("suggestion") or "").strip()
+        has_sug = sug and sug.lower() not in ("없음", "none", "n/a", "-", "null", "없음.")
         RT.bot.log(
             f"🤖 *[{stage}] 하네스* — {v.get('assessment','')}\n"
             f"  → *{verdict}*: {v.get('reason','')}"
-            + (f"\n  💡 {v['suggestion']}" if v.get("suggestion") else ""),
+            + (f"\n  💡 {sug}" if has_sug else ""),
             "하네스",
         )
         return {"harness": {**state.get("harness", {}), stage: v}, "decision": verdict}
@@ -209,11 +269,15 @@ def _step_info(name: str, run_preprocess: bool) -> tuple:
 def n_new_branch(state: PipelineState) -> dict:
     run_num = git.get_next_run_num(RT.args.model)
     branch = git.create_branch(RT.args.model, run_num)
+    # 새 브랜치마다 새 claude 세션 — 노드 간 맥락은 누적하되 브랜치 간엔 격리.
+    RT.claude_sid = str(uuid.uuid4())
+    RT.claude_started = False
     RT.bot.log_run_start(branch, {
         "모델": RT.args.model, "epochs": RT.args.epochs, "max_mmsi": RT.args.max_mmsi,
         "데이터": RT.args.data_file, "base_dir": RT.args.base_dir,
         "베이스 피처": f"{len(steps.BASE_FEATURES)}개",
         "출발 피처": f"{len(state.get('current_extra', []))}개 (기채택)",
+        "claude세션": RT.claude_sid[:8],
     })
     return {"run_num": run_num, "branch": branch, "iters": state.get("iters", 0) + 1}
 
@@ -253,17 +317,18 @@ def n_fe_baseline(state: PipelineState) -> dict:
 
 
 def _reco_prompt(weak: str, tried: list, base_det) -> str:
-    avoid = ("\n시도했으나 효과없던 피처(회피): " + ", ".join(tried)) if tried else ""
+    avoid = ("\nFeatures already tried without effect (avoid): " + ", ".join(tried)) if tried else ""
     return (
-        "AIS 이상탐지 DCdetect 의 피처 엔지니어다. 아래 약세 시나리오를 포착할 새 파생 피처를 "
-        f"{RT.args.invent}개 발명하라. 베이스 탐지율 {base_det}%.{avoid}\n"
-        f"약세: {weak}\n\n"
-        "JSON 배열만 출력(설명 금지). 각 원소:\n"
-        '{"name":"snake_case","desc":"한줄","lambda_src":"lambda seq,t: ...",'
-        '"target_scenario":"타겟"}\n'
-        '컬럼 접근 seq[t][_B["sog"]]. BASE 12: sog,cog,heading,status,dt,dist_km,'
+        "You are the feature engineer for the AIS anomaly-detection model DCdetect. "
+        f"Invent {RT.args.invent} new derived features that capture the weak scenarios below. "
+        f"Baseline detection rate {base_det}%.{avoid}\n"
+        f"Weak scenarios: {weak}\n\n"
+        "Output ONLY a JSON array (no prose). Each element (write `desc` in KOREAN — it is shown in Slack):\n"
+        '{"name":"snake_case","desc":"한줄 설명","lambda_src":"lambda seq,t: ...",'
+        '"target_scenario":"target"}\n'
+        'Column access seq[t][_B["sog"]]. BASE 12: sog,cog,heading,status,dt,dist_km,'
         "cog_hdg_diff,sog_change,cog_hdg_change,speed_consistency,lat_speed,lon_speed. "
-        "이전행 seq[t-1] 은 if t>0 else 0.0 가드, 0나눗셈 max(x,1e-6). 순수함수."
+        "Guard previous row seq[t-1] with `if t>0 else 0.0`; guard zero-division with max(x,1e-6). Pure function."
     )
 
 
@@ -271,7 +336,7 @@ def n_recommend(state: PipelineState) -> dict:
     """claude 피처 추천 → 검증 → dynamic_candidates.py 기록 → 후보풀 확장."""
     weak = state.get("baseline", {}).get("weak", "")
     tried = state.get("tried_feats", [])
-    arr = _claude_json(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")), timeout=240)
+    arr = _branch_claude(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")), timeout=240)
     cands = _validate_recos(arr if isinstance(arr, list) else [])
     if cands:
         _write_dynamic_candidates(cands)
@@ -550,6 +615,10 @@ def main():
     p.add_argument("--max_runs", type=int, default=50)
     p.add_argument("--build_plugin", action="store_true")
     p.add_argument("--no_harness", action="store_true", help="모든 하네스 끔")
+    p.add_argument("--claude_model", default="sonnet",
+                   help="하네스/추천 claude 모델 (브랜치 세션 전체 공통). "
+                        "기본 'sonnet'(4.6) — verdict/추천엔 충분, Opus 대비 비용↓. "
+                        "'opus'로 올리거나 'haiku'로 더 낮춤.")
     args = p.parse_args()
 
     steps._AUTO_APPROVE = args.auto_approve
@@ -559,6 +628,7 @@ def main():
     cfg = steps.load_config()
     RT.bot = _sb.SlackPipelineBot(cfg["slack"]["bot_token"], cfg["slack"]["app_token"],
                                   cfg["slack"]["channel"])
+
     RT.sheet = _sh.PipelineSheets(cfg["google_sheets"]["credentials_file"],
                                   cfg["google_sheets"]["sheet_id"])
     RT.args = args

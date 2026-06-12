@@ -1,8 +1,8 @@
 """일회용: 마스터 시트의 모델별 탭 데이터를 비움 (헤더 유지).
 
 사용:
-  python -m ml.reset_sheets            # 허브에 등록된 모든 모델 탭 비움
-  python -m ml.reset_sheets conv1d     # 특정 모델 탭만 비움
+  python -m ml.scripts.reset_sheets            # 허브에 등록된 모든 모델 탭 비움
+  python -m ml.scripts.reset_sheets conv1d     # 특정 모델 탭만 비움
 """
 import sys
 from ml.integrations.sheets import from_config, FIXED_TABS

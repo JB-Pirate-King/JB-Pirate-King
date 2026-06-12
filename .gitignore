@@ -15,8 +15,11 @@ ml/output/
 # (pipeline.py --base_dir 사용 시에는 D:\ais_models\ 로 저장)
 ml/*.onnx
 ml/*.json
-!ml/fe_state.json
-!ml/pipeline_config.example.json
+# config/ 로 이동된 설정 — 시크릿(pipeline_config/google_credentials/notify_config) 무시,
+# 추적 대상(example/fe_state)만 negation 으로 되살림. negation 은 ignore 패턴 뒤에 와야 함.
+ml/config/*.json
+!ml/config/fe_state.json
+!ml/config/pipeline_config.example.json
 ml/threshold*.txt
 ml/eval_result_*.txt
 

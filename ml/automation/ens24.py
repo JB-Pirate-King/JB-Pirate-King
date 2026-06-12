@@ -60,7 +60,6 @@ if "C:\\pylibs" not in sys.path:
 _saved_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
 try:
-    import eval_anomaly as ea
     import pipeline as pl
     import train_benchmark as tb
     from eval_anomaly import SCENARIO_MAKERS, scale_seq
@@ -78,8 +77,8 @@ SK     = ["iforest", "ocsvm"]            # train_benchmark CLI 미지원 → in-
 
 # ── notify 설정 (BOM 대응) ───────────────────────────────────────────
 def _load_notify_cfg() -> dict:
-    for p in (os.path.join(_ML, "notify_config.json"),
-              r"C:\ccit\JB-Pirate-King\ml\notify_config.json"):
+    for p in (os.path.join(_ML, "config", "notify_config.json"),
+              r"C:\ccit\JB-Pirate-King\ml\config\notify_config.json"):
         if os.path.exists(p):
             try:
                 with open(p, encoding="utf-8-sig") as f:
@@ -261,7 +260,7 @@ def _grade(v: float, hi: float, mid: float) -> str:
 
 
 def analyze_individual(name: str, m: dict) -> str:
-    tpr, pr, roc, f1 = m["tpr_fp1"], m["pr_auc"], m["roc_auc"], m["f1"]
+    tpr, pr, roc = m["tpr_fp1"], m["pr_auc"], m["roc_auc"]
     weak = sorted(m.get("per_scenario", {}).items(), key=lambda kv: kv[1])[:3]
     weak_s = ", ".join(f"{k} {v:.0f}%" for k, v in weak) if weak else "-"
     return (

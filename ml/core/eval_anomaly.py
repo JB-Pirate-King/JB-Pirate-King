@@ -1257,7 +1257,6 @@ def analysis_detection_ensemble(sessions, thresholds, model_names, mins, maxs, c
     print("="*60)
 
     N_ANOM = 500
-    label = "+".join(model_names)
 
     # 각 모델 개별 오탐율
     if real_seqs is not None:
@@ -1709,7 +1708,6 @@ def main():
     # --all 이면 전부, 아무것도 없으면 탐지율만(분석1), 개별 플래그 우선
     if args.all:
         args.corr = args.recon = args.perm = True
-    run_all = args.all
 
     # 전역으로 노출 (함수 내부 N_ANOM 하드코딩 대체용)
     global _G_N_ANOM

@@ -34,7 +34,7 @@ On code/structure change, keep ALL docs in sync. Before push (or when asked to p
 
 1. **README.md / ml/README.md** — reflect changed features, paths, options.
 2. **CLAUDE.md (this file)** — update so a fresh session grasps current state.
-3. **Notion** — update methodology/results pages via `python ml/integrations/notify.py` (token in `ml/notify_config.json`, gitignored).
+3. **Notion** — update methodology/results pages via `python ml/integrations/notify.py` (token in `ml/config/notify_config.json`, gitignored).
 4. **Source code comments** — match current behavior of modified functions/classes.
 
 > Rule: a code/structure change isn't "done" until README + CLAUDE.md + Notion reflect it.
@@ -62,18 +62,24 @@ JB-Pirate-King/
 │   │   ├── feature_engineer.py # DCdetect feature engineering (Greedy + ONNX export)
 │   │   └── patch_plugin.py     # C++ plugin auto-patch (scaler features → codegen) ★
 │   ├── integrations/           # External integrations
-│   │   ├── slack_bot.py        # Slack bot (logs, button approval, Claude queries)
+│   │   ├── slack_bot.py        # Slack bot (logs, button approval)
 │   │   ├── sheets.py           # Google Sheets logging
 │   │   ├── notify.py           # Discord webhook + Notion reports
 │   │   └── git_manager.py      # Auto branch creation / commit
+│   ├── scripts/                # Standalone CLI tools (run directly, not imported)
+│   │   ├── auto_feat_eng.py    # FE automation loop (dataset build → FE)
+│   │   ├── build_3yr_dataset.py# 2023–2025 balanced dataset builder
+│   │   ├── download_ais.py     # AIS raw data downloader
+│   │   └── reset_sheets.py     # Utility: clear all Google Sheets tabs (keep headers)
+│   ├── config/                 # Config + state (secrets gitignored, example/state tracked)
+│   │   ├── pipeline_config.json         # Slack tokens + Sheets creds path + sheet_id (gitignored)
+│   │   ├── pipeline_config.example.json # Template (tracked)
+│   │   ├── google_credentials.json      # GCP service account (gitignored)
+│   │   ├── notify_config.json           # Discord/Notion tokens (gitignored)
+│   │   └── fe_state.json                # FE starting features / initial_extra (tracked)
 │   ├── orchestrator.py         # LangGraph orchestrator (reco + per-node harness + gates) ★
 │   ├── pipeline_steps.py       # Shared step library (run_cmd, stage_*, _fe_train_eval, parsers) ★
-│   ├── reset_sheets.py         # Utility: clear all Google Sheets tabs (keep headers)
-│   ├── fe_state.json           # FE starting features (initial_extra)
-│   ├── build_plugin_wsl.sh     # WSL (Ubuntu-24.04) cmake+make package auto-build ★
-│   ├── auto_feat_eng.py        # FE automation loop (dataset build → FE)
-│   ├── build_3yr_dataset.py    # 2023–2025 balanced dataset builder
-│   └── download_ais.py         # AIS raw data downloader
+│   └── build_plugin_wsl.sh     # WSL (Ubuntu-24.04) cmake+make package auto-build ★
 ├── ais_ids_pi/                 # OpenCPN plugin (C++)
 │   ├── src/ais_ids.cpp         # Plugin main source
 │   ├── include/ais_ml.h        # ML interface (contains AUTO: codegen markers)
@@ -267,6 +273,9 @@ Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
 `orchestrator.py` is a LangGraph `StateGraph` (control flow); the heavy execution functions
 live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md` / `pipeline_full.png`.
 
+> **노드 단위 상세 문서**: [`ml/PIPELINE.md`](ml/PIPELINE.md) — 각 노드 설명, 라우팅, State,
+> Mermaid + 자동 렌더 구조도(`pipeline_langgraph.png`). LangGraph 관점 입문용.
+
 - **pipeline_steps.py** — `run_cmd`, output parsers, `claude_analyze`, `stage_preprocess`,
   `stage_build_plugin`, `stage_release`, `_fe_train_eval` (greedy 1-step train+eval+parse+log),
   `_fe_build_and_release`, `_fe_commit_release`, fe_state io, constants. Not an entry point.
@@ -348,7 +357,7 @@ The Greedy objective is `mean_detection + 1.0 × weak_mean`, but detection per s
 
 - `dcdetect_NNN` branches **off the previous run branch** (e.g. `_002` base = `_001`).
   The first run (or when the previous branch is missing) branches off `develop`.
-- Adoption history is stored in `ml/fe_state.json` and **committed every run** → accumulates in git history (no reliance on an uncommitted working-tree file).
+- Adoption history is stored in `ml/config/fe_state.json` and **committed every run** → accumulates in git history (no reliance on an uncommitted working-tree file).
 - The main loop **restores `develop`** in a `finally` block on any path (normal / stop / crash).
 
 ---
@@ -409,7 +418,7 @@ Goal: find derived features that raise the DCdetect detection rate, then export 
 
 **Per-model tabs in a single master spreadsheet.** Each model gets its own set of tabs prefixed by model name: `{model}_실행요약`, `{model}_상세로그`, `{model}_시나리오결과`, `{model}_피처중요도`, plus a `{model}` detail tab. A `모델목록` (hub) tab lists every model with `=HYPERLINK` jump links to its tabs (click model → jump). Tabs are auto-created on first run for that model (`sheets.py` `_use`).
 
-> Why per-tab, not per-spreadsheet: a service account on personal Gmail has **0 Drive quota** and cannot `gc.create()` new spreadsheets, so model separation is done by tab prefix inside the one master sheet (which is shared to the service account). Config in `ml/pipeline_config.json` (gitignored).
+> Why per-tab, not per-spreadsheet: a service account on personal Gmail has **0 Drive quota** and cannot `gc.create()` new spreadsheets, so model separation is done by tab prefix inside the one master sheet (which is shared to the service account). Config in `ml/config/pipeline_config.json` (gitignored).
 
 Column layout per tab (titles kept Korean for continuity):
 
