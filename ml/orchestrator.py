@@ -47,6 +47,21 @@ import ml.integrations.git_manager as git
 # 하네스를 켤 노드 (전체). 비용 줄이려면 일부만 남긴다.
 HARNESS_ON = {"new_branch", "baseline", "reco", "fe", "build", "release", "chain"}
 
+# 노드별 하네스 판정 포인트 — 같은 템플릿이지만 단계 고유의 관점을 주입해
+# claude 가 그 단계에 맞는 기준으로 평가하게 한다 (일률 판정 방지).
+STAGE_FOCUS = {
+    "new_branch": "Whether branch creation and claude-session init are healthy. Almost always continue (stop only on fatal error).",
+    "baseline":   "Whether the baseline detection rate is a valid FE starting point and the weak scenarios are addressable by feature recommendation. "
+                  "If abnormally low (data/training defect) or broadly 0%, consider retry/stop.",
+    "reco":       "Whether the invented candidates target the weak scenarios and are not duplicate or meaningless. "
+                  "If 0 candidates or all unsuitable, retry.",
+    "fe":         "Whether the adopted feature's objective-score gain is robust (suspect winner's curse / overfitting) "
+                  "and there is no overall FP=1% regression. Zero adoption is a convergence signal, not an error.",
+    "build":      "Whether the C++ patch (5 markers) was applied and the 3 model files were copied without omission, and the feature count (ML_FEATURE_COUNT) matches.",
+    "release":    "Whether the commit and GitHub release artifacts are correct, with no missing attachments.",
+    "chain":      "Whether the adopted feature set was saved to fe_state and the state is ready to continue to the next branch.",
+}
+
 # 추천 피처를 feature_engineer 가 읽는 동적 후보 파일 (feature_engineer 가 exec 로드)
 DYNAMIC_CAND_PATH = "ml/dynamic_candidates.py"
 
@@ -113,11 +128,24 @@ def _claude_json(prompt: str, timeout: int = 120,
             data = json.loads(raw)
             if isinstance(data, dict) and "result" in data:
                 inner = data["result"]
-                return json.loads(inner) if isinstance(inner, str) else inner
+                # 모델이 ```json … ``` 코드펜스로 감싸 반환하면 json.loads 가 char 0 에서 실패한다.
+                return json.loads(_strip_code_fence(inner)) if isinstance(inner, str) else inner
             return data
     except Exception as e:
         print(f"[하네스] claude 호출 실패: {e}")
     return None
+
+
+def _strip_code_fence(text: str) -> str:
+    """모델 응답에서 ```json … ``` / ``` … ``` 코드펜스를 벗겨 순수 JSON 만 남긴다.
+    펜스가 없으면 원문 그대로. 펜스 안에 JSON 이 있으면 그것만 반환."""
+    t = text.strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
+        t = t[nl + 1:] if nl != -1 else t[3:]   # 첫 줄(```json) 제거
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]                  # 닫는 ``` 제거
+    return t.strip()
 
 
 def _branch_claude(prompt: str, timeout: int = 120) -> Optional[dict]:
@@ -136,14 +164,17 @@ def _branch_claude(prompt: str, timeout: int = 120) -> Optional[dict]:
 
 
 def _harness_prompt(stage: str, text: str, extra: dict) -> str:
+    focus = STAGE_FOCUS.get(stage, "")
     return (
-        f"AIS 이상탐지 ML 파이프라인 [{stage}] 노드 결과를 분석하고 다음 행동을 판정하라.\n\n"
-        f"핵심지표(JSON): {json.dumps(extra, ensure_ascii=False)}\n\n"
-        f"=== 출력(마지막 부분) ===\n{text[-2500:]}\n\n"
-        "아래 JSON 만 출력(설명 산문 금지):\n"
+        f"Analyze the [{stage}] node result of the AIS anomaly-detection ML pipeline and decide the next action.\n\n"
+        + (f"Judging focus for this stage: {focus}\n\n" if focus else "")
+        + f"Key metrics (JSON): {json.dumps(extra, ensure_ascii=False)}\n\n"
+        f"=== Node output (tail) ===\n{text[-2500:]}\n\n"
+        "Output ONLY the JSON below (no prose). Write assessment/evidence/reason/suggestion in KOREAN "
+        "(they are shown to the operator in Slack):\n"
         '{"assessment":"수치 요약 1~2문장","evidence":"근거","verdict":"continue|retry|stop",'
         '"reason":"판정 근거","suggestion":"있으면 다음 개선 아이디어"}\n'
-        "verdict 규칙: 정상 진행=continue / 일시오류·재실행 권장=retry / 치명·중단 권장=stop."
+        "verdict rules: normal progress=continue / transient error, rerun advised=retry / fatal, stop advised=stop."
     )
 
 
@@ -157,10 +188,12 @@ def claude_harness(stage: str, ctx_fn):
         v = _branch_claude(_harness_prompt(stage, text, extra)) or {
             "assessment": "분석 불가(claude 없음)", "verdict": "continue", "reason": "fallback"}
         verdict = v.get("verdict", "continue")
+        sug = (v.get("suggestion") or "").strip()
+        has_sug = sug and sug.lower() not in ("없음", "none", "n/a", "-", "null", "없음.")
         RT.bot.log(
             f"🤖 *[{stage}] 하네스* — {v.get('assessment','')}\n"
             f"  → *{verdict}*: {v.get('reason','')}"
-            + (f"\n  💡 {v['suggestion']}" if v.get("suggestion") else ""),
+            + (f"\n  💡 {sug}" if has_sug else ""),
             "하네스",
         )
         return {"harness": {**state.get("harness", {}), stage: v}, "decision": verdict}
@@ -284,17 +317,18 @@ def n_fe_baseline(state: PipelineState) -> dict:
 
 
 def _reco_prompt(weak: str, tried: list, base_det) -> str:
-    avoid = ("\n시도했으나 효과없던 피처(회피): " + ", ".join(tried)) if tried else ""
+    avoid = ("\nFeatures already tried without effect (avoid): " + ", ".join(tried)) if tried else ""
     return (
-        "AIS 이상탐지 DCdetect 의 피처 엔지니어다. 아래 약세 시나리오를 포착할 새 파생 피처를 "
-        f"{RT.args.invent}개 발명하라. 베이스 탐지율 {base_det}%.{avoid}\n"
-        f"약세: {weak}\n\n"
-        "JSON 배열만 출력(설명 금지). 각 원소:\n"
-        '{"name":"snake_case","desc":"한줄","lambda_src":"lambda seq,t: ...",'
-        '"target_scenario":"타겟"}\n'
-        '컬럼 접근 seq[t][_B["sog"]]. BASE 12: sog,cog,heading,status,dt,dist_km,'
+        "You are the feature engineer for the AIS anomaly-detection model DCdetect. "
+        f"Invent {RT.args.invent} new derived features that capture the weak scenarios below. "
+        f"Baseline detection rate {base_det}%.{avoid}\n"
+        f"Weak scenarios: {weak}\n\n"
+        "Output ONLY a JSON array (no prose). Each element (write `desc` in KOREAN — it is shown in Slack):\n"
+        '{"name":"snake_case","desc":"한줄 설명","lambda_src":"lambda seq,t: ...",'
+        '"target_scenario":"target"}\n'
+        'Column access seq[t][_B["sog"]]. BASE 12: sog,cog,heading,status,dt,dist_km,'
         "cog_hdg_diff,sog_change,cog_hdg_change,speed_consistency,lat_speed,lon_speed. "
-        "이전행 seq[t-1] 은 if t>0 else 0.0 가드, 0나눗셈 max(x,1e-6). 순수함수."
+        "Guard previous row seq[t-1] with `if t>0 else 0.0`; guard zero-division with max(x,1e-6). Pure function."
     )
 
 
