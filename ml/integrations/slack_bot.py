@@ -19,6 +19,7 @@ class SlackPipelineBot:
         self.app = App(token=bot_token)
         self.app_token = app_token
         self.channel = channel
+        self.log_file = None     # 지정 시 모든 Slack 메시지 text를 파일에도 기록 (orchestrator가 세팅)
         self._decision = None
         self._event = threading.Event()
         self._active_token = None   # 현재 대기 중인 승인 메시지 토큰 (스테일 클릭 차단용)
@@ -103,6 +104,17 @@ class SlackPipelineBot:
             time.sleep(0.2)
         print("[SlackBot] ⚠ Socket Mode 연결 확인 실패 (계속 진행)")
 
+    def _post(self, **kwargs):
+        """chat_postMessage 래퍼 — log_file 지정 시 text 를 타임스탬프와 함께 파일에도 기록.
+        Slack 전용이던 서술 로그(하네스 verdict·지식요약·스테이지 결과)가 영구 파일로 남는다."""
+        if self.log_file:
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {kwargs.get('text', '')}\n")
+            except Exception:
+                pass   # 파일 로깅 실패가 Slack 전송을 막지 않게
+        return self.app.client.chat_postMessage(**kwargs)
+
     STAGE_EMOJI = {
         "전처리": "🔄", "학습": "🧠", "평가": "📊", "피처개선": "🔬",
         "info": "ℹ️", "success": "✅", "warning": "⚠️", "error": "❌"
@@ -131,7 +143,7 @@ class SlackPipelineBot:
         pairs: dict 또는 (라벨, 값) 리스트."""
         head = {"type": "section",
                 "text": {"type": "mrkdwn", "text": f"{emoji} *{title}*"}}
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel, text=title,
             blocks=[head, self._fields(pairs), self._context(f"🕐 {self._now()}")],
         )
@@ -141,14 +153,14 @@ class SlackPipelineBot:
         first = message.lstrip()[:1]
         has_lead_emoji = bool(first) and ord(first) > 0x2000
         prefix = "" if has_lead_emoji else self.STAGE_EMOJI.get(level, "ℹ️") + " "
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"{prefix}{message}"
         )
 
     def log_run_start(self, branch: str, params: dict):
         """파이프라인 시작 — 헤더 + 파라미터 2열 그리드"""
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"🚀 파이프라인 시작: {branch}",
             blocks=[
@@ -172,7 +184,7 @@ class SlackPipelineBot:
         ]
         if detail:
             blocks.append(self._context(detail))
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel, text=f"{emoji} [{stage}] 시작", blocks=blocks,
         )
 
@@ -180,7 +192,7 @@ class SlackPipelineBot:
         emoji = self.STAGE_EMOJI.get(stage, "▶️")
         status = "✅ 완료" if success else "❌ 실패"
         body = "\n".join(f">  • {l}" for l in lines)
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"{status} [{stage}]",
             blocks=[
@@ -199,7 +211,7 @@ class SlackPipelineBot:
         truncated = len(body) > 2800
         if truncated:
             body = body[:2800] + "\n... (생략)"
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=title,
             blocks=[
@@ -225,7 +237,7 @@ class SlackPipelineBot:
         self._active_token = token
 
         body = "\n".join(f">  • {l}" for l in summary_lines)
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"[{stage}] 승인 대기 중",
             blocks=[
@@ -283,7 +295,7 @@ class SlackPipelineBot:
         arrow = "▲" if obj_gain > 0 else ("▼" if obj_gain < 0 else "─")
         status_emoji = "✅" if obj_gain >= 3.0 else ("⚠️" if obj_gain > 0 else "❌")
         baseline_obj = obj_score - obj_gain
-        self.app.client.chat_postMessage(
+        self._post(
             channel=self.channel,
             text=f"후보 #{candidate_num}: {feat}",
             blocks=[

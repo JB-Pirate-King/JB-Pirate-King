@@ -29,6 +29,10 @@ CONFIG_PATH = "ml/config/pipeline_config.json"
 
 from ml.core.constants import BASE_FEATURES   # 단일 출처 (ml/core/constants.py)
 
+# 브랜치 claude 세션 id — orchestrator.n_new_branch 가 매 브랜치마다 세팅.
+# claude_analyze 가 이 값으로 --resume 해서 하네스/추천/지식주입과 같은 세션에 누적된다.
+_CLAUDE_SID = None
+
 # feature_engineer.py 의 INITIAL_EXTRA 와 동기화
 FE_INITIAL_EXTRA = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
 
@@ -219,6 +223,8 @@ def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
     cmd = ["claude", "-p", prompt, "--output-format", "text"]
     if model:
         cmd += ["--model", model]
+    if _CLAUDE_SID:
+        cmd += ["--resume", _CLAUDE_SID]   # 브랜치 세션 이어감 (지식+앞 하네스 맥락 상속)
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -489,6 +495,24 @@ def stage_release(bot, args, branch: str, run_num: int,
         p = model_dir / fname
         if p.exists():
             model_files.append(str(p))
+
+    # 릴리즈 산출물 영구 보관 — WORK_DIR(.pipeline_tmp)은 휘발이므로 ml/deploy/{branch}/ 에 복사
+    # 후 run 브랜치에 커밋 (git 추적 아카이브). tar.gz 는 용량상 커밋 제외, 복사만.
+    deploy_dir = Path("ml/deploy") / branch
+    deploy_dir.mkdir(parents=True, exist_ok=True)
+    deploy_files = []
+    for src in model_files:
+        dst = deploy_dir / Path(src).name
+        shutil.copy2(src, dst)
+        deploy_files.append(str(dst))
+    if tarball:
+        shutil.copy2(tarball, deploy_dir / Path(tarball).name)
+    if deploy_files:
+        git.commit_results(deploy_files,
+                           f"chore(deploy): {branch} 릴리즈 산출물 보관 ({len(deploy_files)}개)",
+                           branch=branch)
+        bot.log(f"📦 릴리즈 산출물 보관+커밋: `{deploy_dir}` ({len(deploy_files)}개 모델 파일"
+                + (" + tar.gz(커밋 제외)" if tarball else "") + ")", "릴리스")
 
     n_feat    = len(BASE_FEATURES) + len(full_extra)
     feat_list = ", ".join(full_extra) if full_extra else "-"
