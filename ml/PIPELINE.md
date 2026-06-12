@@ -83,18 +83,25 @@
 
 `build_graph().get_graph().draw_mermaid_png()` 로 컴파일된 그래프에서 직접 추출.
 
-![LangGraph 파이프라인 구조](../pipeline_langgraph.png)
+![LangGraph 파이프라인 구조](pipeline_langgraph.png)
 
-> 재생성 (노드 텍스트 검정·볼드):
-> ```python
-> from ml.orchestrator import build_graph
-> from langchain_core.runnables.graph import NodeStyles
-> png = build_graph().get_graph().draw_mermaid_png(node_colors=NodeStyles(
->     default='fill:#f2f0ff,color:#000000,font-weight:bold,line-height:1.2',
->     first='fill-opacity:0,color:#000000,font-weight:bold',
->     last='fill:#bfb6fc,color:#000000,font-weight:bold'))
-> open('pipeline_langgraph.png', 'wb').write(png)
+| 색 | 그룹 | 노드 | 역할 |
+|---|---|---|---|
+| 🟢 초록 | compute | new_branch · preprocess · fe_baseline · reco_again · fe_train · build · release · chain · converge | 실제 일하는 노드 — 브랜치/전처리/진단/FE/빌드/릴리즈/체인 |
+| 🩷 분홍 | reco | recommend | claude 피처 발명 (opus) — 약세 겨냥 새 lambda |
+| 🟣 보라 | judge | j_branch ~ j_chain (7) | claude 판정 (sonnet) — continue/retry/stop 라우팅 |
+| 🟡 노랑 | gate | gate_deploy · gate_release · gate_converge | 사람 승인 (`interrupt()`/auto_approve) — 비가역 관문 |
+| 🔵 파랑 | log | log_run_start · log_fe · log_run_done · log_converge · readme | 기록 — Sheets + 루트 README 결과표 |
+| 🔴 빨강 | stop | user_stop | 중단 종착 — stop verdict/게이트 거부 수렴점 |
+
+> 읽는 법: **초록이 일하고 → 보라가 심사하고 → 노랑이 사람 허락 받고 → 파랑이 적는다.**
+> 분홍이 아이디어를 내고, 틀어지면 빨강으로. 매핑은 `ml/scripts/render_graph.py` 의 GROUPS/STYLES.
+
+> 재생성 (노드 성격별 색상 — 초록 compute · 분홍 recommend · 보라 judge · 노랑 gate · 파랑 log · 빨강 stop):
+> ```bash
+> python -m ml.scripts.render_graph    # repo 루트에서 — ml/pipeline_langgraph.png 갱신
 > ```
+> 노드 분류/색상은 `ml/scripts/render_graph.py` 의 GROUPS/STYLES — 새 노드 추가 시 미분류 경고가 뜬다.
 
 ### 주석 달린 Mermaid (라우팅 레이블 포함)
 
@@ -365,7 +372,7 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 - **사이클**: `release → log_run_done → chain → j_chain → new_branch` (다음 브랜치 시작).
   `recursion_limit = max(80, max_runs × 25)`, `--max_runs`(기본 50)로 무한루프 방지.
 - **수렴 종료 (횟수 기준)**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`
-  으로 다른 각도 재추천 — **브랜치당 `--invent_rounds`(기본 2) 라운드 소진 후에야**
+  으로 다른 각도 재추천 — **브랜치당 `--invent_rounds`(기본 3) 라운드 소진 후에야**
   `gate_converge → converge → END`. 단발 미채택 = 즉시 종료가 아님.
 - **베이스라인 캐시**: `fe_baseline`(diagnose) 결과 JSON 을 `fe_train` 이 `--baseline_cache` 로
   재사용 — 같은 피처셋이면 베이스라인 재학습 생략 (브랜치당 1회 학습). 재추천 라운드 비용은
@@ -441,7 +448,7 @@ python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
 
 # 주요 플래그
 #   --invent N                추천 피처 개수 (기본 5)
-#   --invent_rounds N         브랜치당 추천 라운드 상한 (기본 2 — 미채택이어도 재추천 후 수렴)
+#   --invent_rounds N         브랜치당 추천 라운드 상한 (기본 3 — 미채택이어도 재추천 후 수렴)
 #   --no_judge              모든 판정 끔
 #   --claude_model M          경량 모델 — 판정·지식요약 (기본 sonnet)
 #   --claude_model_heavy M    심층 모델 — 피처발명·상세분석 (기본 opus)

@@ -4,6 +4,24 @@ A system that detects anomalous behavior in ship AIS signals. It consists of an 
 
 ---
 
+## Run Results
+
+Auto-updated by the orchestrator's `readme` node after each release. The summary table is one
+row per run (newest first); each run also gets a collapsible detail block with per-FP and
+per-scenario detection rates. The Note is written by claude resuming the branch session.
+
+<!-- RUN_RESULTS:BEGIN -->
+| Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
+|---|---|---|---|---|---|---|---|---|
+<!-- RUN_RESULTS:END -->
+
+### Per-run detail
+
+<!-- RUN_DETAILS:BEGIN -->
+<!-- RUN_DETAILS:END -->
+
+---
+
 ## Components
 
 | Directory | Description |
@@ -45,18 +63,6 @@ The orchestrator auto-chains run branches (`dcdetect_001 → 002 → ...`), adop
 run until convergence. See [`CLAUDE.md`](CLAUDE.md) for the full pipeline architecture and
 [`ml/PIPELINE.md`](ml/PIPELINE.md) for the LangGraph node-level reference. More ML detail in
 [`ml/README.md`](ml/README.md).
-
----
-
-## Run Results
-
-Auto-updated by the orchestrator's `readme` node after each release (claude writes the note
-from the branch session's accumulated context). Newest first.
-
-<!-- RUN_RESULTS:BEGIN -->
-| Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
-|---|---|---|---|---|---|---|---|---|
-<!-- RUN_RESULTS:END -->
 
 ---
 
