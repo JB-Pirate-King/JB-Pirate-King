@@ -1,0 +1,67 @@
+---
+notion_url: https://www.notion.so/37cbe080983081298cc3dec1e2b0066c
+last_synced: 2026-06-12 13:43
+tags: [notion-sync]
+---
+
+# 📚 프로젝트 핵심 개념 지식베이스 (Knowledge Base)
+
+## JB-Pirate-King AIS IDS 지식베이스 허브
+이 지식베이스(KB)는 **JB-Pirate-King — 선박 AIS 신호의 스푸핑·조작을 탐지하는 침입탐지시스템(IDS)** 프로젝트의 배경지식·위협모델·실증 취약점·ML 방법론·시스템 아키텍처를 한곳에 모은 통합 허브입니다. 선행 논문, 사업계획서·발표 자료, 우리 팀이 직접 발견·실증한 취약점, 그리고 실제 ML 소스코드에서 추출한 내용을 **합성**해 작성했으며, 새 세션이나 신규 합류자가 프로젝트 전모를 빠르게 복원할 수 있도록 설계되었습니다.
+프로젝트를 한 문단으로 요약하면 다음과 같습니다. AIS(자동선박식별장치)는 인증·암호화 없이 VHF로 위치·속도·식별번호를 브로드캐스트하는 구조라 스푸핑·유령 선박·신호 변조에 근본적으로 취약합니다. JB-Pirate-King은 이 신호 흐름(NMEA 0183 → AIVDM → ECDIS/OpenCPN)을 분석 대상으로 삼아, **OpenCPN C++ 플러그인(****`ais_ids_pi`****)이 AIS 메시지를 피처로 추출 → ONNX 추론 → 정상/이상 판정**하는 IDS를 구현합니다. 탐지 엔진은 **DCdetect 이중 어텐션 비지도 시계열 모델**을 메인으로, 베이스 12피처에서 Greedy Forward Selection(목적점수 +3.0pp 게이트)으로 파생 피처를 자동 채택해 FP=1% 기준 40.6%에서 91.9%까지 탐지율을 끌어올렸습니다. 나아가 LLM을 **개발·분석·심판·피처발명** 4역할로 활용하는 LangGraph·MCP 기반 자가개선 MLOps 파이프라인으로 운영됩니다.
+
+---
+
+
+## 📑 섹션 구성 (5)
+아래 5개 child 페이지를 순서대로 읽으면 도메인 → 위협 → 실증취약 → 탐지 → 시스템으로 이어집니다.
+1. 🛰️ **AIS·해상 프로토콜 도메인 배경** — NMEA 0183 → AIVDM → ECDIS/OpenCPN 데이터 흐름과 핵심 표준·용어, SCADA 대비 IDS 설계 제약
+1. 🎯 **위협 모델·공격 시나리오** — NMEA 동적 플러딩(유령 선박 떼), S-100 GPS 조작(STRIDE), S-52 시각정보 변조, ECDIS Edition 0 차트 삭제, 합성 AIS(ghost ship)
+1. 🔓 **OpenCPN 실증 취약점 분석(6종)** — Code Injection(RCE)·Command Injection·Path Traversal(2종)·chartsymbols.xml 심볼 변조·WMM 힙 오버플로
+1. 🧠 **ML 이상탐지 방법론 — DCdetect 비지도 시계열 IDS** — 이중 어텐션, 베이스 12피처+Greedy FE, 3개년 균형 데이터셋·MMSI 홀드아웃, FP=1% 평가, permutation importance, 32개 시나리오
+1. 🏴‍☠️ **시스템 아키텍처와 LLM 자가개선 파이프라인** — OpenCPN C++ 플러그인 + ONNX 추론 + Python ML 전체 구조, Snort 형식 규칙 엔진 구상, LangGraph·MCP·위키 기반 자가개선 MLOps
+> 🔗 개념 심화: [LLM 동작 방식 — 위키·LangGraph·MCP](https://app.notion.com/p/37cbe08098308160b277ce7b5303a145) · [LLM Wiki(세팅 문서)](https://app.notion.com/p/37abe080983080058e98daec422ca27d)
+*자동 생성: Claude · 2026-06-12 · team-vault 소스(논문·발표·취약점·ML) 15개 파일 합성*
+- 📄 [[1. 🛰️ AIS·해상 프로토콜 도메인 배경/1. 🛰️ AIS·해상 프로토콜 도메인 배경|1. 🛰️ AIS·해상 프로토콜 도메인 배경]]
+- 📄 [[2. 🎯 위협 모델·공격 시나리오/2. 🎯 위협 모델·공격 시나리오|2. 🎯 위협 모델·공격 시나리오]]
+- 📄 [[3. 🔓 OpenCPN 호스트 보안 — 취약점 클래스(개념 요약)/3. 🔓 OpenCPN 호스트 보안 — 취약점 클래스(개념 요약)|3. 🔓 OpenCPN 호스트 보안 — 취약점 클래스(개념 요약)]]
+- 📄 [[4. 🧠 ML 이상탐지 방법론 — DCdetect 비지도 시계열 IDS/4. 🧠 ML 이상탐지 방법론 — DCdetect 비지도 시계열 IDS|4. 🧠 ML 이상탐지 방법론 — DCdetect 비지도 시계열 IDS]]
+- 📄 [[5. 🏴‍☠️ 시스템 아키텍처와 LLM 자가개선 파이프라인/5. 🏴‍☠️ 시스템 아키텍처와 LLM 자가개선 파이프라인|5. 🏴‍☠️ 시스템 아키텍처와 LLM 자가개선 파이프라인]]
+
+---
+
+
+## 📖 통합 용어집 (Glossary)
+5개 섹션의 핵심 용어를 합쳐 정리(가나다·알파벳순).
+| 용어 | 뜻 |
+| AIS (Automatic Identification System) | 선박 위치·속도·MMSI·COG·Heading 등을 VHF로 자동 broadcast하는 시스템. 암호화·인증이 없고 브로드캐스트 기반이라 스푸핑에 구조적으로 취약하며, 우리 IDS의 분석 대상 데이터다. |
+| AIS Spoofing | AIS 메시지를 조작해 가짜 선박을 만들거나 변조하는 공격. Fake Vessel 생성, Position Spoofing, Replay Attack, Identity Spoofing 유형이 있으며 인증·암호화 부재와 broadcast 구조가 근본 원인이다. |
+| AIVDM 메시지 | AIS의 binary 데이터(ITU-R M.1371)를 NMEA 0183 ASCII 문자열로 캡슐화한 실제 전송 형식. payload는 6-bit ASCII 인코딩, message type(1~27)별 필드 구조가 다른 실제 공격면이다. |
+| AIS Type 1·24 | AIS 메시지 종류. Type 1은 168비트 위치 보고(MMSI·SOG·위경도·COG·heading 등), Type 24 Part A는 선박명(최대 20자). |
+| chartsymbols.xml File-Swap | OpenCPN이 무결성 검증 없이 로드하는 chartsymbols.xml을 변조본으로 교체해 OBSTRN(수중 장애물) lookup을 비활성화, 경고 심볼을 화면에서 은닉하는 무결성 우회 공격. |
+| DCdetect (Dual Attention) | Channel-wise(피처 간 관계)와 Patch-wise(시간 구간 패턴) 어텐션을 동시에 학습하는 비지도 이상탐지 모델. 개별 피처는 정상이나 조합이 비정상인 위장 이상을 잡는 본 프로젝트의 메인 모델. SEQ_LEN=10, 베이스 12피처. |
+| Dynamic Flooding (Ghost Ship Swarm) | 위조 AIS(AIVDM) 메시지를 항해 조건에 맞게 좌표를 계산하며 고빈도로 대량 송출하는 공격. OpenCPN 화면에 수천~약 1만 척의 유령 선박을 띄워 상황 인지를 마비시킨다. |
+| ECDIS / ECS | 전자해도 기반 항해정보 통합 표시 시스템. ECDIS는 IMO/IHO 인증으로 종이해도를 법적 대체(공식 ENC 사용), ECS는 비표준·보조 장비. OpenCPN은 ECS 계열로 우리 플러그인의 호스트다. |
+| Edition 0 삭제형 업데이트 | ECDIS가 차트를 해도 목록에서 제거할 때 쓰는 정상 기능. 검증 없이 사용자 Yes 클릭만으로 삭제되어, 위조 Edition 0 파일을 주입하면 차트 DoS 공격이 된다. |
+| ENC / S-57 / S-63 | ENC는 공식 전자해도, S-57은 IHO의 ENC 데이터 형식 표준, S-63은 Blowfish 암호화·디지털 서명·해시로 ENC를 보호하는 데이터 보호 표준. S-63은 데이터 무결성만 보호하고 운용 절차는 다루지 않는다. |
+| FP=1% 임계값 | 홀드아웃 정상 시퀀스 점수의 99퍼센타일을 임계값으로 잡아 오탐율을 1%로 고정한 기준. 이 상태에서 공격을 몇 % 잡는지가 핵심 탐지율 지표이며, 배포 threshold도 동일 값을 쓴다. |
+| Greedy Forward Selection | 베이스 피처에 후보 파생 피처를 하나씩 추가·학습·평가해 목적점수 향상이 +3.0pp 이상인 best 1개를 채택하는 탐욕적 전진 선택. 채택 시 재학습 후 새 브랜치로 체이닝하며 수렴까지 반복. |
+| LangGraph StateGraph | 파이프라인을 노드(작업)+엣지(흐름)의 그래프로 표현하는 상태기계. 조건엣지(verdict 분기), 사이클(자동 반복), interrupt()(사람 승인 HITL), 체크포인터로 여러 LLM 호출을 하나의 프로그램으로 엮는다. |
+| LLM-as-judge / claude_harness | 각 파이프라인 노드 뒤에서 LLM이 결과를 평가해 JSON verdict로 흐름을 게이팅하는 역할. LLM 4중 활용 중 '심판'에 해당. |
+| MCP (Model Context Protocol) | LLM이 외부 도구/서비스를 표준 규약으로 직접 호출하게 하는 프로토콜. GitHub·Sheets·Notion·Slack·Obsidian 등을 직접 조작해 '조언자'가 아닌 '행위자(agent)'로 만든다. |
+| MMSI | Maritime Mobile Service Identity. 선박 고유 식별번호. 위조나 가짜 선박 생성 시 핵심 탐지 단서(예: 동일 MMSI 다중 위치). |
+| NMEA 0183 / 2000 | 해상 계기·항해 장비 간 통신 표준. 4800 baud 시리얼로 `$ttsss,데이터…*체크섬` ASCII 문장을 주고받는다. 인증·암호화·무결성 검증이 없어 주입·플러딩에 취약하며, 우리 IDS 입력 피처의 원천 포맷이다. |
+| OBSTRN | ENC S-57 객체 분류 중 수중 장애물(Obstruction). chartsymbols.xml 변조로 이 심볼만 숨기면 항해자가 암초를 인지하지 못해 충돌·침몰로 이어질 수 있다. |
+| OpenCPN / ais_ids_pi | OpenCPN은 오픈소스 전자해도 시스템(ECS). ais_ids_pi는 그 위 C++ 플러그인으로, AIS 메시지를 12개 피처로 추출해 ONNX 모델로 추론한다. 빌드·배포는 Ubuntu 24.04 네이티브 Linux 전용. |
+| Path Traversal (File Overwrite) | 경로 검증 없이 외부 입력의 이름 필드를 파일 경로로 사용해 `../`로 상위 디렉터리를 탈출, 임의 위치에 파일을 생성/덮어쓰는 취약점. |
+| Permutation Importance | 피처값을 셔플해 의미를 없앴을 때의 탐지율 하락폭으로 중요도를 측정. 음수가 클수록 중요(예: −13.43pp = 제거 시 탐지율 13.4%p 하락). |
+| PlugIn_AIS_Target | OpenCPN 플러그인 API가 AIS 표적 데이터를 노출하는 C++ 구조체. MMSI·SOG·COG·HDG·Lat/Lon·NavStatus·CPA/TCPA 등을 담으며, 이 필드가 우리 ML 모델의 입력 게이트웨이다. |
+| S-52 표시 라이브러리 | IHO가 정한, ENC 객체/속성을 화면 심볼·색상으로 변환하는 규칙 라이브러리(chartsymbols.xml). 입력이 정상이어도 이 lookup table을 변조하면 위험물을 은밀히 숨길 수 있는 '표시 계층' 공격 벡터. |
+| Snort 형식 엔진 | 네트워크 IDS 표준 Snort/Suricata의 rule header + option 형식을 차용해 AIS 신호 이상 패턴을 시그니처로 기술하려는 규칙 기반 탐지 구상. 비지도 ML 탐지와 상호 보완. |
+| STRIDE | Microsoft의 위협 분류 모델 — Spoofing·Tampering·Repudiation·Information Disclosure·Denial of Service·Elevation of Privilege. S-100 ECDIS 분석에서 GPS/AIS 스푸핑·ENC 변조가 최고 위험으로 평가됐다. |
+| TranAD Self-Conditioning | 두 Decoder(D1→D2)가 조건을 주고받으며 이상 시점의 재구성 오차를 증폭하는 Transformer 오토인코더. DCdetect와 0.7/0.3 가중 앙상블로 결합. |
+| Zip Slip | ZIP 압축 해제 시 엔트리 이름의 `../`를 제거하지 않고 대상 경로와 결합해 디렉터리를 탈출하는 Path Traversal. Chart Downloader에서 발생. |
+| 목적점수 | FP=1% 기준 전체 시나리오 평균 탐지율에 약세 시나리오(베이스 탐지율<50%) 평균을 1.0배 가중해 더한 값. 못 잡던 공격을 끌어올린 피처가 채택되도록 유도한다. |
+| 비지도 이상탐지 | 정상/공격 레이블 없이 정상 패턴만 학습하고 그로부터의 이탈 정도로 이상 여부를 판단하는 방식. Marine Cadastre AIS 데이터에 레이블이 없어 채택. 본 프로젝트 DCdetect IDS의 핵심. |
+| 재구성 오차 / MSE | 오토인코더 계열 이상탐지의 핵심 지표. 정상 패턴을 학습한 모델이 입력을 복원할 때의 평균 제곱 오차로, 정상은 낮고 이상은 높아 임곗값 초과 시 이상으로 분류한다. |
+| WMM 힙 버퍼 오버플로 | OpenCPN WMM 플러그인이 .cof 헤더의 edit_date 길이를 검증하지 않고 복사해 힙을 오염시키는 취약점. 길이 검증 누락이 메모리 손상으로 직결되는 전형. |
