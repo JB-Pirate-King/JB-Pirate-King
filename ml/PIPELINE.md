@@ -10,11 +10,11 @@
 - **1 run = 1 git 브랜치 = 피처 1개 채택 시도** (`dcdetect_001`, `_002`, …).
 - 채택에 성공하면 **체인**(그래프 사이클)으로 다음 브랜치를 시작하고, 더 이상
   목적점수 이득이 없으면 **수렴**하여 종료한다.
-- 각 compute 노드 뒤에는 **판정(judge)** 노드 — claude 가가 붙어 `continue / retry / stop`
-  으로 라우팅한다.
+- 각 compute 노드 뒤에는 **판정(judge)** 노드가 붙어 claude 가 `continue / retry / stop`
+  으로 라우팅한다 (LLM-as-judge).
 - 비가역 단계(배포·커밋·수렴)에는 **게이트**(`interrupt()` 또는 `--auto_approve`)가 있다.
-- claude 호출(추천·판정·분석)은 **브랜치당 세션 1개**를 공유하며 기본 모델은 **Sonnet 4.6**
-  (`--claude_model` 로 변경).
+- claude 호출(추천·판정·분석)은 **브랜치당 세션 1개**를 공유. 모델은 역할별 분리 —
+  판정/지식요약 `--claude_model`(기본 sonnet), 피처발명/상세분석 `--claude_model_heavy`(기본 opus).
 
 ```
 새 브랜치 ─▶ 베이스 진단 ─▶ 피처 발명 ─▶ FE 학습/채택 ─▶ 배포 게이트
@@ -361,6 +361,8 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 - **수렴 종료**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`(라운드 남으면 재추천)
   → 끝나면 `gate_converge → converge → END`.
 - **세션 격리**: 브랜치마다 새 claude 세션(uuid). 브랜치 내 노드는 맥락 공유, 브랜치 간엔 격리.
+- **thread_id**: run 마다 `orchestrator-{시각}` 발급 (stdout/로그에 출력) — LangSmith Threads 뷰에서
+  run 별로 분리되고, SqliteSaver 도입 시 크래시 재개 키로 쓴다. (고정값이면 전 run 이 한 스레드로 합쳐짐)
 - **develop 복구**: `main()` 의 `finally` 에서 항상 `git checkout develop`.
 
 ---
