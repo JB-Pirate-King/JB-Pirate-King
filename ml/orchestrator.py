@@ -814,7 +814,11 @@ def main():
         "tried_feats": [], "adopted_any": False, "terminate": False,
     }
     graph = build_graph()
-    config = {"configurable": {"thread_id": "orchestrator"},
+    # thread_id 를 run 마다 분리 — 고정값이면 LangSmith Threads 뷰에서 모든 run 이
+    # 한 스레드의 턴으로 합쳐져 새 run 이 안 보이는 것처럼 보인다.
+    thread_id = f"orchestrator-{time.strftime('%Y%m%d_%H%M%S')}"
+    print(f"[LangGraph] thread_id={thread_id}")
+    config = {"configurable": {"thread_id": thread_id},
               "recursion_limit": max(80, args.max_runs * 25)}
     try:
         run_pipeline(graph, init, config)
