@@ -147,7 +147,8 @@ flowchart TD
 
     log_run_done --> chain[chain<br/>fe_state 저장·커밋]
     chain --> h_chain{{h_chain 하네스}}
-    h_chain -.->|continue 사이클| new_branch
+    h_chain -.->|continue·상한미달 사이클| new_branch
+    h_chain -.->|상한 도달| END4([END])
     h_chain -.->|retry| fe_train
     h_chain -.->|stop| user_stop
 
@@ -221,6 +222,7 @@ graph TD;
 	h_build -.-> fe_train;
 	h_build -.-> gate_release;
 	h_build -.-> user_stop;
+	h_chain -. END .-> __end__;
 	h_chain -.-> fe_train;
 	h_chain -.-> new_branch;
 	h_chain -.-> user_stop;

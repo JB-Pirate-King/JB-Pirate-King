@@ -456,6 +456,21 @@ def route_after_branch(state: PipelineState) -> str:
     return "preprocess" if (state.get("first_iter", True) and not RT.args.skip_preprocess) else "fe_baseline"
 
 
+def route_after_chain(state: PipelineState) -> str:
+    """체인 후 라우팅 — 다음 브랜치를 **생성하기 전에** max_runs 가드.
+    하네스 verdict 우선(stop/retry), 그다음 상한 도달 시 빈 브랜치를 만들지 않고 종료.
+    (전엔 new_branch 가 빈 브랜치를 만든 뒤 route_after_branch 가 END 처리해 낭비 브랜치가 생겼다.)"""
+    d = state.get("decision", "continue")
+    if d == "stop":
+        return "user_stop"
+    if d == "retry":
+        return "fe_train"
+    if state.get("iters", 0) >= RT.args.max_runs:
+        RT.bot.log(f"⚠️ 안전 상한 {RT.args.max_runs} 도달 — 체이닝 종료", "warning")
+        return "END"
+    return "new_branch"
+
+
 def route_after_preprocess(state: PipelineState) -> str:
     return "END" if state.get("terminate") else "fe_baseline"
 
@@ -561,8 +576,9 @@ def build_graph(checkpointer=None):
                             {"log_run_done": "log_run_done", "fe_train": "fe_train", "user_stop": "user_stop"})
     g.add_edge("log_run_done", "chain")
     g.add_edge("chain", "h_chain")
-    g.add_conditional_edges("h_chain", _route_harness("new_branch"),
-                            {"new_branch": "new_branch", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("h_chain", route_after_chain,
+                            {"new_branch": "new_branch", "fe_train": "fe_train",
+                             "user_stop": "user_stop", "END": END})
 
     g.add_conditional_edges("gate_converge", route_gate_converge,
                             {"converge": "converge", "user_stop": "user_stop"})
