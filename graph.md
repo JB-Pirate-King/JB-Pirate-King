@@ -1,7 +1,7 @@
 # 파이프라인 구조도 (완전판) — LangGraph
 
 피처 추천 + 노드별 하네스 + FE 분해 + Google Sheets 포함 최종 설계.
-렌더 이미지: `pipeline_full.png`.
+렌더 이미지: `pipeline_langgraph.png` (코드 자동 추출 — 상세는 `ml/PIPELINE.md`).
 
 > **VS Code 미리보기**: 확장 `Markdown Preview Mermaid Support` 설치 → 창 한번 리로드 → `Ctrl+Shift+V`.
 
