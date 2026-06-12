@@ -1,7 +1,7 @@
 """
 AIS 파이프라인 오케스트레이터 — LangGraph 완전판.
 
-graph.md 구조도 반영:
+구조 (상세: ml/PIPELINE.md, 렌더: pipeline_langgraph.png):
   - claude 피처 추천(reco) 노드: 약세 진단 → claude 가 새 후보 피처 발명·검증 → 후보풀 확장.
     수렴(채택0) 시 다른 각도로 재추천 루프(라운드 상한).
   - 노드별 판정: 각 compute 노드 뒤 claude -p 판정 → 분석·판정(continue/retry/stop).
@@ -541,6 +541,58 @@ def n_release(state: PipelineState) -> dict:
     return {}
 
 
+def n_readme(state: PipelineState) -> dict:
+    """릴리즈 후 루트 README.md 의 Run Results 표에 이번 run 결과 행 추가 (claude 노드).
+
+    수치는 FE 산출 JSON 에서 코드로 뽑고, Note 한 줄은 브랜치 세션(지식·판정·분석 누적)을
+    --resume 한 claude 가 작성. README 는 run 브랜치에 커밋된다."""
+    r = state.get("r", {})
+    fe = r.get("fe_stats", {})
+    # FP5/10 은 fe_stats 에 없어 FE JSON 에서 보강
+    det5 = det10 = None
+    fe_json = steps.WORK_DIR / "feat_eng_iter01.json"
+    if fe_json.exists():
+        try:
+            d = json.loads(fe_json.read_text(encoding="utf-8"))
+            det5, det10 = d.get("det_fp5"), d.get("det_fp10")
+        except Exception:
+            pass
+
+    v = _branch_claude(
+        "Write ONE short Korean sentence (<=80 chars) summarizing this run's outcome and "
+        "the adopted feature's significance, for the project README results table. "
+        'Output ONLY JSON: {"note":"..."}', timeout=60) or {}
+    note = (v.get("note") or "").replace("|", "/").strip()
+
+    base, det = fe.get("baseline_det"), fe.get("det_rate")
+    fmt = lambda x, s="%": (f"{x:.1f}{s}" if isinstance(x, (int, float)) else "-")
+    row = ("| {b} | {d} | {a} | {fp1} | {fp5} | {fp10} | {th} | {nf} | {note} |").format(
+        b=state["branch"], d=time.strftime("%Y-%m-%d"),
+        a=", ".join(f"`{f}`" for f in r.get("newly_adopted", [])) or "-",
+        fp1=(f"{fmt(base)}→{fmt(det)}" + (f" ({det-base:+.1f}pp)" if isinstance(base,(int,float)) and isinstance(det,(int,float)) else "")),
+        fp5=fmt(det5), fp10=fmt(det10),
+        th=(f"{fe.get('threshold'):.6f}" if isinstance(fe.get("threshold"), (int, float)) else "-"),
+        nf=r.get("n_feat", "-"), note=note or "-")
+
+    try:
+        p = Path("README.md")
+        txt = p.read_text(encoding="utf-8")
+        begin, end = "<!-- RUN_RESULTS:BEGIN -->", "<!-- RUN_RESULTS:END -->"
+        head, rest = txt.split(begin, 1)
+        block, tail = rest.split(end, 1)
+        lines = [l for l in block.strip().splitlines() if l.strip()]
+        table_head, rows = lines[:2], lines[2:]          # 헤더 2줄 유지, 최신 행을 위로
+        new_block = "\n".join(table_head + [row] + rows)
+        p.write_text(head + begin + "\n" + new_block + "\n" + end + tail, encoding="utf-8")
+        git.commit_results(["README.md"],
+                           f"docs: {state['branch']} run result → README", branch=state["branch"])
+        RT.bot.log(f"📝 README Run Results 갱신 — {state['branch']}"
+                   + (f"\n  └ {note}" if note else ""), "지식")
+    except Exception as e:
+        print(f"[readme] 갱신 실패(무시): {e}")
+    return {}
+
+
 def n_chain(state: PipelineState) -> dict:
     full_extra = state["r"]["full_extra"]
     steps._save_fe_initial_extra(full_extra)
@@ -665,7 +717,8 @@ def build_graph(checkpointer=None):
     for n, fn in [("new_branch", n_new_branch), ("preprocess", n_preprocess),
                   ("fe_baseline", n_fe_baseline), ("recommend", n_recommend),
                   ("reco_again", n_reco_again), ("fe_train", n_fe_train),
-                  ("build", n_build), ("release", n_release), ("chain", n_chain),
+                  ("build", n_build), ("release", n_release), ("readme", n_readme),
+                  ("chain", n_chain),
                   ("converge", n_converge), ("user_stop", n_user_stop),
                   ("gate_deploy", n_gate_deploy), ("gate_release", n_gate_release),
                   ("gate_converge", n_gate_converge),
@@ -717,7 +770,8 @@ def build_graph(checkpointer=None):
     g.add_edge("release", "j_release")
     g.add_conditional_edges("j_release", _route_judge("log_run_done"),
                             {"log_run_done": "log_run_done", "fe_train": "fe_train", "user_stop": "user_stop"})
-    g.add_edge("log_run_done", "chain")
+    g.add_edge("log_run_done", "readme")
+    g.add_edge("readme", "chain")
     g.add_edge("chain", "j_chain")
     g.add_conditional_edges("j_chain", route_after_chain,
                             {"new_branch": "new_branch", "fe_train": "fe_train",

@@ -154,7 +154,8 @@ flowchart TD
     j_release -.->|retry| fe_train
     j_release -.->|stop| user_stop
 
-    log_run_done --> chain[chain<br/>fe_state 저장·커밋]
+    log_run_done --> readme[readme<br/>루트 README 결과표 갱신]
+    readme --> chain[chain<br/>fe_state 저장·커밋]
     chain --> j_chain{{j_chain 판정}}
     j_chain -.->|continue·상한미달 사이클| new_branch
     j_chain -.->|상한 도달| END4([END])
@@ -190,6 +191,7 @@ graph TD;
 	fe_train(fe_train)
 	build(build)
 	release(release)
+	readme(readme)
 	chain(chain)
 	converge(converge)
 	user_stop(user_stop)
@@ -224,14 +226,14 @@ graph TD;
 	j_base -.-> fe_train;
 	j_base -.-> recommend;
 	j_base -.-> user_stop;
-	j_branch -. END .-> __end__;
+	j_branch -.  END  .-> __end__;
 	j_branch -.-> fe_baseline;
 	j_branch -.-> preprocess;
 	j_branch -.-> user_stop;
 	j_build -.-> fe_train;
 	j_build -.-> gate_release;
 	j_build -.-> user_stop;
-	j_chain -. END .-> __end__;
+	j_chain -.  END  .-> __end__;
 	j_chain -.-> fe_train;
 	j_chain -.-> new_branch;
 	j_chain -.-> user_stop;
@@ -246,11 +248,12 @@ graph TD;
 	j_release -.-> log_run_done;
 	j_release -.-> user_stop;
 	log_fe --> j_fe;
-	log_run_done --> chain;
+	log_run_done --> readme;
 	log_run_start --> j_branch;
 	new_branch --> log_run_start;
-	preprocess -. END .-> __end__;
+	preprocess -.  END  .-> __end__;
 	preprocess -.-> fe_baseline;
+	readme --> chain;
 	reco_again --> recommend;
 	recommend --> j_reco;
 	release --> j_release;
@@ -282,6 +285,7 @@ graph TD;
 | `fe_train` | `n_fe_train` — orchestrator.py:350<br/>→ `_fe_train_eval` pipeline_steps.py:557 | **핵심**: 후보 스캔 → 목적점수 ≥`min_gain` 최선 1개 채택 → 재학습(model_best) → 순열중요도 → 최종 FP1/5/10 → 임계값 → 배포 export. `feature_engineer` 1 subprocess | `r{newly_adopted,full_extra,det_rate,summary,fe_stats,…}` |
 | `build` | `n_build` — orchestrator.py:360<br/>→ `_fe_build_and_release` pipeline_steps.py:884 (→ `stage_build_plugin`:344) | C++ 플러그인 패치(`patch_plugin`) + 모델 파일 복사 → `ais_ids_pi/data/` | `commit_files`, `build_summary` |
 | `release` | `n_release` — orchestrator.py:366<br/>→ `_fe_commit_release` pipeline_steps.py:901 (→ `stage_release`:464) | 채택 커밋 + GitHub 릴리즈(`gh release`, prerelease `run/dcdetect_NNN`) | — |
+| `readme` | `n_readme` | **claude 노드** — 루트 `README.md` Run Results 표에 이번 run 행 추가 (수치는 FE JSON, Note 는 브랜치 세션 claude 한 줄) → run 브랜치에 커밋 | — |
 | `chain` | `n_chain` | `fe_state.json` 저장 + **채택 lambda 를 `adopted_features.py` 에 영속화** → 함께 커밋 → 다음 브랜치로 사이클 | `current_extra`, `adopted_any` |
 | `converge` | `n_converge` — orchestrator.py:383 | 수렴 완료 로그 | `terminate` |
 | `user_stop` | `n_user_stop` — orchestrator.py:389 | 중단 — Sheets 실패기록 + 종료 | `terminate` |

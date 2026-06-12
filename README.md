@@ -42,9 +42,21 @@ python ml/core/feature_engineer.py --input D:/ais_data/preprocessed/ais_preproce
 ```
 
 The orchestrator auto-chains run branches (`dcdetect_001 → 002 → ...`), adopting one feature per
-run until convergence. See [`CLAUDE.md`](CLAUDE.md) for the full pipeline architecture, the
-`--max_runs` / `--build_plugin` flags, branch-chaining behavior, and the **LangGraph port**
-(`ml/orchestrator_lg.py`). More ML detail in [`ml/README.md`](ml/README.md).
+run until convergence. See [`CLAUDE.md`](CLAUDE.md) for the full pipeline architecture and
+[`ml/PIPELINE.md`](ml/PIPELINE.md) for the LangGraph node-level reference. More ML detail in
+[`ml/README.md`](ml/README.md).
+
+---
+
+## Run Results
+
+Auto-updated by the orchestrator's `readme` node after each release (claude writes the note
+from the branch session's accumulated context). Newest first.
+
+<!-- RUN_RESULTS:BEGIN -->
+| Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
+|---|---|---|---|---|---|---|---|---|
+<!-- RUN_RESULTS:END -->
 
 ---
 
