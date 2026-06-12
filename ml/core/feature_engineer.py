@@ -752,18 +752,45 @@ def greedy_forward_selection(train_seqs: list, eval_seqs: list, args) -> tuple:
     print(f"[베이스라인]  피처 {n_base_total}개: {BASE_FEATURES + current_extra}")
     print(f"{'─'*W}")
     t0 = time.time()
-    tensor, scaler = prepare_tensor(scan_seqs, current_extra)
-    model, val_loader = train_recon_model(args.model, tensor, n_base_total, args.epochs)
-    det0, sc0, extra0, _ = evaluate(model, scaler, current_extra, args.n_anom,
-                                    raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
-    elapsed = time.time() - t0
 
-    # 약세 시나리오 집합 = 베이스라인 FP=1% 탐지율 < weak_floor (전 과정 고정)
-    weak_names = {n for n, d, _ in sc0 if d < weak_floor}
-    # 목적점수는 FP1/5/10 평균(부드러운 지표)으로 계산 → 출렁임/회귀 완화
-    best_score = _objective(_combine_multifp(sc0, extra0), weak_names, weak_weight)
-    best_det   = det0
-    print(f"  → 전체 평균 탐지율 {det0:.1f}%  (목적점수 {best_score:.1f})  [{elapsed/60:.1f}분]")
+    # --baseline_cache: diagnose_only 가 막 평가한 같은 피처셋 결과(JSON)를 재사용해
+    # 베이스라인 재학습 생략 (오케스트레이터 fe_baseline → fe_train 의 중복 학습 제거).
+    # 피처셋이 다르거나 score 누락이면 무시하고 정상 학습 (안전 폴백).
+    cache = None
+    cache_path = getattr(args, "baseline_cache", None)
+    if cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as cf:
+                c = json.load(cf)
+            if (c.get("baseline_score") is not None
+                    and list(c.get("extra", [])) == list(current_extra)):
+                cache = c
+            else:
+                print("  [캐시] 피처셋 불일치/score 없음 — 무시하고 베이스라인 학습")
+        except Exception as e:
+            print(f"  [캐시] 로드 실패(무시): {e}")
+
+    if cache:
+        det0 = float(cache["baseline_det"])
+        best_score = float(cache["baseline_score"])
+        sc0 = [(n, float(d), None) for n, d in cache.get("scenario_fp1", {}).items()]
+        weak_names = {n for n, d, _ in sc0 if d < weak_floor}
+        best_det = det0
+        print(f"  → [캐시 재사용] 전체 평균 탐지율 {det0:.1f}%  (목적점수 {best_score:.1f})"
+              f"  — 베이스라인 재학습 생략")
+    else:
+        tensor, scaler = prepare_tensor(scan_seqs, current_extra)
+        model, val_loader = train_recon_model(args.model, tensor, n_base_total, args.epochs)
+        det0, sc0, extra0, _ = evaluate(model, scaler, current_extra, args.n_anom,
+                                        raw_seqs=eval_seqs, extra_fp=(5.0, 10.0))
+        elapsed = time.time() - t0
+
+        # 약세 시나리오 집합 = 베이스라인 FP=1% 탐지율 < weak_floor (전 과정 고정)
+        weak_names = {n for n, d, _ in sc0 if d < weak_floor}
+        # 목적점수는 FP1/5/10 평균(부드러운 지표)으로 계산 → 출렁임/회귀 완화
+        best_score = _objective(_combine_multifp(sc0, extra0), weak_names, weak_weight)
+        best_det   = det0
+        print(f"  → 전체 평균 탐지율 {det0:.1f}%  (목적점수 {best_score:.1f})  [{elapsed/60:.1f}분]")
     if weak_names:
         weak_str = ", ".join(f"{n}({d:.0f}%)" for n, d, _ in sc0 if n in weak_names)
         print(f"  약세 시나리오({len(weak_names)}개): {weak_str}")
@@ -1054,6 +1081,9 @@ def main():
                          "미지정 시 CANDIDATE_FEATURES 전체")
     ap.add_argument("--diagnose_only", action="store_true",
                     help="베이스라인 학습+평가(약세 진단)까지만, 재학습/순열중요도/export 생략")
+    ap.add_argument("--baseline_cache", default=None,
+                    help="diagnose_only 산출 JSON 경로 — 같은 피처셋이면 베이스라인 "
+                         "재학습을 생략하고 그 결과(det/score/시나리오)를 재사용")
     ap.add_argument("--scan_ratio", type=float, default=1.0,
                     help="후보 스캔 학습 표본 비율 (예 0.4 = 40%%만, 채택본은 풀 재학습). "
                          "1.0=풀(기본). 순위만 보므로 best 선택은 보통 동일, 스캔 2~3배 빠름")
@@ -1092,7 +1122,11 @@ def main():
         scen = {n: d for n, d, _ in base_h.get("scenarios", [])}
         if args.out_json:
             with open(args.out_json, "w", encoding="utf-8") as jf:
-                json.dump({"baseline_det": base_h["det"], "scenario_fp1": scen},
+                # score/extra 포함 → 이후 같은 피처셋의 greedy 가 --baseline_cache 로
+                # 이 결과를 재사용해 베이스라인 재학습을 생략한다 (브랜치당 1회만 학습).
+                json.dump({"baseline_det": base_h["det"], "scenario_fp1": scen,
+                           "baseline_score": base_h.get("score"),
+                           "extra": list(base_h.get("extra", []))},
                           jf, ensure_ascii=False, indent=2)
         print(f"\n[진단전용] 재학습/순열중요도/export 생략 — 약세 진단 완료 "
               f"(베이스 탐지율 {base_h['det']:.1f}%)")

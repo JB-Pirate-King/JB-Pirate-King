@@ -362,8 +362,12 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 
 - **사이클**: `release → log_run_done → chain → j_chain → new_branch` (다음 브랜치 시작).
   `recursion_limit = max(80, max_runs × 25)`, `--max_runs`(기본 50)로 무한루프 방지.
-- **수렴 종료**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`(라운드 남으면 재추천)
-  → 끝나면 `gate_converge → converge → END`.
+- **수렴 종료 (횟수 기준)**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`
+  으로 다른 각도 재추천 — **브랜치당 `--invent_rounds`(기본 2) 라운드 소진 후에야**
+  `gate_converge → converge → END`. 단발 미채택 = 즉시 종료가 아님.
+- **베이스라인 캐시**: `fe_baseline`(diagnose) 결과 JSON 을 `fe_train` 이 `--baseline_cache` 로
+  재사용 — 같은 피처셋이면 베이스라인 재학습 생략 (브랜치당 1회 학습). 재추천 라운드 비용은
+  후보 N개 학습만.
 - **세션 격리**: 브랜치마다 새 claude 세션(uuid). 브랜치 내 노드는 맥락 공유, 브랜치 간엔 격리.
 - **thread_id**: run 마다 `orchestrator-{시각}` 발급 (stdout/로그에 출력) — LangSmith Threads 뷰에서
   run 별로 분리되고, SqliteSaver 도입 시 크래시 재개 키로 쓴다. (고정값이면 전 run 이 한 스레드로 합쳐짐)
@@ -435,7 +439,7 @@ python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
 
 # 주요 플래그
 #   --invent N                추천 피처 개수 (기본 5)
-#   --invent_rounds N         수렴 시 재추천 라운드 상한
+#   --invent_rounds N         브랜치당 추천 라운드 상한 (기본 2 — 미채택이어도 재추천 후 수렴)
 #   --no_judge              모든 판정 끔
 #   --claude_model M          경량 모델 — 판정·지식요약 (기본 sonnet)
 #   --claude_model_heavy M    심층 모델 — 피처발명·상세분석 (기본 opus)

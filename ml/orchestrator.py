@@ -386,7 +386,9 @@ def n_new_branch(state: PipelineState) -> dict:
         "출발 피처": f"{len(state.get('current_extra', []))}개 (기채택)",
         "claude세션": RT.claude_sid[:8],
     })
-    return {"run_num": run_num, "branch": branch, "iters": state.get("iters", 0) + 1}
+    # reco_round 는 브랜치 단위 리셋 — 각 브랜치가 invent_rounds 만큼 재추천 기회를 가짐
+    return {"run_num": run_num, "branch": branch,
+            "iters": state.get("iters", 0) + 1, "reco_round": 1}
 
 
 def n_preprocess(state: PipelineState) -> dict:
@@ -682,9 +684,10 @@ def route_after_fe(state: PipelineState) -> str:
         return "fe_baseline"           # 실패 → 재진단/재시도
     if r.get("newly_adopted"):
         return "gate_deploy"
-    # 수렴: 추천 라운드 남으면 재추천, 아니면 종료 게이트
+    # 수렴 판단에 횟수 기준: 이 브랜치에서 미채택이라도 invent_rounds 까지
+    # 다른 각도로 재추천 (라운드 비용은 baseline_cache 로 후보 학습만).
+    # 모든 라운드 소진 후에야 수렴 게이트로 — 단발 미채택 = 즉시 종료 방지.
     if (RT.args.invent and RT.args.invent > 0
-            and not state.get("adopted_any")
             and state.get("reco_round", 1) < RT.args.invent_rounds):
         return "reco_again"
     return "gate_converge"
@@ -821,7 +824,9 @@ def main():
     p.add_argument("--scan_ratio", type=float, default=1.0)
     p.add_argument("--candidates", nargs="*", default=None)
     p.add_argument("--invent", type=int, default=5, help="claude 피처 추천 N개")
-    p.add_argument("--invent_rounds", type=int, default=1, help="수렴 시 재추천 라운드 상한")
+    p.add_argument("--invent_rounds", type=int, default=2,
+                   help="브랜치당 추천 라운드 상한 — 미채택이어도 이 횟수까지 다른 각도로 "
+                        "재추천 후에야 수렴 처리 (기본 2; 라운드 비용은 baseline_cache 덕에 후보 학습만)")
     p.add_argument("--n_anom", type=int, default=None)
     p.add_argument("--overall_tol", type=float, default=1.0)
     p.add_argument("--auto_approve", action="store_true")
