@@ -30,7 +30,7 @@ CONFIG_PATH = "ml/config/pipeline_config.json"
 from ml.core.constants import BASE_FEATURES   # 단일 출처 (ml/core/constants.py)
 
 # 브랜치 claude 세션 id — orchestrator.n_new_branch 가 매 브랜치마다 세팅.
-# claude_analyze 가 이 값으로 --resume 해서 하네스/추천/지식주입과 같은 세션에 누적된다.
+# claude_analyze 가 이 값으로 --resume 해서 판정/추천/지식주입과 같은 세션에 누적된다.
 _CLAUDE_SID = None
 
 # feature_engineer.py 의 INITIAL_EXTRA 와 동기화
@@ -224,7 +224,7 @@ def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
     if model:
         cmd += ["--model", model]
     if _CLAUDE_SID:
-        cmd += ["--resume", _CLAUDE_SID]   # 브랜치 세션 이어감 (지식+앞 하네스 맥락 상속)
+        cmd += ["--resume", _CLAUDE_SID]   # 브랜치 세션 이어감 (지식+앞 판정 맥락 상속)
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",

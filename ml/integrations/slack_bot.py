@@ -107,7 +107,7 @@ class SlackPipelineBot:
 
     def _post(self, **kwargs):
         """chat_postMessage 래퍼 — log_file 지정 시 text 를 타임스탬프와 함께 파일에도 기록.
-        Slack 전용이던 서술 로그(하네스 verdict·지식요약·스테이지 결과)가 영구 파일로 남는다."""
+        Slack 전용이던 서술 로그(판정 verdict·지식요약·스테이지 결과)가 영구 파일로 남는다."""
         if self.log_file:
             try:
                 br = f"[{self.current_branch}]" if self.current_branch else ""

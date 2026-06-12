@@ -77,7 +77,7 @@ JB-Pirate-King/
 │   │   ├── google_credentials.json      # GCP service account (gitignored)
 │   │   ├── notify_config.json           # Discord/Notion tokens (gitignored)
 │   │   └── fe_state.json                # FE starting features / initial_extra (tracked)
-│   ├── orchestrator.py         # LangGraph orchestrator (reco + per-node harness + gates) ★
+│   ├── orchestrator.py         # LangGraph orchestrator (reco + per-node judge + gates) ★
 │   ├── pipeline_steps.py       # Shared step library (run_cmd, stage_*, _fe_train_eval, parsers) ★
 │   └── build_plugin_wsl.sh     # WSL (Ubuntu-24.04) cmake+make package auto-build ★
 ├── ais_ids_pi/                 # OpenCPN plugin (C++)
@@ -287,15 +287,15 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md`
   `ml/dynamic_candidates.py` (gitignored) → `feature_engineer` loads + scans them. Convergence
   (no adoption) re-recommends from a different angle up to `--invent_rounds`. `--invent` defaults
   to **5** and is the ONLY candidate source — `CANDIDATE_FEATURES` is empty (no static pool).
-- **per-node claude harness** (`claude_harness` factory): each compute node is followed by a harness
+- **per-node claude judge** (`claude_judge` factory): each compute node is followed by a judge
   node that runs `claude -p --output-format json` → `{assessment, verdict: continue|retry|stop, ...}`
   → routing. Per-stage judging criteria injected via `STAGE_FOCUS`; model replies fenced in
-  ```` ```json ```` are stripped (`_strip_code_fence`). Toggle per node via `HARNESS_ON` set;
-  `--no_harness` disables all.
+  ```` ```json ```` are stripped (`_strip_code_fence`). Toggle per node via `JUDGE_ON` set;
+  `--no_judge` disables all.
 - **per-branch claude session**: `n_new_branch` issues a uuid; knowledge priming creates the
-  session (`--session-id`), then harness/recommend/`claude_analyze` all `--resume` it — one
+  session (`--session-id`), then judge/recommend/`claude_analyze` all `--resume` it — one
   accumulated conversation per branch, isolated across branches. Models per call type:
-  `--claude_model` (default `sonnet`) for harness verdicts + knowledge summary,
+  `--claude_model` (default `sonnet`) for judge verdicts + knowledge summary,
   `--claude_model_heavy` (default `opus`) for feature invention + FE deep analysis
   (cross-model resume keeps context).
 - **knowledge priming** (`--knowledge`, default on): team-vault ML/security docs (4 files,
@@ -320,7 +320,7 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md`
 - **Runner**: `run_pipeline` polls `__interrupt__`, gets the Slack decision via `bot.wait_approval`,
   resumes with `Command(resume=decision)`.
 - **Launch**: `python -m ml.orchestrator` (same flags as before + `--invent`, `--invent_rounds`,
-  `--no_harness`, `--claude_model`, `--claude_model_heavy`, `--knowledge/--no-knowledge`).
+  `--no_judge`, `--claude_model`, `--claude_model_heavy`, `--knowledge/--no-knowledge`).
 - **LangSmith tracing**: `orchestrator.py` auto-loads repo-root `.env` (gitignored) at import —
   set `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT` there and every
   node run/route is traced to smith.langchain.com with no code changes.
