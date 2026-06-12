@@ -866,9 +866,9 @@ def main():
     p.add_argument("--scan_ratio", type=float, default=1.0)
     p.add_argument("--candidates", nargs="*", default=None)
     p.add_argument("--invent", type=int, default=5, help="claude 피처 추천 N개")
-    p.add_argument("--invent_rounds", type=int, default=2,
+    p.add_argument("--invent_rounds", type=int, default=3,
                    help="브랜치당 추천 라운드 상한 — 미채택이어도 이 횟수까지 다른 각도로 "
-                        "재추천 후에야 수렴 처리 (기본 2; 라운드 비용은 baseline_cache 덕에 후보 학습만)")
+                        "재추천 후에야 수렴 처리 (기본 3; 라운드 비용은 baseline_cache 덕에 후보 학습만)")
     p.add_argument("--n_anom", type=int, default=None)
     p.add_argument("--overall_tol", type=float, default=1.0)
     p.add_argument("--auto_approve", action="store_true")
