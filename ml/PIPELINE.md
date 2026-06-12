@@ -381,10 +381,22 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 세션 누적 순서: ① 지식 주입 → ② 판정들 → ③ 피처 추천 → ④ claude_analyze(FE 상세분석)
 — 전부 한 대화. 턴마다 모델만 바꿔 resume (맥락 유지 검증됨).
 
-| 경로 | 모델 | 플래그 |
-|---|---|---|
-| 피처 발명(recommend) · FE 상세분석(claude_analyze) | **Opus 4.8** | `--claude_model_heavy` (기본 opus) |
-| 판정 verdict ×7 · 지식주입/요약 | **Sonnet 4.6** | `--claude_model` (기본 sonnet) |
+노드별 모델 배치 (기본값). 원칙: **판정·요약·한줄노트 = sonnet** (잦고 가벼움) /
+**발명·심층분석 = opus** (추론 가치). 전부 같은 브랜치 세션을 모델만 바꿔 resume.
+
+| claude 호출 노드 | 하는 일 | 모델 | 플래그 |
+|---|---|---|---|
+| `j_branch` | 브랜치 생성 점검 verdict | Sonnet 4.6 | `--claude_model` |
+| `j_base` | 베이스라인 진단 verdict | Sonnet 4.6 | 〃 |
+| `j_reco` | 추천 후보 타당성 verdict | Sonnet 4.6 | 〃 |
+| `j_fe` | FE 채택 결과 verdict (라우팅 결합) | Sonnet 4.6 | 〃 |
+| `j_build` | 빌드 산출 점검 verdict | Sonnet 4.6 | 〃 |
+| `j_release` | 릴리즈 점검 verdict | Sonnet 4.6 | 〃 |
+| `j_chain` | 체인 상태 점검 verdict | Sonnet 4.6 | 〃 |
+| 지식주입+요약 (`_prime_session`) | team-vault 시드 + 한국어 요약 | Sonnet 4.6 | 〃 |
+| `readme` | 루트 README Run Results Note 한 줄 | Sonnet 4.6 | 〃 |
+| **`recommend`** | **새 피처 lambda 발명** | **Opus 4.8** | `--claude_model_heavy` |
+| **`claude_analyze`** | **FE 상세분석** (전처리/FE 실패/FE 성공 3지점) | **Opus 4.8** | 〃 |
 
 ### 도메인 지식 주입 (`--knowledge`, 기본 on)
 
