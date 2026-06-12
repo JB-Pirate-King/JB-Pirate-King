@@ -71,4 +71,4 @@ new_branch → baseline →[reco: LLM 피처발명]→ fe_train →[게이트:�
 
 ## 관련
 
-[[09 최종발표 마스터플랜]] · [[00 - 프로젝트 현황 (Claude)]] · 코드: develop `ml/orchestrator.py`(LangGraph), `ml/pipeline_steps.py`(claude_analyze)
+[[발표 마스터플랜]] · [[LLM 동작 방식 — 위키·LangGraph·MCP]] · [[CCIT/운영 현황 정리 (2026-06-11) — Claude|운영 현황 정리]] · 코드: develop `ml/orchestrator.py`(LangGraph), `ml/pipeline_steps.py`(claude_analyze)
