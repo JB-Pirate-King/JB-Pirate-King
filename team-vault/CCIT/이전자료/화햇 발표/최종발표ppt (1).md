@@ -1,6 +1,6 @@
 ---
 source_file: 최종발표ppt (1).pdf
-last_synced: 2026-06-12 19:33
+last_synced: 2026-06-12 19:42
 tags: [notion-sync, attachment]
 ---
 
