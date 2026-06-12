@@ -84,6 +84,38 @@ RT = _Runtime()
 
 
 # ─────────────────────────────────────────────
+# 파일 로깅 — stdout/stderr tee + 브랜치별 로그 파일 전환
+# ─────────────────────────────────────────────
+_LOG = {"f": None, "path": None}   # 현재 로그 파일 핸들/경로 (브랜치마다 교체)
+
+
+def _switch_log(path):
+    """로그 파일 전환 — 이전 파일 닫고 새 파일 열기. bot.log_file 도 동기화."""
+    if _LOG["f"]:
+        try:
+            _LOG["f"].close()
+        except Exception:
+            pass
+    _LOG["f"] = open(path, "a", encoding="utf-8", errors="replace")
+    _LOG["path"] = str(path)
+    if RT.bot:
+        RT.bot.log_file = str(path)
+
+
+class _Tee:
+    """stdout/stderr 복제 — 콘솔 + 현재 _LOG 파일 동시 기록."""
+    def __init__(self, stream):
+        self.stream = stream
+    def write(self, s):
+        self.stream.write(s)
+        if _LOG["f"]:
+            _LOG["f"].write(s)
+            _LOG["f"].flush()
+    def flush(self):
+        self.stream.flush()
+
+
+# ─────────────────────────────────────────────
 # 도메인 지식 (team-vault Notion→md) — 브랜치 세션 시작 시 1회 주입
 # ─────────────────────────────────────────────
 # ML/보안 관련 문서만 (OpenCPN C++ 빌드 매뉴얼은 FE/판정과 무관 → 제외).
@@ -342,6 +374,8 @@ def n_new_branch(state: PipelineState) -> dict:
     RT.claude_started = False
     steps._CLAUDE_SID = RT.claude_sid   # claude_analyze(steps)도 같은 세션 --resume
     RT.bot.current_branch = branch      # 파일 로그 라인의 [브랜치] 접두사
+    # 브랜치별 로그 파일로 전환: ml/logs/{branch}_{시각}.log
+    _switch_log(Path("ml/logs") / f"{branch}_{time.strftime('%Y%m%d_%H%M%S')}.log")
     # 로그 파일에 브랜치 구분선 + 풀 세션 uuid (stdout tee 로 기록됨)
     print(f"\n{'='*70}\n===== {branch} 시작 — claude session {RT.claude_sid} =====\n{'='*70}")
     _prime_session(RT.knowledge)        # 도메인 지식 시드 (--knowledge, team-vault)
@@ -751,21 +785,12 @@ def main():
     args = p.parse_args()
 
     # ── 영구 파일 로깅: stdout/stderr tee + Slack 서술 로그 ──
-    # ml/logs/run_YYYYMMDD_HHMMSS.log 하나에 raw 출력과 Slack text 가 함께 남는다.
-    log_dir = Path("ml/logs"); log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    _logf = open(log_path, "a", encoding="utf-8", errors="replace")
-
-    class _Tee:
-        def __init__(self, stream): self.stream = stream
-        def write(self, s):
-            self.stream.write(s)
-            _logf.write(s); _logf.flush()
-        def flush(self): self.stream.flush()
-
+    # 시작 시 ml/logs/run_*.log, 브랜치 진입마다 ml/logs/{branch}_*.log 로 전환(_switch_log).
+    Path("ml/logs").mkdir(parents=True, exist_ok=True)
+    _switch_log(Path("ml/logs") / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log")
     sys.stdout = _Tee(sys.stdout)
     sys.stderr = _Tee(sys.stderr)
-    print(f"[로그] {log_path}")
+    print(f"[로그] {_LOG['path']}")
 
     steps._AUTO_APPROVE = args.auto_approve
     if args.no_harness:
@@ -774,7 +799,7 @@ def main():
     cfg = steps.load_config()
     RT.bot = _sb.SlackPipelineBot(cfg["slack"]["bot_token"], cfg["slack"]["app_token"],
                                   cfg["slack"]["channel"])
-    RT.bot.log_file = str(log_path)   # Slack 서술 로그도 같은 파일에
+    RT.bot.log_file = _LOG["path"]   # Slack 서술 로그도 같은 파일에
 
     RT.sheet = _sh.PipelineSheets(cfg["google_sheets"]["credentials_file"],
                                   cfg["google_sheets"]["sheet_id"])

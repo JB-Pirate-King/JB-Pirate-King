@@ -305,9 +305,10 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md`
   so `n_chain` merges adopted `{name, desc, lambda_src}` into tracked
   `ml/config/adopted_features.py` (committed with fe_state); `feature_engineer` exec-loads it —
   without this the next run's `--initial_extra` crashes with KeyError.
-- **file logging**: every run tees stdout/stderr + all Slack message texts (with
-  `[HH:MM:SS][branch]` prefixes and per-branch session-uuid separators) into
-  `ml/logs/run_YYYYMMDD_HHMMSS.log` (gitignored).
+- **file logging**: stdout/stderr tee + all Slack message texts (with
+  `[HH:MM:SS][branch]` prefixes) into `ml/logs/` (gitignored). Startup writes
+  `run_{ts}.log`; each branch entry switches to its own `{branch}_{ts}.log`
+  headed by a separator with the full claude session uuid.
 - **release artifact archive**: `stage_release` copies the model files to `ml/deploy/{branch}/`
   and commits them to the run branch (tar.gz copied but git-ignored).
 - **interrupt() gates**: deploy / release / converge are independent `interrupt()` nodes. Because

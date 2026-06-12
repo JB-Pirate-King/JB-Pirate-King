@@ -390,7 +390,7 @@ feature_engineer 가 시작 시 로드. 없으면 다음 run 의 `--initial_extr
 
 | 싱크 | 내용 |
 |---|---|
-| **`ml/logs/run_*.log`** (gitignored) | stdout/stderr tee + 모든 Slack 메시지 text(`[HH:MM:SS][브랜치]` 접두사) + 브랜치 시작 구분선(풀 세션 uuid) |
+| **`ml/logs/`** (gitignored) | stdout/stderr tee + 모든 Slack 메시지 text(`[HH:MM:SS][브랜치]` 접두사). 시작 시 `run_{시각}.log`, **브랜치 진입마다 `{branch}_{시각}.log` 로 전환** — 파일당 한 브랜치. 머리에 브랜치 구분선 + 풀 claude 세션 uuid |
 | Slack `#ais-pipeline` | 서술 로그 — 시작그리드·지식요약·하네스 verdict·후보표·게이트 |
 | Google Sheets | 구조화 지표 5탭 |
 | LangSmith (`.env` 트레이싱) | 노드 span·라우팅·state·latency (관찰 전용) |
