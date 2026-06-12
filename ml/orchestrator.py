@@ -553,8 +553,9 @@ def n_readme(state: PipelineState) -> dict:
     --resume 한 claude 가 작성. README 는 run 브랜치에 커밋된다."""
     r = state.get("r", {})
     fe = r.get("fe_stats", {})
-    # FP5/10 은 fe_stats 에 없어 FE JSON 에서 보강
+    # FP5/10·시나리오별 탐지율은 fe_stats 에 없어 FE JSON 에서 보강
     det5 = det10 = None
+    d = {}
     fe_json = steps.WORK_DIR / "feat_eng_iter01.json"
     if fe_json.exists():
         try:
@@ -579,6 +580,8 @@ def n_readme(state: PipelineState) -> dict:
         th=(f"{fe.get('threshold'):.6f}" if isinstance(fe.get("threshold"), (int, float)) else "-"),
         nf=r.get("n_feat", "-"), note=note or "-")
 
+    detail = _readme_detail_block(state["branch"], r, fe, d, note)
+
     try:
         p = Path("README.md")
         txt = p.read_text(encoding="utf-8")
@@ -588,7 +591,14 @@ def n_readme(state: PipelineState) -> dict:
         lines = [l for l in block.strip().splitlines() if l.strip()]
         table_head, rows = lines[:2], lines[2:]          # 헤더 2줄 유지, 최신 행을 위로
         new_block = "\n".join(table_head + [row] + rows)
-        p.write_text(head + begin + "\n" + new_block + "\n" + end + tail, encoding="utf-8")
+        txt = head + begin + "\n" + new_block + "\n" + end + tail
+        # 상세 블록 (시나리오별 FP1/5/10) — RUN_DETAILS 마커에 최신순 prepend
+        db, de = "<!-- RUN_DETAILS:BEGIN -->", "<!-- RUN_DETAILS:END -->"
+        if detail and db in txt:
+            head2, rest2 = txt.split(db, 1)
+            old_details, tail2 = rest2.split(de, 1)
+            txt = head2 + db + "\n" + detail + "\n" + old_details.strip("\n") + "\n" + de + tail2
+        p.write_text(txt, encoding="utf-8")
         git.commit_results(["README.md"],
                            f"docs: {state['branch']} run result → README", branch=state["branch"])
         RT.bot.log(f"📝 README Run Results 갱신 — {state['branch']}"
@@ -596,6 +606,35 @@ def n_readme(state: PipelineState) -> dict:
     except Exception as e:
         print(f"[readme] 갱신 실패(무시): {e}")
     return {}
+
+
+def _readme_detail_block(branch: str, r: dict, fe: dict, d: dict, note: str) -> str:
+    """run 상세 — FP별 + 시나리오(공격 유형)별 탐지율을 접이식 블록으로.
+    d = FE 산출 JSON (scenario_fp1/fp5/fp10, feature_descriptions 포함). 비면 생략."""
+    sc1 = d.get("scenario_fp1") or {}
+    if not sc1:
+        return ""
+    sc5, sc10 = d.get("scenario_fp5") or {}, d.get("scenario_fp10") or {}
+    descs = d.get("feature_descriptions", {})
+    adopted = r.get("newly_adopted", [])
+    base, det = fe.get("baseline_det"), fe.get("det_rate")
+    fmt = lambda x: (f"{x:.1f}%" if isinstance(x, (int, float)) else "-")
+
+    L = [f"<details>",
+         f"<summary><b>{branch}</b> — " + (", ".join(f"<code>{f}</code>" for f in adopted) or "no adoption")
+         + f" · FP=1% {fmt(base)}→{fmt(det)} · {time.strftime('%Y-%m-%d')}</summary>", ""]
+    for f in adopted:
+        if descs.get(f):
+            L.append(f"- `{f}` — {descs[f]}")
+    if note:
+        L.append(f"- 🤖 {note}")
+    L += ["", "| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |",
+          "|---|---|---|---|---|"]
+    for name, v1 in sorted(sc1.items(), key=lambda kv: kv[1]):
+        flag = "⚠️ weak" if v1 < 50 else ""
+        L.append(f"| {name} | {v1:.1f}% | {fmt(sc5.get(name))} | {fmt(sc10.get(name))} | {flag} |")
+    L += ["", "</details>", ""]
+    return "\n".join(L)
 
 
 def n_chain(state: PipelineState) -> dict:
