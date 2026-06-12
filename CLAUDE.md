@@ -289,7 +289,28 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md`
   to **5** and is the ONLY candidate source — `CANDIDATE_FEATURES` is empty (no static pool).
 - **per-node claude harness** (`claude_harness` factory): each compute node is followed by a harness
   node that runs `claude -p --output-format json` → `{assessment, verdict: continue|retry|stop, ...}`
-  → routing. Toggle per node via `HARNESS_ON` set; `--no_harness` disables all.
+  → routing. Per-stage judging criteria injected via `STAGE_FOCUS`; model replies fenced in
+  ```` ```json ```` are stripped (`_strip_code_fence`). Toggle per node via `HARNESS_ON` set;
+  `--no_harness` disables all.
+- **per-branch claude session**: `n_new_branch` issues a uuid; knowledge priming creates the
+  session (`--session-id`), then harness/recommend/`claude_analyze` all `--resume` it — one
+  accumulated conversation per branch, isolated across branches. Models per call type:
+  `--claude_model` (default `sonnet`) for harness verdicts + knowledge summary,
+  `--claude_model_heavy` (default `opus`) for feature invention + FE deep analysis
+  (cross-model resume keeps context).
+- **knowledge priming** (`--knowledge`, default on): team-vault ML/security docs (4 files,
+  ~26K chars) seeded as the session's first turn; claude returns a Korean summary (attack types,
+  detection approach, feature ideas) shown in Slack. `--no-knowledge` to disable.
+- **adopted-feature persistence**: `dynamic_candidates.py` is overwritten every recommend round,
+  so `n_chain` merges adopted `{name, desc, lambda_src}` into tracked
+  `ml/config/adopted_features.py` (committed with fe_state); `feature_engineer` exec-loads it —
+  without this the next run's `--initial_extra` crashes with KeyError.
+- **file logging**: stdout/stderr tee + all Slack message texts (with
+  `[HH:MM:SS][branch]` prefixes) into `ml/logs/` (gitignored). Startup writes
+  `run_{ts}.log`; each branch entry switches to its own `{branch}_{ts}.log`
+  headed by a separator with the full claude session uuid.
+- **release artifact archive**: `stage_release` copies the model files to `ml/deploy/{branch}/`
+  and commits them to the run branch (tar.gz copied but git-ignored).
 - **interrupt() gates**: deploy / release / converge are independent `interrupt()` nodes. Because
   gates sit at node boundaries, a crash while awaiting Slack approval resumes **without retraining**.
 - **Sheets**: `log_sheet(kind)` DRY factory (`run_start|fe|run_done|converge`).
@@ -299,7 +320,7 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md`
 - **Runner**: `run_pipeline` polls `__interrupt__`, gets the Slack decision via `bot.wait_approval`,
   resumes with `Command(resume=decision)`.
 - **Launch**: `python -m ml.orchestrator` (same flags as before + `--invent`, `--invent_rounds`,
-  `--no_harness`).
+  `--no_harness`, `--claude_model`, `--claude_model_heavy`, `--knowledge/--no-knowledge`).
 - **LangSmith tracing**: `orchestrator.py` auto-loads repo-root `.env` (gitignored) at import —
   set `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT` there and every
   node run/route is traced to smith.langchain.com with no code changes.

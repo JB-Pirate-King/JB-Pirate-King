@@ -127,6 +127,20 @@ CANDIDATE_FEATURES: dict = {}  # 정적 후보 없음 — 전량 claude -p 동�
 # reco 노드가 약세 진단 → 새 피처 lambda 를 ml/dynamic_candidates.py 에
 # DYNAMIC_FEATURES dict 로 써둔다. 여기서 이 모듈 네임스페이스로 exec → lambda 가
 # _B / _ang_diff / math 를 그대로 참조 → CANDIDATE_FEATURES 에 병합. 파일 없으면 무시.
+# 채택 피처 영속 파일을 먼저 로드 — 이전 run 에서 채택된 동적 피처의 lambda.
+# dynamic_candidates.py 는 매 recommend 마다 덮어써지므로, 채택분 lambda 를 여기
+# 보존하지 않으면 다음 run 의 --initial_extra 계산에서 KeyError 가 난다.
+_ADOPTED_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "adopted_features.py")
+if os.path.exists(_ADOPTED_PATH):
+    try:
+        with open(_ADOPTED_PATH, encoding="utf-8") as _af:
+            exec(_af.read(), globals())
+        _adp = globals().get("ADOPTED_FEATURES", {})
+        CANDIDATE_FEATURES.update(_adp)
+        print(f"[채택피처] {len(_adp)}개 로드: {list(_adp)}")
+    except Exception as _e:
+        print(f"[채택피처] 로드 실패(무시): {_e}")
+
 _DYN_PATH = os.path.join(os.path.dirname(__file__), "..", "dynamic_candidates.py")
 if os.path.exists(_DYN_PATH):
     try:

@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Optional, TypedDict
@@ -65,6 +66,10 @@ STAGE_FOCUS = {
 # 추천 피처를 feature_engineer 가 읽는 동적 후보 파일 (feature_engineer 가 exec 로드)
 DYNAMIC_CAND_PATH = "ml/dynamic_candidates.py"
 
+# 채택된 동적 피처의 lambda 영속 파일 (git 추적). dynamic_candidates.py 는 매 추천마다
+# 덮어써지므로, 채택분은 여기로 옮겨 보존해야 다음 run 의 --initial_extra 계산이 가능.
+ADOPTED_FEATS_PATH = "ml/config/adopted_features.py"
+
 
 class _Runtime:
     bot = None
@@ -72,8 +77,68 @@ class _Runtime:
     args = None
     claude_sid = None        # 브랜치당 claude 세션 id (노드 간 맥락 누적)
     claude_started = False   # 해당 세션 첫 호출 여부 (--session-id vs --resume)
+    knowledge = ""           # 세션 시작 시 주입할 도메인 지식 (team-vault, --knowledge)
+    last_cands = {}          # 이번 브랜치 추천 후보 dict (name → {desc, lambda_src}) — 채택 영속화용
 
 RT = _Runtime()
+
+
+# ─────────────────────────────────────────────
+# 파일 로깅 — stdout/stderr tee + 브랜치별 로그 파일 전환
+# ─────────────────────────────────────────────
+_LOG = {"f": None, "path": None}   # 현재 로그 파일 핸들/경로 (브랜치마다 교체)
+
+
+def _switch_log(path):
+    """로그 파일 전환 — 이전 파일 닫고 새 파일 열기. bot.log_file 도 동기화."""
+    if _LOG["f"]:
+        try:
+            _LOG["f"].close()
+        except Exception:
+            pass
+    _LOG["f"] = open(path, "a", encoding="utf-8", errors="replace")
+    _LOG["path"] = str(path)
+    if RT.bot:
+        RT.bot.log_file = str(path)
+
+
+class _Tee:
+    """stdout/stderr 복제 — 콘솔 + 현재 _LOG 파일 동시 기록."""
+    def __init__(self, stream):
+        self.stream = stream
+    def write(self, s):
+        self.stream.write(s)
+        if _LOG["f"]:
+            _LOG["f"].write(s)
+            _LOG["f"].flush()
+    def flush(self):
+        self.stream.flush()
+
+
+# ─────────────────────────────────────────────
+# 도메인 지식 (team-vault Notion→md) — 브랜치 세션 시작 시 1회 주입
+# ─────────────────────────────────────────────
+# ML/보안 관련 문서만 (OpenCPN C++ 빌드 매뉴얼은 FE/판정과 무관 → 제외).
+KNOWLEDGE_FILES = [
+    "team-vault/자료/머신러닝 기반 선박 AIS IDS 설계 및 구현.md",
+    "team-vault/자료/WISA_2025_Poster_Design_and_Analysis_of_Dynamic_Flooding_Attack_Scenarios_Based_on_the_NMEA_Protocol.md",
+    "team-vault/자료/해상 네트워크에서의 IDS 적용 가능성 연구 SCADA 환경과의 비교 분석.md",
+    "team-vault/자료/프로젝트 중간발표.md",
+]
+
+
+def _load_knowledge(max_chars: int = 60000) -> str:
+    """KNOWLEDGE_FILES 를 읽어 frontmatter 제거 후 합친다. 없는 파일은 건너뜀."""
+    import re as _re
+    parts = []
+    for path in KNOWLEDGE_FILES:
+        p = Path(path)
+        if not p.exists():
+            continue
+        txt = p.read_text(encoding="utf-8", errors="replace")
+        txt = _re.sub(r"^---\n.*?\n---\n", "", txt, count=1, flags=_re.S)  # YAML frontmatter 제거
+        parts.append(f"## {p.stem}\n{txt.strip()}")
+    return "\n\n".join(parts)[:max_chars]
 
 
 # ─────────────────────────────────────────────
@@ -148,19 +213,54 @@ def _strip_code_fence(text: str) -> str:
     return t.strip()
 
 
-def _branch_claude(prompt: str, timeout: int = 120) -> Optional[dict]:
+def _branch_claude(prompt: str, timeout: int = 120, heavy: bool = False) -> Optional[dict]:
     """브랜치당 claude 세션 1개를 유지하며 호출 — 노드 간 맥락 누적 + 캐시 재사용.
 
     첫 호출은 --session-id 로 RT.claude_sid 세션을 만들고, 이후는 --resume 로
     이어붙인다. 같은 브랜치의 추천/하네스가 베이스라인·채택 결과를 기억한 채 판정한다.
-    세션 id 가 없으면(미설정) stateless 단발 호출로 폴백."""
+    세션 id 가 없으면(미설정) stateless 단발 호출로 폴백.
+
+    heavy=True 면 창의/심층 작업용 모델(--claude_model_heavy, 기본 opus) 사용 —
+    같은 세션을 턴마다 다른 모델로 resume 해도 맥락은 유지된다 (검증됨)."""
     sid = RT.claude_sid
     first = not RT.claude_started
-    model = getattr(RT.args, "claude_model", None)   # 브랜치 세션 전체 동일 모델
+    model = getattr(RT.args, "claude_model_heavy" if heavy else "claude_model", None)
     out = _claude_json(prompt, timeout, session=sid, first=first, model=model)
     if sid:
         RT.claude_started = True   # 생성 시도 후엔 항상 resume (턴은 이미 기록됨)
     return out
+
+
+def _prime_session(knowledge: str):
+    """브랜치 세션을 도메인 지식으로 시드 — 첫 호출(--session-id)로 지식을 넣어두면
+    이후 하네스/추천이 --resume 로 그 지식을 알고 판정·발명한다.
+    JSON 파싱 불필요(응답 무시)하므로 _claude_json 대신 직접 호출."""
+    if not (knowledge and RT.claude_sid):
+        return
+    prompt = (
+        "You are joining an AIS anomaly-detection ML pipeline as its analyst and feature engineer. "
+        "Study the project domain knowledge below (research notes on AIS spoofing, ML-based IDS design, "
+        "NMEA flooding attack scenarios). Use it in every later judgment and feature invention in THIS session.\n"
+        "After studying, reply with a SHORT KOREAN summary (3-4 bullet lines, no preamble) of the key points "
+        "you will use: main attack types, detection approach, and 1-2 concrete feature ideas.\n\n"
+        "=== PROJECT KNOWLEDGE ===\n" + knowledge
+    )
+    cmd = ["claude", "-p", prompt, "--session-id", RT.claude_sid]
+    model = getattr(RT.args, "claude_model", None)
+    if model:
+        cmd += ["--model", model]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=240)
+        RT.claude_started = True   # 세션 생성됨 → 이후는 resume
+        summary = r.stdout.strip() if r.returncode == 0 else ""
+        RT.bot.log(
+            f"📚 *도메인 지식 주입* ({len(knowledge):,}자 · {len(KNOWLEDGE_FILES)}개 문서) → 세션 시드"
+            + (f"\n{summary}" if summary else ""),
+            "지식",
+        )
+    except Exception as e:
+        print(f"[지식주입] 실패(무시): {e}")
 
 
 def _harness_prompt(stage: str, text: str, extra: dict) -> str:
@@ -272,6 +372,13 @@ def n_new_branch(state: PipelineState) -> dict:
     # 새 브랜치마다 새 claude 세션 — 노드 간 맥락은 누적하되 브랜치 간엔 격리.
     RT.claude_sid = str(uuid.uuid4())
     RT.claude_started = False
+    steps._CLAUDE_SID = RT.claude_sid   # claude_analyze(steps)도 같은 세션 --resume
+    RT.bot.current_branch = branch      # 파일 로그 라인의 [브랜치] 접두사
+    # 브랜치별 로그 파일로 전환: ml/logs/{branch}_{시각}.log
+    _switch_log(Path("ml/logs") / f"{branch}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    # 로그 파일에 브랜치 구분선 + 풀 세션 uuid (stdout tee 로 기록됨)
+    print(f"\n{'='*70}\n===== {branch} 시작 — claude session {RT.claude_sid} =====\n{'='*70}")
+    _prime_session(RT.knowledge)        # 도메인 지식 시드 (--knowledge, team-vault)
     RT.bot.log_run_start(branch, {
         "모델": RT.args.model, "epochs": RT.args.epochs, "max_mmsi": RT.args.max_mmsi,
         "데이터": RT.args.data_file, "base_dir": RT.args.base_dir,
@@ -336,9 +443,11 @@ def n_recommend(state: PipelineState) -> dict:
     """claude 피처 추천 → 검증 → dynamic_candidates.py 기록 → 후보풀 확장."""
     weak = state.get("baseline", {}).get("weak", "")
     tried = state.get("tried_feats", [])
-    arr = _branch_claude(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")), timeout=240)
+    arr = _branch_claude(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")),
+                         timeout=240, heavy=True)   # 피처 발명 = 창의 작업 → opus
     cands = _validate_recos(arr if isinstance(arr, list) else [])
     if cands:
+        RT.last_cands.update({c["name"]: c for c in cands})   # 채택 시 lambda 영속화용 보관
         _write_dynamic_candidates(cands)
         RT.args.candidates = [c["name"] for c in cands]
         RT.bot.log(f"🧬 *추천 {len(cands)}개*: " +
@@ -368,6 +477,35 @@ def _validate_recos(arr: list) -> list:
         except Exception as e:
             print(f"[추천] '{name}' 제외: {e}")
     return valid
+
+
+def _persist_adopted(names: list) -> bool:
+    """채택된 피처의 lambda 를 ADOPTED_FEATS_PATH 에 병합 저장 (이전 내용 유지).
+    feature_engineer 가 시작 시 이 파일을 로드해 initial_extra 계산에 쓴다."""
+    entries = {}
+    p = Path(ADOPTED_FEATS_PATH)
+    if p.exists():   # 기존 채택분 로드 (exec → ADOPTED_FEATURES) — desc/lambda_src 원문은
+        try:         # 재구성 불가하므로 파일 텍스트 파싱 대신 소스 라인 보존 방식 사용
+            existing = p.read_text(encoding="utf-8").splitlines()
+            entries = {l.split('"')[1]: l for l in existing
+                       if l.strip().startswith('"') and '": (' in l}
+        except Exception as e:
+            print(f"[채택영속화] 기존 파일 파싱 실패(새로 작성): {e}")
+    added = False
+    for n in names:
+        c = RT.last_cands.get(n)
+        if not c or n in entries:
+            continue
+        entries[n] = (f'    "{n}": ({json.dumps(c.get("desc", ""), ensure_ascii=False)}, '
+                      f'{c["lambda_src"]}),')
+        added = True
+    if not entries:
+        return False
+    body = ["# 채택된 동적 피처 lambda 영속 보관 — orchestrator n_chain 이 채택 시 병합 기록.",
+            "# feature_engineer 가 시작 시 exec 로드 (initial_extra 계산에 필수). git 추적.",
+            "ADOPTED_FEATURES = {"] + list(entries.values()) + ["}"]
+    p.write_text("\n".join(body) + "\n", encoding="utf-8")
+    return added
 
 
 def _write_dynamic_candidates(cands: list):
@@ -406,7 +544,12 @@ def n_release(state: PipelineState) -> dict:
 def n_chain(state: PipelineState) -> dict:
     full_extra = state["r"]["full_extra"]
     steps._save_fe_initial_extra(full_extra)
-    git.commit_results([steps.FE_STATE_FILE],
+    # 채택 피처 lambda 영속화 — 안 하면 다음 run 의 dynamic_candidates 덮어쓰기로
+    # lambda 유실 → feature_engineer KeyError (initial_extra 계산 불가).
+    commit_files = [steps.FE_STATE_FILE]
+    if _persist_adopted(state["r"].get("newly_adopted", [])):
+        commit_files.append(ADOPTED_FEATS_PATH)
+    git.commit_results(commit_files,
                        f"chore(fe): {state['branch']} fe_state 갱신 ({len(full_extra)}피처)",
                        branch=state["branch"])
     nxt = git.get_next_run_num(RT.args.model)
@@ -454,6 +597,21 @@ def route_after_branch(state: PipelineState) -> str:
         RT.bot.log(f"⚠️ 안전 상한 {RT.args.max_runs} 도달", "warning")
         return "END"
     return "preprocess" if (state.get("first_iter", True) and not RT.args.skip_preprocess) else "fe_baseline"
+
+
+def route_after_chain(state: PipelineState) -> str:
+    """체인 후 라우팅 — 다음 브랜치를 **생성하기 전에** max_runs 가드.
+    하네스 verdict 우선(stop/retry), 그다음 상한 도달 시 빈 브랜치를 만들지 않고 종료.
+    (전엔 new_branch 가 빈 브랜치를 만든 뒤 route_after_branch 가 END 처리해 낭비 브랜치가 생겼다.)"""
+    d = state.get("decision", "continue")
+    if d == "stop":
+        return "user_stop"
+    if d == "retry":
+        return "fe_train"
+    if state.get("iters", 0) >= RT.args.max_runs:
+        RT.bot.log(f"⚠️ 안전 상한 {RT.args.max_runs} 도달 — 체이닝 종료", "warning")
+        return "END"
+    return "new_branch"
 
 
 def route_after_preprocess(state: PipelineState) -> str:
@@ -561,8 +719,9 @@ def build_graph(checkpointer=None):
                             {"log_run_done": "log_run_done", "fe_train": "fe_train", "user_stop": "user_stop"})
     g.add_edge("log_run_done", "chain")
     g.add_edge("chain", "h_chain")
-    g.add_conditional_edges("h_chain", _route_harness("new_branch"),
-                            {"new_branch": "new_branch", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("h_chain", route_after_chain,
+                            {"new_branch": "new_branch", "fe_train": "fe_train",
+                             "user_stop": "user_stop", "END": END})
 
     g.add_conditional_edges("gate_converge", route_gate_converge,
                             {"converge": "converge", "user_stop": "user_stop"})
@@ -616,10 +775,22 @@ def main():
     p.add_argument("--build_plugin", action="store_true")
     p.add_argument("--no_harness", action="store_true", help="모든 하네스 끔")
     p.add_argument("--claude_model", default="sonnet",
-                   help="하네스/추천 claude 모델 (브랜치 세션 전체 공통). "
-                        "기본 'sonnet'(4.6) — verdict/추천엔 충분, Opus 대비 비용↓. "
-                        "'opus'로 올리거나 'haiku'로 더 낮춤.")
+                   help="경량 claude 모델 — 하네스 verdict·지식주입/요약. 기본 'sonnet'.")
+    p.add_argument("--claude_model_heavy", default="opus",
+                   help="심층 claude 모델 — 피처 발명(recommend)·FE 상세분석(claude_analyze). "
+                        "기본 'opus'. 같은 브랜치 세션을 모델만 바꿔 resume (맥락 유지).")
+    p.add_argument("--knowledge", action=argparse.BooleanOptionalAction, default=True,
+                   help="team-vault 도메인 지식(ML IDS·공격 시나리오)을 브랜치 세션에 주입. "
+                        "끄려면 --no_knowledge.")
     args = p.parse_args()
+
+    # ── 영구 파일 로깅: stdout/stderr tee + Slack 서술 로그 ──
+    # 시작 시 ml/logs/run_*.log, 브랜치 진입마다 ml/logs/{branch}_*.log 로 전환(_switch_log).
+    Path("ml/logs").mkdir(parents=True, exist_ok=True)
+    _switch_log(Path("ml/logs") / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    sys.stdout = _Tee(sys.stdout)
+    sys.stderr = _Tee(sys.stderr)
+    print(f"[로그] {_LOG['path']}")
 
     steps._AUTO_APPROVE = args.auto_approve
     if args.no_harness:
@@ -628,10 +799,14 @@ def main():
     cfg = steps.load_config()
     RT.bot = _sb.SlackPipelineBot(cfg["slack"]["bot_token"], cfg["slack"]["app_token"],
                                   cfg["slack"]["channel"])
+    RT.bot.log_file = _LOG["path"]   # Slack 서술 로그도 같은 파일에
 
     RT.sheet = _sh.PipelineSheets(cfg["google_sheets"]["credentials_file"],
                                   cfg["google_sheets"]["sheet_id"])
     RT.args = args
+    RT.knowledge = _load_knowledge() if args.knowledge else ""
+    if RT.knowledge:
+        print(f"[지식] team-vault {len(RT.knowledge):,}자 로드 — 브랜치 세션마다 주입")
 
     init: PipelineState = {
         "iters": 0, "first_iter": True, "reco_round": 1,
