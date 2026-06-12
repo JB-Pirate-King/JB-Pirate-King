@@ -181,15 +181,18 @@ def _strip_code_fence(text: str) -> str:
     return t.strip()
 
 
-def _branch_claude(prompt: str, timeout: int = 120) -> Optional[dict]:
+def _branch_claude(prompt: str, timeout: int = 120, heavy: bool = False) -> Optional[dict]:
     """브랜치당 claude 세션 1개를 유지하며 호출 — 노드 간 맥락 누적 + 캐시 재사용.
 
     첫 호출은 --session-id 로 RT.claude_sid 세션을 만들고, 이후는 --resume 로
     이어붙인다. 같은 브랜치의 추천/하네스가 베이스라인·채택 결과를 기억한 채 판정한다.
-    세션 id 가 없으면(미설정) stateless 단발 호출로 폴백."""
+    세션 id 가 없으면(미설정) stateless 단발 호출로 폴백.
+
+    heavy=True 면 창의/심층 작업용 모델(--claude_model_heavy, 기본 opus) 사용 —
+    같은 세션을 턴마다 다른 모델로 resume 해도 맥락은 유지된다 (검증됨)."""
     sid = RT.claude_sid
     first = not RT.claude_started
-    model = getattr(RT.args, "claude_model", None)   # 브랜치 세션 전체 동일 모델
+    model = getattr(RT.args, "claude_model_heavy" if heavy else "claude_model", None)
     out = _claude_json(prompt, timeout, session=sid, first=first, model=model)
     if sid:
         RT.claude_started = True   # 생성 시도 후엔 항상 resume (턴은 이미 기록됨)
@@ -338,6 +341,9 @@ def n_new_branch(state: PipelineState) -> dict:
     RT.claude_sid = str(uuid.uuid4())
     RT.claude_started = False
     steps._CLAUDE_SID = RT.claude_sid   # claude_analyze(steps)도 같은 세션 --resume
+    RT.bot.current_branch = branch      # 파일 로그 라인의 [브랜치] 접두사
+    # 로그 파일에 브랜치 구분선 + 풀 세션 uuid (stdout tee 로 기록됨)
+    print(f"\n{'='*70}\n===== {branch} 시작 — claude session {RT.claude_sid} =====\n{'='*70}")
     _prime_session(RT.knowledge)        # 도메인 지식 시드 (--knowledge, team-vault)
     RT.bot.log_run_start(branch, {
         "모델": RT.args.model, "epochs": RT.args.epochs, "max_mmsi": RT.args.max_mmsi,
@@ -403,7 +409,8 @@ def n_recommend(state: PipelineState) -> dict:
     """claude 피처 추천 → 검증 → dynamic_candidates.py 기록 → 후보풀 확장."""
     weak = state.get("baseline", {}).get("weak", "")
     tried = state.get("tried_feats", [])
-    arr = _branch_claude(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")), timeout=240)
+    arr = _branch_claude(_reco_prompt(weak, tried, state.get("baseline", {}).get("det")),
+                         timeout=240, heavy=True)   # 피처 발명 = 창의 작업 → opus
     cands = _validate_recos(arr if isinstance(arr, list) else [])
     if cands:
         RT.last_cands.update({c["name"]: c for c in cands})   # 채택 시 lambda 영속화용 보관
@@ -734,9 +741,10 @@ def main():
     p.add_argument("--build_plugin", action="store_true")
     p.add_argument("--no_harness", action="store_true", help="모든 하네스 끔")
     p.add_argument("--claude_model", default="sonnet",
-                   help="하네스/추천 claude 모델 (브랜치 세션 전체 공통). "
-                        "기본 'sonnet'(4.6) — verdict/추천엔 충분, Opus 대비 비용↓. "
-                        "'opus'로 올리거나 'haiku'로 더 낮춤.")
+                   help="경량 claude 모델 — 하네스 verdict·지식주입/요약. 기본 'sonnet'.")
+    p.add_argument("--claude_model_heavy", default="opus",
+                   help="심층 claude 모델 — 피처 발명(recommend)·FE 상세분석(claude_analyze). "
+                        "기본 'opus'. 같은 브랜치 세션을 모델만 바꿔 resume (맥락 유지).")
     p.add_argument("--knowledge", action=argparse.BooleanOptionalAction, default=True,
                    help="team-vault 도메인 지식(ML IDS·공격 시나리오)을 브랜치 세션에 주입. "
                         "끄려면 --no_knowledge.")

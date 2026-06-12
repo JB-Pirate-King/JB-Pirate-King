@@ -2,6 +2,8 @@
 
 An anomaly-detection pipeline over ship AIS data. Centered on the DCdetect model, it uses Greedy feature engineering to produce a deployable ONNX model.
 
+> LangGraph node-level reference (nodes, routing, sessions/models, logging): [`PIPELINE.md`](PIPELINE.md)
+
 ---
 
 ## File Structure

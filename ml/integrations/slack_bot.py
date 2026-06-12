@@ -20,6 +20,7 @@ class SlackPipelineBot:
         self.app_token = app_token
         self.channel = channel
         self.log_file = None     # 지정 시 모든 Slack 메시지 text를 파일에도 기록 (orchestrator가 세팅)
+        self.current_branch = "" # 파일 로그 라인 접두사용 현재 브랜치 (orchestrator가 갱신)
         self._decision = None
         self._event = threading.Event()
         self._active_token = None   # 현재 대기 중인 승인 메시지 토큰 (스테일 클릭 차단용)
@@ -109,8 +110,9 @@ class SlackPipelineBot:
         Slack 전용이던 서술 로그(하네스 verdict·지식요약·스테이지 결과)가 영구 파일로 남는다."""
         if self.log_file:
             try:
+                br = f"[{self.current_branch}]" if self.current_branch else ""
                 with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {kwargs.get('text', '')}\n")
+                    f.write(f"[{datetime.now().strftime('%H:%M:%S')}]{br} {kwargs.get('text', '')}\n")
             except Exception:
                 pass   # 파일 로깅 실패가 Slack 전송을 막지 않게
         return self.app.client.chat_postMessage(**kwargs)

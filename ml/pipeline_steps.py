@@ -318,7 +318,7 @@ def stage_preprocess(bot, sheet, branch, args, step_info: tuple):
         elapsed = time.time() - t0
         details  = _parse_preprocess(out)
         analysis = claude_analyze("전처리", out, ret == 0, elapsed,
-                                  model=getattr(args, "claude_model", None))
+                                  model=getattr(args, "claude_model_heavy", None))
 
         hdr = _step_header(cur, total, "전처리", next_name)
         if ret != 0:
@@ -792,7 +792,7 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
     if ret != 0:
         fe_details = _parse_fe(out)
         analysis = claude_analyze("피처개선", out, False, elapsed,
-                                  model=getattr(args, "claude_model", None))
+                                  model=getattr(args, "claude_model_heavy", None))
         summary = (["❌ 피처 엔지니어링 실패", f"소요: {elapsed:.0f}s"]
                    + fe_details + ["─"] + analysis)
         bot.log_stage_result("피처개선", summary, success=False)
@@ -852,7 +852,7 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
     analysis = claude_analyze("피처개선", out, bool(newly_adopted), elapsed, {
         "newly_adopted": newly_adopted,
         "det_rate": det_rate, "baseline_det": baseline_det, "n_feat": n_feat
-    }, model=getattr(args, "claude_model", None))
+    }, model=getattr(args, "claude_model_heavy", None))
     bot.log("\n".join(analysis), "피처개선")
 
     if candidates:

@@ -273,7 +273,7 @@ graph TD;
 | `fe_train` | `n_fe_train` — orchestrator.py:350<br/>→ `_fe_train_eval` pipeline_steps.py:557 | **핵심**: 후보 스캔 → 목적점수 ≥`min_gain` 최선 1개 채택 → 재학습(model_best) → 순열중요도 → 최종 FP1/5/10 → 임계값 → 배포 export. `feature_engineer` 1 subprocess | `r{newly_adopted,full_extra,det_rate,summary,fe_stats,…}` |
 | `build` | `n_build` — orchestrator.py:360<br/>→ `_fe_build_and_release` pipeline_steps.py:884 (→ `stage_build_plugin`:344) | C++ 플러그인 패치(`patch_plugin`) + 모델 파일 복사 → `ais_ids_pi/data/` | `commit_files`, `build_summary` |
 | `release` | `n_release` — orchestrator.py:366<br/>→ `_fe_commit_release` pipeline_steps.py:901 (→ `stage_release`:464) | 채택 커밋 + GitHub 릴리즈(`gh release`, prerelease `run/dcdetect_NNN`) | — |
-| `chain` | `n_chain` — orchestrator.py:372 | `fe_state.json`(`ml/config/`)에 채택 피처셋 저장·커밋 → 다음 브랜치로 사이클 | `current_extra`, `adopted_any` |
+| `chain` | `n_chain` | `fe_state.json` 저장 + **채택 lambda 를 `adopted_features.py` 에 영속화** → 함께 커밋 → 다음 브랜치로 사이클 | `current_extra`, `adopted_any` |
 | `converge` | `n_converge` — orchestrator.py:383 | 수렴 완료 로그 | `terminate` |
 | `user_stop` | `n_user_stop` — orchestrator.py:389 | 중단 — Sheets 실패기록 + 종료 | `terminate` |
 
@@ -321,8 +321,9 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 | `route_after_preprocess` orchestrator.py:425 | preprocess 뒤 | terminate면 END, 아니면 fe_baseline |
 | `_route_harness(next)` orchestrator.py:170 | 대부분 하네스 | stop→user_stop / retry→fe_train / else→next |
 | `route_after_fe` orchestrator.py:429 | h_fe 뒤 | verdict + 채택여부 결합 (위 설명) |
-| `route_gate_deploy` :454 / `route_gate_release` :458 / `route_gate_converge` :462 | 각 게이트 뒤 | approve→진행 / 그외→user_stop(deploy는 retry→fe_baseline) |
-| `build_graph` orchestrator.py:469 | — | 전체 노드·엣지 배선 (그래프 정의) |
+| `route_gate_deploy` / `route_gate_release` / `route_gate_converge` | 각 게이트 뒤 | approve→진행 / 그외→user_stop(deploy는 retry→fe_baseline) |
+| `route_after_chain` | h_chain 뒤 | stop/retry 우선 → `iters >= max_runs` 면 **빈 브랜치 안 만들고 END** → 아니면 new_branch (사이클) |
+| `build_graph` | — | 전체 노드·엣지 배선 (그래프 정의) |
 
 ---
 
@@ -355,19 +356,49 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 
 ---
 
-## 7. claude 호출 모델
+## 7. claude 세션 & 모델
 
-| 경로 | 세션 | 모델 |
+**브랜치당 세션 1개** — `n_new_branch` 가 uuid 발급(`--session-id` 생성) 후 이후 호출은
+전부 `--resume` 로 같은 대화에 누적. 브랜치 간엔 격리(새 uuid). 세션 파일:
+`~/.claude/projects/C--Users-imcas-JB-Pirate-King/<uuid>.jsonl` (완료된 브랜치는
+`claude --resume <uuid>` 로 직접 열람 가능).
+
+세션 누적 순서: ① 지식 주입 → ② 하네스들 → ③ 피처 추천 → ④ claude_analyze(FE 상세분석)
+— 전부 한 대화. 턴마다 모델만 바꿔 resume (맥락 유지 검증됨).
+
+| 경로 | 모델 | 플래그 |
 |---|---|---|
-| 하네스 ×7 + 추천 | 브랜치당 1개 공유 (`_branch_claude`) | `--claude_model` (기본 **Sonnet 4.6**) |
-| `claude_analyze` (FE 상세분석) | 없음 | `--claude_model` 따름 |
+| 피처 발명(recommend) · FE 상세분석(claude_analyze) | **Opus 4.8** | `--claude_model_heavy` (기본 opus) |
+| 하네스 verdict ×7 · 지식주입/요약 | **Sonnet 4.6** | `--claude_model` (기본 sonnet) |
 
-`--claude_model opus` 로 올리거나 `haiku` 로 더 낮춤. 브랜치 세션은 1개 모델로 고정
-(세션 중 모델 변경은 `--resume` 충돌).
+### 도메인 지식 주입 (`--knowledge`, 기본 on)
+
+`KNOWLEDGE_FILES`(team-vault ML/보안 4문서: ML IDS 설계, WISA NMEA flooding, 해상 IDS,
+중간발표)를 합쳐(~26K자) 브랜치 세션 **첫 턴**으로 주입 → claude 가 한국어 요약(주요 공격·
+탐지방식·피처 아이디어)을 반환해 Slack 에 표시. 이후 하네스/추천/분석이 이 지식을 알고 수행.
+끄기: `--no-knowledge`.
+
+### 채택 피처 lambda 영속화
+
+`dynamic_candidates.py` 는 매 추천마다 덮어써지므로, 채택된 피처의 lambda 는
+`ml/config/adopted_features.py`(git 추적)에 병합 저장(`_persist_adopted`, n_chain) →
+feature_engineer 가 시작 시 로드. 없으면 다음 run 의 `--initial_extra` 계산에서 KeyError.
 
 ---
 
-## 8. 실행
+## 8. 로깅
+
+| 싱크 | 내용 |
+|---|---|
+| **`ml/logs/run_*.log`** (gitignored) | stdout/stderr tee + 모든 Slack 메시지 text(`[HH:MM:SS][브랜치]` 접두사) + 브랜치 시작 구분선(풀 세션 uuid) |
+| Slack `#ais-pipeline` | 서술 로그 — 시작그리드·지식요약·하네스 verdict·후보표·게이트 |
+| Google Sheets | 구조화 지표 5탭 |
+| LangSmith (`.env` 트레이싱) | 노드 span·라우팅·state·latency (관찰 전용) |
+| `ml/deploy/{branch}/` | 릴리즈 산출물 아카이브 — 모델 3파일은 run 브랜치에 커밋, tar.gz 는 복사만(ignore) |
+
+---
+
+## 9. 실행
 
 ```bash
 # 무인 실행 (게이트 자동승인)
@@ -376,12 +407,14 @@ python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
   --base_dir "D:/" --skip_preprocess --auto_approve
 
 # 주요 플래그
-#   --invent N          추천 피처 개수 (기본 5)
-#   --invent_rounds N   수렴 시 재추천 라운드 상한
-#   --no_harness        모든 하네스 끔
-#   --claude_model M    하네스/추천/분석 모델 (기본 sonnet)
-#   --max_runs N        브랜치 체인 안전 상한 (기본 50)
-#   --build_plugin      WSL tar.gz 빌드 (기본 off, 정식 빌드는 native Linux)
+#   --invent N                추천 피처 개수 (기본 5)
+#   --invent_rounds N         수렴 시 재추천 라운드 상한
+#   --no_harness              모든 하네스 끔
+#   --claude_model M          경량 모델 — 하네스·지식요약 (기본 sonnet)
+#   --claude_model_heavy M    심층 모델 — 피처발명·상세분석 (기본 opus)
+#   --knowledge/--no-knowledge  team-vault 지식 주입 (기본 on)
+#   --max_runs N              브랜치 체인 안전 상한 (기본 50)
+#   --build_plugin            WSL tar.gz 빌드 (기본 off, 정식 빌드는 native Linux)
 ```
 
 > ⚠️ Slack 버튼 승인(`interrupt()` 게이트)은 SocketMode **인바운드**가 필요하다.
