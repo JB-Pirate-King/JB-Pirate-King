@@ -1,6 +1,6 @@
 ---
 source_file: 해상 네트워크에서의 IDS 적용 가능성 연구 SCADA 환경과의 비교 분석.pdf
-last_synced: 2026-06-12 09:00
+last_synced: 2026-06-12 13:43
 tags: [notion-sync, attachment]
 ---
 
