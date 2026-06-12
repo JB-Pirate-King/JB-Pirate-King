@@ -1,10 +1,10 @@
 ---
 notion_url: https://www.notion.so/36dbe080983081749ae1c239f9c806be
-last_synced: 2026-06-12 18:02
+last_synced: 2026-06-12 19:30
 tags: [notion-sync]
 ---
 
-# 📈 ML 성능 현황 요약
+# ML 성능 현황 요약
 
 현재 학습 완료된 모델들의 성능 요약입니다.
 
