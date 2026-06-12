@@ -176,6 +176,11 @@ FE history reset after the LangGraph migration — runs restart from the base 12
 Prior runs (up to 24 features, best 83.5% FP=1%) are preserved in `run/dcdetect_NNN`
 release tags and git history.
 
+> 🧊 **Official frozen numbers (final presentation)**: dcdetect **20 features (FE Iter8)** —
+> FP=1% **91.9%** · FP=5% 97.6% · FP=10% 98.7%. Model backup: GitHub release
+> `models/2026-06-05` + `D:\ais_models\dcdetect\`. Do NOT quote older numbers (83.5% etc.)
+> in any presentation material. Single source of truth: `team-vault/발표 마스터플랜.md`.
+
 ---
 
 ## Pipeline Architecture
