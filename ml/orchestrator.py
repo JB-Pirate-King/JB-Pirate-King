@@ -300,14 +300,17 @@ def claude_judge(stage: str, ctx_fn):
     return node
 
 
-def _route_judge(continue_to: str):
-    """판정 verdict → continue_to / fe_train(retry) / user_stop(stop)."""
+def _route_judge(continue_to: str, retry_to: str):
+    """판정 verdict → continue_to / retry_to / user_stop(stop).
+
+    retry 는 **직전 노드 재실행** — 예전엔 일률 fe_train 으로 보내
+    j_base retry 가 후보 0인 채 스캔에 진입하는 등 비논리적이었다."""
     def route(state: PipelineState) -> str:
         d = state.get("decision", "continue")
         if d == "stop":
             return "user_stop"
         if d == "retry":
-            return "fe_train"
+            return retry_to
         return continue_to
     return route
 
@@ -661,7 +664,7 @@ def route_after_chain(state: PipelineState) -> str:
     if d == "stop":
         return "user_stop"
     if d == "retry":
-        return "fe_train"
+        return "chain"   # 직전 노드 재실행 (fe_state 저장은 멱등)
     if state.get("iters", 0) >= RT.args.max_runs:
         RT.bot.log(f"⚠️ 안전 상한 {RT.args.max_runs} 도달 — 체이닝 종료", "warning")
         return "END"
@@ -749,11 +752,11 @@ def build_graph(checkpointer=None):
                             {"fe_baseline": "fe_baseline", "END": END})
 
     g.add_edge("fe_baseline", "j_base")
-    g.add_conditional_edges("j_base", _route_judge("recommend"),
-                            {"recommend": "recommend", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("j_base", _route_judge("recommend", retry_to="fe_baseline"),
+                            {"recommend": "recommend", "fe_baseline": "fe_baseline", "user_stop": "user_stop"})
     g.add_edge("recommend", "j_reco")
-    g.add_conditional_edges("j_reco", _route_judge("fe_train"),
-                            {"fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("j_reco", _route_judge("fe_train", retry_to="recommend"),
+                            {"fe_train": "fe_train", "recommend": "recommend", "user_stop": "user_stop"})
 
     g.add_edge("fe_train", "log_fe")
     g.add_edge("log_fe", "j_fe")
@@ -766,18 +769,18 @@ def build_graph(checkpointer=None):
     g.add_conditional_edges("gate_deploy", route_gate_deploy,
                             {"build": "build", "fe_baseline": "fe_baseline", "user_stop": "user_stop"})
     g.add_edge("build", "j_build")
-    g.add_conditional_edges("j_build", _route_judge("gate_release"),
-                            {"gate_release": "gate_release", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("j_build", _route_judge("gate_release", retry_to="build"),
+                            {"gate_release": "gate_release", "build": "build", "user_stop": "user_stop"})
     g.add_conditional_edges("gate_release", route_gate_release,
                             {"release": "release", "user_stop": "user_stop"})
     g.add_edge("release", "j_release")
-    g.add_conditional_edges("j_release", _route_judge("log_run_done"),
-                            {"log_run_done": "log_run_done", "fe_train": "fe_train", "user_stop": "user_stop"})
+    g.add_conditional_edges("j_release", _route_judge("log_run_done", retry_to="release"),
+                            {"log_run_done": "log_run_done", "release": "release", "user_stop": "user_stop"})
     g.add_edge("log_run_done", "readme")
     g.add_edge("readme", "chain")
     g.add_edge("chain", "j_chain")
     g.add_conditional_edges("j_chain", route_after_chain,
-                            {"new_branch": "new_branch", "fe_train": "fe_train",
+                            {"new_branch": "new_branch", "chain": "chain",
                              "user_stop": "user_stop", "END": END})
 
     g.add_conditional_edges("gate_converge", route_gate_converge,

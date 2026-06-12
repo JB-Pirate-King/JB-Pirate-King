@@ -122,9 +122,10 @@ flowchart TD
         recommend --> j_reco{{j_reco 판정}}
         reco_again[reco_again<br/>라운드+1] --> recommend
     end
-    j_base -.->|retry| fe_train
+    j_base -.->|retry| fe_baseline
     j_base -.->|stop| user_stop
     j_reco -.->|continue| fe_train
+    j_reco -.->|retry| recommend
     j_reco -.->|stop| user_stop
 
     subgraph FE[피처 엔지니어링]
@@ -148,10 +149,10 @@ flowchart TD
     end
     gate_deploy -.->|retry| fe_baseline
     gate_deploy -.->|stop| user_stop
-    j_build -.->|retry| fe_train
+    j_build -.->|retry| build
     j_build -.->|stop| user_stop
     gate_release -.->|stop| user_stop
-    j_release -.->|retry| fe_train
+    j_release -.->|retry| release
     j_release -.->|stop| user_stop
 
     log_run_done --> readme[readme<br/>루트 README 결과표 갱신]
@@ -159,7 +160,7 @@ flowchart TD
     chain --> j_chain{{j_chain 판정}}
     j_chain -.->|continue·상한미달 사이클| new_branch
     j_chain -.->|상한 도달| END4([END])
-    j_chain -.->|retry| fe_train
+    j_chain -.->|retry| chain
     j_chain -.->|stop| user_stop
 
     gate_converge[/gate_converge<br/>수렴 종료 승인/] -.->|approve| converge[converge]
@@ -223,18 +224,18 @@ graph TD;
 	gate_deploy -.-> user_stop;
 	gate_release -.-> release;
 	gate_release -.-> user_stop;
-	j_base -.-> fe_train;
+	j_base -.-> fe_baseline;
 	j_base -.-> recommend;
 	j_base -.-> user_stop;
 	j_branch -.  END  .-> __end__;
 	j_branch -.-> fe_baseline;
 	j_branch -.-> preprocess;
 	j_branch -.-> user_stop;
-	j_build -.-> fe_train;
+	j_build -.-> build;
 	j_build -.-> gate_release;
 	j_build -.-> user_stop;
 	j_chain -.  END  .-> __end__;
-	j_chain -.-> fe_train;
+	j_chain -.-> chain;
 	j_chain -.-> new_branch;
 	j_chain -.-> user_stop;
 	j_fe -.-> fe_baseline;
@@ -243,9 +244,10 @@ graph TD;
 	j_fe -.-> reco_again;
 	j_fe -.-> user_stop;
 	j_reco -.-> fe_train;
+	j_reco -.-> recommend;
 	j_reco -.-> user_stop;
-	j_release -.-> fe_train;
 	j_release -.-> log_run_done;
+	j_release -.-> release;
 	j_release -.-> user_stop;
 	log_fe --> j_fe;
 	log_run_done --> readme;
@@ -314,7 +316,7 @@ claude 호출은 `_branch_claude`(orchestrator.py:123) → `_claude_json`(orches
 `JUDGE_ON` 에 든 stage 만 동작(`--no_judge` 로 전체 off).
 
 동작: 해당 노드 결과를 claude 에 주고 `{assessment, verdict, reason, suggestion}` JSON 받음 →
-`_route_judge`: **stop→user_stop / retry→fe_train / 그외→다음 노드**.
+`_route_judge`: **stop→user_stop / retry→직전 노드 재실행 / 그외→다음 노드**.
 
 프롬프트(`_judge_prompt`)는 공통 템플릿에 **stage별 판정 포인트**(`STAGE_FOCUS`)를 주입한다 —
 baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 파일·피처수 일치하나" 처럼
@@ -332,7 +334,7 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 |---|---|---|
 | `route_after_branch_j` orchestrator.py:542 (→`route_after_branch`:418) | j_branch 뒤 | stop이면 user_stop, 아니면 max_runs 체크 → preprocess/fe_baseline/END |
 | `route_after_preprocess` orchestrator.py:425 | preprocess 뒤 | terminate면 END, 아니면 fe_baseline |
-| `_route_judge(next)` orchestrator.py:170 | 대부분 판정 | stop→user_stop / retry→fe_train / else→next |
+| `_route_judge(next, retry_to)` | 대부분 판정 | stop→user_stop / **retry→직전 노드 재실행** / else→next |
 | `route_after_fe` orchestrator.py:429 | j_fe 뒤 | verdict + 채택여부 결합 (위 설명) |
 | `route_gate_deploy` / `route_gate_release` / `route_gate_converge` | 각 게이트 뒤 | approve→진행 / 그외→user_stop(deploy는 retry→fe_baseline) |
 | `route_after_chain` | j_chain 뒤 | stop/retry 우선 → `iters >= max_runs` 면 **빈 브랜치 안 만들고 END** → 아니면 new_branch (사이클) |
