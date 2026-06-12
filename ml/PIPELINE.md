@@ -25,6 +25,58 @@
 
 ---
 
+## 1.5 파이썬 파일 구성
+
+파이프라인을 이루는 `ml/` 하위 파일별 역할.
+
+### 제어흐름 & 실행 (루트)
+| 파일 | 역할 |
+|---|---|
+| `orchestrator.py` | **LangGraph `StateGraph`** — 노드/엣지/게이트/하네스 제어흐름. 진입점 `python -m ml.orchestrator` |
+| `pipeline_steps.py` | 무거운 **실행함수 라이브러리** — `run_cmd`, 출력 파서, `stage_*`, `_fe_train_eval`/`_fe_build_and_release`/`_fe_commit_release`, `claude_analyze`, fe_state io |
+| `dynamic_candidates.py` | **런타임 생성** — `recommend` 노드가 claude 발명 피처를 여기 기록, `feature_engineer` 가 exec 로드 (gitignored) |
+| `build_plugin_wsl.sh` | WSL tar.gz 빌드 (`--build_plugin`, 기본 off) |
+
+### `core/` — ML 엔진
+| 파일 | 역할 |
+|---|---|
+| `constants.py` | `BASE_FEATURES`(12)/`SEQ_LEN`(10) **단일 출처** |
+| `preprocess.py` | raw AIS(.csv/.zst/.zip) → 파생피처 CSV |
+| `train_benchmark.py` | 비지도 9모델 정의·학습 (dcdetect★/usad/tranad/…) |
+| `eval_anomaly.py` | 32개 공격 시나리오 탐지율/오탐 평가 |
+| `feature_engineer.py` | **Greedy FE** + ONNX export. orchestrator 가 subprocess 로 호출 |
+| `patch_plugin.py` | scaler features → C++ 코드젠 (`[AUTO:*]` 마커) |
+| `pipeline.py` | 단순 train+eval 경로 (실험용; `automation/ens24` 가 import) |
+
+### `integrations/` — 외부 연동
+| 파일 | 역할 |
+|---|---|
+| `slack_bot.py` | Slack 로그 전송 + 버튼 승인 대기 (Block Kit) |
+| `sheets.py` | Google Sheets 5탭 자동 로깅 |
+| `notify.py` | Discord webhook + Notion 리포트 |
+| `git_manager.py` | 브랜치 생성(`get_next_run_num`/`create_branch`)·커밋·푸시 |
+
+### `scripts/` — 독립 CLI (import 안 됨, 직접 실행)
+| 파일 | 역할 |
+|---|---|
+| `auto_feat_eng.py` | FE 자동화 루프 (데이터셋 빌드 → FE) |
+| `build_3yr_dataset.py` | 2023–2025 균형 데이터셋 빌더 |
+| `download_ais.py` | AIS 원본 다운로더 |
+| `reset_sheets.py` | 시트 탭 데이터 초기화 (`python -m ml.scripts.reset_sheets`) |
+
+### `config/` — 설정·상태 (시크릿 gitignored)
+`pipeline_config.json`(Slack/Sheets, 시크릿) · `pipeline_config.example.json`(템플릿) ·
+`google_credentials.json`(GCP, 시크릿) · `notify_config.json`(Discord/Notion, 시크릿) ·
+`fe_state.json`(채택 피처 누적, 추적)
+
+### `automation/` — 보조
+| 파일 | 역할 |
+|---|---|
+| `bootstrap.py` | 세션 시작 현황 부트스트랩 |
+| `ens24.py` | ens24 앙상블 자동화 |
+
+---
+
 ## 2. 그래프 구조도
 
 ### 자동 렌더 (LangGraph 실제 구조)
@@ -37,6 +89,8 @@
 
 ### 주석 달린 Mermaid (라우팅 레이블 포함)
 
+> **선 종류**: `──▶` 실선 = 직접 엣지(`add_edge`) · `┄┄▶` 점선 = 조건부 엣지(`add_conditional_edges`, 라우팅 함수가 분기). LangGraph 원본과 동일 규칙.
+
 ```mermaid
 flowchart TD
     START([START]) --> new_branch
@@ -46,64 +100,157 @@ flowchart TD
         log_run_start --> h_branch{{h_branch 하네스}}
     end
 
-    h_branch -->|preprocess| preprocess[preprocess<br/>raw→csv·첫브랜치만]
-    h_branch -->|fe_baseline| fe_baseline
-    h_branch -->|stop| user_stop
-    h_branch -->|max_runs 초과| END1([END])
-    preprocess --> fe_baseline
-    preprocess -->|terminate| END1
+    h_branch -.->|preprocess| preprocess[preprocess<br/>raw→csv·첫브랜치만]
+    h_branch -.->|fe_baseline| fe_baseline
+    h_branch -.->|stop| user_stop
+    h_branch -.->|max_runs 초과| END1([END])
+    preprocess -.->|continue| fe_baseline
+    preprocess -.->|terminate| END1
 
     subgraph DIAGNOSE_RECO[진단 · 추천]
         fe_baseline[fe_baseline<br/>베이스 탐지율·약세진단] --> h_base{{h_base 하네스}}
-        h_base -->|continue| recommend[recommend<br/>claude 피처 N개 발명]
+        h_base -.->|continue| recommend[recommend<br/>claude 피처 N개 발명]
         recommend --> h_reco{{h_reco 하네스}}
         reco_again[reco_again<br/>라운드+1] --> recommend
     end
-    h_base -->|retry| fe_train
-    h_base -->|stop| user_stop
-    h_reco -->|continue| fe_train
-    h_reco -->|stop| user_stop
+    h_base -.->|retry| fe_train
+    h_base -.->|stop| user_stop
+    h_reco -.->|continue| fe_train
+    h_reco -.->|stop| user_stop
 
     subgraph FE[피처 엔지니어링]
         fe_train[fe_train<br/>스캔→채택→재학습→중요도→최종평가→export] --> log_fe[log_fe<br/>Sheets]
         log_fe --> h_fe{{h_fe 하네스}}
     end
 
-    h_fe -->|채택O| gate_deploy
-    h_fe -->|채택X·라운드남음| reco_again
-    h_fe -->|채택X·라운드끝| gate_converge
-    h_fe -->|실패/retry| fe_baseline
-    h_fe -->|stop| user_stop
+    h_fe -.->|채택O| gate_deploy
+    h_fe -.->|채택X·라운드남음| reco_again
+    h_fe -.->|채택X·라운드끝| gate_converge
+    h_fe -.->|실패/retry| fe_baseline
+    h_fe -.->|stop| user_stop
 
     subgraph DEPLOY[배포 · 릴리즈]
-        gate_deploy[/gate_deploy<br/>배포 승인/] -->|approve| build[build<br/>C++ 패치·모델 복사]
+        gate_deploy[/gate_deploy<br/>배포 승인/] -.->|approve| build[build<br/>C++ 패치·모델 복사]
         build --> h_build{{h_build 하네스}}
-        h_build -->|continue| gate_release[/gate_release<br/>커밋·릴리즈 승인/]
-        gate_release -->|approve| release[release<br/>git commit·gh release]
+        h_build -.->|continue| gate_release[/gate_release<br/>커밋·릴리즈 승인/]
+        gate_release -.->|approve| release[release<br/>git commit·gh release]
         release --> h_release{{h_release 하네스}}
-        h_release -->|continue| log_run_done[log_run_done<br/>Sheets]
+        h_release -.->|continue| log_run_done[log_run_done<br/>Sheets]
     end
-    gate_deploy -->|retry| fe_baseline
-    gate_deploy -->|stop| user_stop
-    h_build -->|retry| fe_train
-    h_build -->|stop| user_stop
-    gate_release -->|stop| user_stop
-    h_release -->|retry| fe_train
-    h_release -->|stop| user_stop
+    gate_deploy -.->|retry| fe_baseline
+    gate_deploy -.->|stop| user_stop
+    h_build -.->|retry| fe_train
+    h_build -.->|stop| user_stop
+    gate_release -.->|stop| user_stop
+    h_release -.->|retry| fe_train
+    h_release -.->|stop| user_stop
 
     log_run_done --> chain[chain<br/>fe_state 저장·커밋]
     chain --> h_chain{{h_chain 하네스}}
-    h_chain -->|continue 사이클| new_branch
-    h_chain -->|retry| fe_train
-    h_chain -->|stop| user_stop
+    h_chain -.->|continue 사이클| new_branch
+    h_chain -.->|retry| fe_train
+    h_chain -.->|stop| user_stop
 
-    gate_converge[/gate_converge<br/>수렴 종료 승인/] -->|approve| converge[converge]
-    gate_converge -->|stop| user_stop
+    gate_converge[/gate_converge<br/>수렴 종료 승인/] -.->|approve| converge[converge]
+    gate_converge -.->|stop| user_stop
     converge --> log_converge[log_converge<br/>Sheets] --> END2([END])
     user_stop[user_stop<br/>중단] --> END3([END])
 ```
 
 > `{{ }}` = 하네스(claude 판정) · `[/ /]` = 게이트(승인) · `[ ]` = compute/로그 노드.
+
+### LangGraph 원본 (배선 그대로, 노드명만)
+
+`build_graph().get_graph().draw_mermaid()` 출력 — 우리가 `add_node`/`add_edge` 로 배선한
+그래프 그 자체. `-->` = 직접 엣지, `-.->` = 조건부(라우팅 함수) 엣지.
+
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([__start__]):::first
+	new_branch(new_branch)
+	preprocess(preprocess)
+	fe_baseline(fe_baseline)
+	recommend(recommend)
+	reco_again(reco_again)
+	fe_train(fe_train)
+	build(build)
+	release(release)
+	chain(chain)
+	converge(converge)
+	user_stop(user_stop)
+	gate_deploy(gate_deploy)
+	gate_release(gate_release)
+	gate_converge(gate_converge)
+	log_run_start(log_run_start)
+	log_fe(log_fe)
+	log_run_done(log_run_done)
+	log_converge(log_converge)
+	h_branch(h_branch)
+	h_base(h_base)
+	h_reco(h_reco)
+	h_fe(h_fe)
+	h_build(h_build)
+	h_release(h_release)
+	h_chain(h_chain)
+	__end__([__end__]):::last
+	__start__ --> new_branch;
+	build --> h_build;
+	chain --> h_chain;
+	converge --> log_converge;
+	fe_baseline --> h_base;
+	fe_train --> log_fe;
+	gate_converge -.-> converge;
+	gate_converge -.-> user_stop;
+	gate_deploy -.-> build;
+	gate_deploy -.-> fe_baseline;
+	gate_deploy -.-> user_stop;
+	gate_release -.-> release;
+	gate_release -.-> user_stop;
+	h_base -.-> fe_train;
+	h_base -.-> recommend;
+	h_base -.-> user_stop;
+	h_branch -. END .-> __end__;
+	h_branch -.-> fe_baseline;
+	h_branch -.-> preprocess;
+	h_branch -.-> user_stop;
+	h_build -.-> fe_train;
+	h_build -.-> gate_release;
+	h_build -.-> user_stop;
+	h_chain -.-> fe_train;
+	h_chain -.-> new_branch;
+	h_chain -.-> user_stop;
+	h_fe -.-> fe_baseline;
+	h_fe -.-> gate_converge;
+	h_fe -.-> gate_deploy;
+	h_fe -.-> reco_again;
+	h_fe -.-> user_stop;
+	h_reco -.-> fe_train;
+	h_reco -.-> user_stop;
+	h_release -.-> fe_train;
+	h_release -.-> log_run_done;
+	h_release -.-> user_stop;
+	log_fe --> h_fe;
+	log_run_done --> chain;
+	log_run_start --> h_branch;
+	new_branch --> log_run_start;
+	preprocess -. END .-> __end__;
+	preprocess -.-> fe_baseline;
+	reco_again --> recommend;
+	recommend --> h_reco;
+	release --> h_release;
+	log_converge --> __end__;
+	user_stop --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+
+> 재생성: `python -c "from ml.orchestrator import build_graph; print(build_graph().get_graph().draw_mermaid())"`
 
 ---
 
@@ -153,6 +300,11 @@ claude 호출은 `_branch_claude`(orchestrator.py:123) → `_claude_json`(orches
 
 동작: 해당 노드 결과를 claude 에 주고 `{assessment, verdict, reason, suggestion}` JSON 받음 →
 `_route_harness`: **stop→user_stop / retry→fe_train / 그외→다음 노드**.
+
+프롬프트(`_harness_prompt`)는 공통 템플릿에 **stage별 판정 포인트**(`STAGE_FOCUS`)를 주입한다 —
+baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 파일·피처수 일치하나" 처럼
+단계 고유 기준으로 평가(일률 판정 방지). claude 응답이 ```json 펜스로 와도 `_strip_code_fence`
+로 벗겨 파싱한다.
 
 > `h_fe` 만 예외 — `route_after_fe` 가 하네스 verdict + **채택여부**를 결합해 분기
 > (채택O→gate_deploy / 채택X→reco_again 또는 gate_converge / 실패→fe_baseline).
