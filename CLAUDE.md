@@ -241,71 +241,9 @@ Autonomous chaining hardened. Fresh session must know:
 - **fe_state.json**: stores the Greedy starting features for the next branch (`initial_extra`). Auto-updated on adoption.
 - **Output**: metrics→Sheets, model→branch `ais_ids_pi/data` + release. FE intermediates go to `ml/.pipeline_tmp/` (gitignored). The D drive holds only inputs/cache.
 
-### Slack messages & Claude analysis / approval
+## Orchestrator internals (Slack flow + LangGraph)
 
-Each stage reports to Slack in this flow (`integrations/slack_bot.py`):
-
-```
-📍 [1/2] ■□  *Feature Engineering*  →  next: pipeline end          ← log_stage_start
-📊 baseline (12 feat): FP=1% detection 40.6% · objective 77.2      ← fe_progress (live)
-⚠️ 5 weak scenarios (baseline <50%): D1-LowSlow(0%), F3(12%)...
-🔬 candidate #1/20 `accel` — acceleration Δsog/dt
-   └ `accel`: detection 43.6% (+3.0pp) · objective 80.5 (+3.3) → ✅ meets bar (≥+3.0)
-🔬 candidate #2/20 `turn_rate` — COG change rate
-   └ `turn_rate`: detection 33.6% (-6.7pp) · objective 62.0 (-11.9) → ⬜ below bar
-   ... (20 candidates)
-🏆 adopted! `accel` — FP=1% 40.6% → 43.6% | objective +3.3
-🔁 retrain final model on adopted set (13 feat) — this is the deployable model
-🧠 final training 100% — Epoch 1/1 (train=0.019 val=0.005)
-  ✅ final training done — best val MSE 0.005150
-📊 evaluating final model (FP=1%/5%/10% + per-scenario)...
-📈 final detection — FP=1%: 43.6% · FP=5%: 58.2% · FP=10%: 67.0%
-🎯 deploy threshold (FP=1% normal 99th pct): 0.00491234
-✅/❌ [FE done] + candidate table + feature-importance table (log_stage_result / log_table)
-```
-
-**Claude analysis** (`claude_analyze` → `claude -p`): called at each stage end.
-- Prompt: `[stage] result analysis / success·elapsed / extra info (JSON) / last 60 lines of run output`
-  → returns three things: ① result assessment (numbers) ② cause/evidence ③ next action `continue`/`retry`/`stop` + reason.
-- Slack output: `🤖 *Claude analysis*` + answer lines. (If the `claude` CLI is missing, shows "analysis unavailable".)
-
-**Approval gates** (`_wait`) — per stage within a branch:
-- **Gate ① after FE eval**: Claude analysis + candidate table → "proceed to deploy?" (✅proceed / 🔄rerun FE / ❌stop)
-- **Gate ② after plugin build**: build result → "commit + release?" (✅proceed / ❌stop)
-- **Gate ③ on convergence**: if nothing adopted, confirm "end pipeline?"
-- `--auto_approve` **ON**: all gates auto-pass (if the summary contains `❌`, returns `stop`). Slack shows only a `🤖 [auto_approve] … → approve` log → unattended branch chaining.
-- **OFF**: each gate waits on a Slack button.
-
----
-
-## LangGraph Orchestrator (`ml/orchestrator.py`)
-
-`orchestrator.py` is a LangGraph `StateGraph` (control flow); the heavy execution functions
-live in `ml/pipeline_steps.py` (shared step library). Design diagram: `graph.md` / `pipeline_full.png`.
-
-- **pipeline_steps.py** — `run_cmd`, output parsers, `claude_analyze`, `stage_preprocess`,
-  `stage_build_plugin`, `stage_release`, `_fe_train_eval` (greedy 1-step train+eval+parse+log),
-  `_fe_build_and_release`, `_fe_commit_release`, fe_state io, constants. Not an entry point.
-- **FE decomposition**: `fe_baseline` node (`feature_engineer --diagnose_only` → baseline det +
-  weak scenarios) is split from `fe_train` (scan→adopt→retrain→importance→finaleval→export, one
-  `feature_engineer` subprocess via `_fe_train_eval`).
-- **claude feature recommendation (`n_recommend`)**: weak-scenario diagnosis → `claude -p` proposes
-  N new candidate features (name + lambda) → validated (exec on dummy seq + dedup) → written to
-  `ml/dynamic_candidates.py` (gitignored) → `feature_engineer` loads + scans them. Convergence
-  (no adoption) re-recommends from a different angle up to `--invent_rounds`. Enable with `--invent N`.
-- **per-node claude harness** (`claude_harness` factory): each compute node is followed by a harness
-  node that runs `claude -p --output-format json` → `{assessment, verdict: continue|retry|stop, ...}`
-  → routing. Toggle per node via `HARNESS_ON` set; `--no_harness` disables all.
-- **interrupt() gates**: deploy / release / converge are independent `interrupt()` nodes. Because
-  gates sit at node boundaries, a crash while awaiting Slack approval resumes **without retraining**.
-- **Sheets**: `log_sheet(kind)` DRY factory (`run_start|fe|run_done|converge`).
-- **Chaining = graph cycle**: `release → chain → new_branch`. Convergence → `converge → END`.
-  `--max_runs` is a state-counter guard; `recursion_limit = max_runs × 25`.
-- **Checkpointer**: `MemorySaver` (in-process). Swap to `SqliteSaver` for cross-restart resume.
-- **Runner**: `run_pipeline` polls `__interrupt__`, gets the Slack decision via `bot.wait_approval`,
-  resumes with `Command(resume=decision)`.
-- **Launch**: `python -m ml.orchestrator` (same flags as before + `--invent`, `--invent_rounds`,
-  `--no_harness`).
+Slack 단계별 메시지·승인 흐름, claude 분석, LangGraph 노드·게이트·체크포인터 등 오케스트레이터 내부 상세는 skill **orchestrator-internals** (`.claude/skills/orchestrator-internals/SKILL.md`) 참조. 실행 명령은 아래 Key Pipeline Commands.
 
 ---
 
@@ -365,55 +303,9 @@ The Greedy objective is `mean_detection + 1.0 × weak_mean`, but detection per s
 
 ---
 
-## Feature Engineering (`core/feature_engineer.py`)
+## Feature Engineering
 
-Goal: find derived features that raise the DCdetect detection rate, then export a deployable model.
-
-### Algorithm
-
-**Greedy Forward Selection**:
-1. Train baseline (current feature set) + eval (FP=1/5/10).
-2. Add each candidate → train → compute objective score (`overall_mean + 1.0 × weak_mean`).
-3. If the best objective gain is ≥ `--min_gain` (default 3.0pp), adopt it.
-4. On the adopted set, **retrain (model_best)** → permutation importance + final FP1/5/10 + threshold → export for deployment.
-5. `--max_steps` caps adoptions per call (the orchestrator uses `1` → 1 feature per run, branch chaining).
-   If unset, repeats until convergence.
-
-> The orchestrator calls with `--max_steps 1` → adopts 1 feature per run (branch), then chains to a new branch (dcdetect_001→002→...). A direct standalone run (`feature_engineer.py`) without `--max_steps` runs to convergence in one go.
-
-### Evaluation criterion (FP = 1%)
-
-- Threshold = the **99th percentile** of holdout normal-sequence scores (top 1% are false positives).
-- Detection rate = fraction of attack-scenario sequences exceeding the threshold.
-- FP=5% and FP=10% are computed simultaneously (95/90th percentile thresholds).
-- Deploy threshold = this FP=1% threshold → the same false-positive rate holds in the field.
-
-### Output JSON keys
-
-| Key | Description |
-|---|---|
-| `best_extra` | Final adopted extra features |
-| `best_det` | FP=1% final detection rate (%) |
-| `det_fp5` | FP=5% final detection rate (%) |
-| `det_fp10` | FP=10% final detection rate (%) |
-| `threshold` | Deploy threshold (99th pct of normal scores) |
-| `baseline_det` | Detection rate before FE (%) |
-| `scenario_fp1` | Per-scenario FP=1% detection dict |
-| `scenario_fp5/fp10` | Per-scenario FP=5%/10% detection dicts |
-| `permutation_importance` | Detection-rate drop when a feature is removed (more negative = more important) |
-
-### Main options
-
-| Option | Default | Description |
-|---|---|---|
-| `--input` | (required) | Preprocessed CSV |
-| `--max_mmsi` | 500 | Cap on number of training MMSIs |
-| `--epochs` | 5 | Number of epochs |
-| `--n_anom` | 200 | Anomalous sequences per scenario |
-| `--min_gain` | 3.0 | Minimum objective-score gain for adoption (pp) |
-| `--initial_extra` | [] | Greedy starting extra features (auto-loaded from fe_state.json) |
-| `--export_dir` | — | Path to save deployable ONNX/scaler/threshold |
-| `--holdout_file` | — | Separate file for FP measurement (fully disjoint from training data) |
+Greedy 1-feature 채택 알고리즘, FP=1% 평가 기준, 출력 JSON 키, 주요 옵션은 skill **feature-engineering** (`.claude/skills/feature-engineering/SKILL.md`) 참조.
 
 ---
 
@@ -452,39 +344,7 @@ Goal: find derived features that raise the DCdetect detection rate, then export 
 
 ## Release & Version Management
 
-### Automated Run Releases (prerelease)
-
-Auto-created by the orchestrator on FE completion:
-- Tag: `run/dcdetect_NNN` (prerelease)
-- Target: commit SHA (a branch name triggers a 422 error)
-- Attachments: 3 model files (`model_dcdetect.onnx`, `scaler_dcdetect.json`, `threshold_dcdetect.txt`)
-- The plugin tar.gz can only be built on Linux — attach manually
-
-### Stable Releases (manual)
-
-```bash
-git checkout main && git merge develop
-git tag v1.0.0 && git push origin main --tags
-gh release create v1.0.0 \
-  --title "v1.0.0 — dcdetect 24 features" \
-  --notes "..."
-```
-
-### Version Scheme
-
-| Bump | When |
-|---|---|
-| **major** | Feature-count/interface change (12→N), SEQ_LEN change |
-| **minor** | New model, new eval scenarios, large detection-rate gain |
-| **patch** | Threshold retune, bug fix, same-structure retrain |
-
-### Version History
-
-| Version | Date | Notes |
-|---|---|---|
-| v0.1.0 | — | Initial release (conv1d, tranad, dcdetect, 1-day data) |
-| v0.2.0 | 2026-05-22 | dcdetect 12 features, 3yr data |
-| run/dcdetect_001~012 | 2026-05-29 | Greedy FE automation runs (prerelease, 13–24 features) |
+자동 run 릴리스(prerelease)·수동 안정 릴리스·버전 스킴·이력은 skill **release-management** (`.claude/skills/release-management/SKILL.md`) 참조.
 
 ---
 
