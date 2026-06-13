@@ -419,81 +419,7 @@ Goal: find derived features that raise the DCdetect detection rate, then export 
 
 ## Google Sheets Tab Structure
 
-**Per-model tabs in a single master spreadsheet.** Each model gets its own set of tabs prefixed by model name: `{model}_실행요약`, `{model}_상세로그`, `{model}_시나리오결과`, `{model}_피처중요도`, plus a `{model}` detail tab. A `모델목록` (hub) tab lists every model with `=HYPERLINK` jump links to its tabs (click model → jump). Tabs are auto-created on first run for that model (`sheets.py` `_use`).
-
-> Why per-tab, not per-spreadsheet: a service account on personal Gmail has **0 Drive quota** and cannot `gc.create()` new spreadsheets, so model separation is done by tab prefix inside the one master sheet (which is shared to the service account). Config in `ml/pipeline_config.json` (gitignored).
-
-Column layout per tab (titles kept Korean for continuity):
-
-### 1. `dcdetect` tab — per-run detail log
-
-| Column | Meaning |
-|---|---|
-| `branch` | Branch name (run delimiter, e.g. `▶ dcdetect_001`) |
-| `timestamp` | Log time |
-| `stage` | Stage name (RUN START / Feature Engineering / RUN DONE) |
-| `status` | done/failed/in-progress |
-| `det_change` | Detection-rate change (baseline→final, e.g. `56.6%→81.8%(+25.3pp)`) |
-| `n_features` | Final total feature count this run |
-| `adopted` | Newly adopted feature(s) this run |
-| `threshold` | FP=1% deploy threshold |
-| `elapsed_s` | Elapsed time (s) |
-
-### 2. `실행요약` (Run Summary) tab — one line per run
-
-| Column | Meaning |
-|---|---|
-| `timestamp` | Run start time |
-| `branch` | Branch name |
-| `model` | Model name (dcdetect) |
-| `epochs` | Training epochs |
-| `max_mmsi` | Cap on ships used for training |
-| `data_file` | Training data path |
-| `fe_steps` | Features newly adopted this run |
-| `fe_baseline` | FP=1% detection before FE (%) |
-| `fe_det_fp1` | FP=1% final detection (%) |
-| `fe_det_fp5` | FP=5% final detection (%) |
-| `fe_det_fp10` | FP=10% final detection (%) |
-| `fe_n_feat` | Final total feature count |
-| `fe_features` | Full cumulative adopted-feature list this run |
-| `fe_threshold` | Deploy threshold (FP=1% normal-score 99th pct) |
-| `notes` | Status (done / converged) |
-
-### 3. `상세로그` (Detail Log) tab — raw log of every stage
-
-| Column | Meaning |
-|---|---|
-| `timestamp` | Log time |
-| `branch` | Branch name |
-| `stage` | Stage name |
-| `status` | done/failed |
-| `det_rate` | FP=1% detection rate |
-| `n_features` | Feature count |
-| `threshold` | Threshold |
-| `elapsed_sec` | Elapsed (s) |
-| `notes` | Memo (adopted features, etc.) |
-
-### 4. `시나리오결과` (Scenario Results) tab — per-scenario detection
-
-| Column | Meaning |
-|---|---|
-| `timestamp` | Log time |
-| `branch` | Branch name |
-| `model` | Model name |
-| `fp_target` | FP target (`FP=1%`) |
-| `scenario` | Scenario name (Basic1, D2, FN3, F1, G2 ...) |
-| `det_rate` | Detection rate for that scenario (%) |
-
-### 5. `피처중요도` (Feature Importance) tab — permutation importance
-
-| Column | Meaning |
-|---|---|
-| `timestamp` | Log time |
-| `branch` | Branch name |
-| `fe_step` | FE step (Step 1) |
-| `feature` | Feature name |
-| `importance_pp` | Detection-rate drop when removed (pp). **More negative = more important.** e.g. -20.9 = removing it drops detection by 20.9pp |
-| `description` | Feature description |
+5탭 자동 로깅(per-model 탭 prefix, 단일 마스터 시트 내 모델별 분리). 상세 탭·컬럼 스키마는 skill **sheets-logging** (`.claude/skills/sheets-logging/SKILL.md`) 참조. 설정: `ml/pipeline_config.json`(gitignored).
 
 ---
 
@@ -510,60 +436,9 @@ Column layout per tab (titles kept Korean for continuity):
 
 ---
 
-## Model File Path Rules
+## Model File Path Rules / Plugin Patch & Build
 
-- Trained (per model): `D:\ais_models\{name}\model_{name}.onnx`, `scaler_{name}.json`, `threshold_{name}.txt`
-- Plugin source (bundled into the build): `ais_ids_pi/data/model.onnx`, `scaler.json`, `threshold.txt`
-- **Runtime load location** (`g_pData`, `ais_ids_pi.cpp:157`): `GetpPrivateApplicationDataLocation()/plugins/ais_ids_pi/data/` → on Linux `~/.opencpn/plugins/ais_ids_pi/data/`. `local-build-package.sh` copies `ais_ids_pi/data/` here (`DATA_DEST`), so the two paths match.
-
-### Deploying a trained model to the plugin
-
-Training exports `model_{name}.onnx` / `scaler_{name}.json` / `threshold_{name}.txt`, but the plugin loads **fixed names** (fallback when no `ensemble_config.json`): `model.onnx` / `scaler.json` / `threshold.txt` (`ais_ids.cpp` `LoadMLFromConfig`). Rename into the runtime load location:
-
-```bash
-DEST="$HOME/.opencpn/plugins/ais_ids_pi/data"
-mkdir -p "$DEST"
-cp model_{name}.onnx     "$DEST/model.onnx"
-cp scaler_{name}.json    "$DEST/scaler.json"
-cp threshold_{name}.txt  "$DEST/threshold.txt"
-```
-
-The orchestrator's `stage_build_plugin` does this rename-copy into `ais_ids_pi/data/`, and run-release notes embed the same `$HOME/.opencpn/...` deploy snippet. `local-build-package.sh` then installs `ais_ids_pi/data/` to the runtime location on a native-Linux build.
-
----
-
-## Plugin Auto-Patch & Build
-
-Run automatically by the orchestrator on FE adoption. Manual run:
-
-```bash
-# 1. Patch C++ code (dry_run first to inspect)
-python ml/core/patch_plugin.py --scaler D:/ais_models/dcdetect/scaler_dcdetect.json --dry_run
-python ml/core/patch_plugin.py --scaler D:/ais_models/dcdetect/scaler_dcdetect.json
-
-# 2. Linux build (native Linux only)
-./local-build-package.sh   # from ais_ids_pi/
-# Output: ais_ids_pi-<version>-ubuntu-x86_64-24.04-noble.tar.gz
-```
-
-**AUTO: marker locations** (C++ auto-patch regions):
-- `ais_ml.h`: `[AUTO:feat_block]` (ML_FEATURE_COUNT + feature comments), `[AUTO:push_decl]`
-- `ais_ml.cpp`: `[AUTO:push_impl]`
-- `ais_ids.cpp`: `[AUTO:extra_feats]`, `[AUTO:push_calls]`
-
----
-
-## Plugin Build & Deploy (native Linux ONLY)
-
-**The OpenCPN plugin is built and deployed on native Linux. Windows is used only for ML model training.**
-
-- Target: Ubuntu 24.04 (noble)
-- `ais_ids_pi/opencpn-libs/` is a git submodule. Before first build: `git submodule update --init --recursive`
-- ONNX Runtime bundled at `ais_ids_pi/onnxruntime/{include,lib}`
-- Build command (from `ais_ids_pi/`): `./local-build-package.sh`
-- C++ feature count hardcoded: `ML_FEATURE_COUNT` in `ais_ids_pi/include/ais_ml.h`. Must match the deployed model.
-
-> The orchestrator's `--build_plugin` flag (WSL build) is opt-in and **off by default** — the canonical plugin build is native Linux.
+모델 파일 경로·런타임 로드 위치·배포 리네임, C++ `AUTO:` 패치 마커·`patch_plugin.py`, 네이티브 리눅스 빌드/배포는 skill **plugin-build** (`.claude/skills/plugin-build/SKILL.md`) 참조. (플러그인 빌드/배포는 네이티브 리눅스 전용.)
 
 ---
 
