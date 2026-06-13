@@ -81,3 +81,6 @@ ml/.baseline_diag*
 
 # reco 생성 동적 후보
 ml/dynamic_candidates.py
+
+# 자동 생성 커밋 컨텍스트 캐시 (commit_context.py 가 git 에서 재생성 — 생성기만 커밋)
+ml/automation/context/commit_log.md

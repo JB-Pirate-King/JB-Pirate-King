@@ -113,6 +113,22 @@ def show_runs():
         print("  (실행중/완료 run 없음)")
 
 
+# ── 2.5 최근 커밋 (프로젝트 변경 맥락) ───────────────────────────
+def show_recent_commits():
+    print(f"\n{SEP}")
+    print("🧭  최근 커밋 (프로젝트 맥락)")
+    print(SEP)
+    try:
+        import commit_context  # 같은 디렉토리 (스크립트 실행 시 sys.path[0])
+        info = commit_context.generate()
+        for line in info.get("recent_oneline", [])[:8]:
+            print(f"  {line}")
+        rel = os.path.relpath(commit_context.OUT_FILE, REPO_ROOT)
+        print(f"\n  📄 전체 커밋 맥락: {rel}  (총 {info.get('count', 0)}개)")
+    except Exception as e:
+        print(f"  (커밋 컨텍스트 생성 실패: {e})")
+
+
 # ── 3. distribute_manifest 감지 ──────────────────────────────────
 def show_pending_distribute():
     manifests = glob.glob(os.path.join(ENS_OUT, "ens24*/distribute_manifest.json"))
@@ -262,6 +278,7 @@ def main():
 
     show_obsidian()
     show_runs()
+    show_recent_commits()
     show_pending_distribute()
     if args.full:
         show_models()
