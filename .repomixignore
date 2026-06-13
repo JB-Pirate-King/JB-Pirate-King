@@ -1,0 +1,4 @@
+# repomix 추가 제외 — .gitignore 외에, 코드 패킹 시 빼는 무거운/불필요 경로
+ais_ids_pi/onnxruntime/
+ais_ids_pi/opencpn-libs/
+ais_ids_pi/data/

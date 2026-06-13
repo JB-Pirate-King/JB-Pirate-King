@@ -89,3 +89,7 @@ ml/dynamic_candidates.py
 
 # 자동 생성 커밋 컨텍스트 캐시 (commit_context.py 가 git 에서 재생성 — 생성기만 커밋)
 ml/automation/context/commit_log.md
+
+# repomix 임시 출력물 (개요 파악용, 커밋 안 함)
+repomix-out.md
+repomix-output.*
