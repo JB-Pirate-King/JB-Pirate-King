@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ml/automation/bootstrap.py",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}
