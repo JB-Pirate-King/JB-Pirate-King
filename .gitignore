@@ -67,8 +67,13 @@ dist/
 build/
 .pytest_cache/
 
-# Claude Code 설정
-.claude/
+# Claude Code 설정 — 공유 자산(skills/agents/commands/settings.json)만 추적,
+# 나머지(worktrees·세션 히스토리·로컬 settings.local.json)는 무시
+.claude/*
+!.claude/skills/
+!.claude/agents/
+!.claude/commands/
+!.claude/settings.json
 
 # 민감한 설정 파일
 ml/pipeline_config.json
