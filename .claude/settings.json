@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          { "type": "command", "command": "powershell -NoProfile -Command \"Write-Output '=== git changes (session start auto-check) ==='; git status --short; Write-Output '--- recent commits ---'; git log --oneline -8\"" }
+        ]
+      }
+    ]
+  }
+}
