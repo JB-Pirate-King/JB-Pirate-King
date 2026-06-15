@@ -76,8 +76,10 @@ dist/
 build/
 .pytest_cache/
 
-# Claude Code 설정
-.claude/
+# Claude Code 설정 (개인 설정은 무시, 공용 스킬은 추적)
+.claude/*
+!.claude/skills/
+!.claude/settings.json
 
 # 민감한 설정 파일
 ml/pipeline_config.json

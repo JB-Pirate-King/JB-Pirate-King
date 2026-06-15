@@ -41,6 +41,13 @@ On code/structure change, keep ALL docs in sync. Before push (or when asked to p
 
 > **Docs language: English.** All Markdown docs are written in English.
 
+### Skill-driven workflow (instructions)
+
+- **On session start**: run `git status --short` + `git log --oneline -8` to see what changed since last time, before taking on work.
+- **Before push, or when the user says "push" / "done" / "문서 갱신"**: invoke the **`/sync-docs`** skill — it fans out parallel agents to sync README, ml/README, and CLAUDE.md against the current diff. This automates the checklist above (Notion stays manual).
+- **When the user wants a changelog / release note / "변경사항 정리"**: invoke **`/change-report`** — it reads git + GitHub changes and writes a dated report into `CHANGELOG.md`.
+- Skills live in `.claude/skills/` (git-tracked, shared on pull).
+
 ---
 
 ## Project Overview
@@ -314,6 +321,12 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `ml/pipeli
   `[HH:MM:SS][branch]` prefixes) into `ml/logs/` (gitignored). Startup writes
   `run_{ts}.log`; each branch entry switches to its own `{branch}_{ts}.log`
   headed by a separator with the full claude session uuid.
+- **node in/out logging** (`_logged_node`): every graph node (compute + judge) is
+  wrapped to record its input `state` and output delta. Two sinks: ① compressed
+  `┌─[NODE→]`/`└─[NODE←] name [branch] (elapsed)` one-liners into the tee log,
+  ② full machine-parsable records into `ml/logs/nodes_{ts}.jsonl` (run-scoped, big
+  strings truncated). `interrupt()` gates propagate `GraphInterrupt` through the
+  wrapper, so only `[NODE→]` is logged until resume re-runs the node.
 - **release artifact archive**: `stage_release` copies the model files to `ml/deploy/{branch}/`
   and commits them to the run branch (tar.gz copied but git-ignored).
 - **interrupt() gates**: deploy / release / converge are independent `interrupt()` nodes. Because

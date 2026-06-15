@@ -431,6 +431,7 @@ feature_engineer 가 시작 시 로드. 없으면 다음 run 의 `--initial_extr
 | 싱크 | 내용 |
 |---|---|
 | **`ml/logs/`** (gitignored) | stdout/stderr tee + 모든 Slack 메시지 text(`[HH:MM:SS][브랜치]` 접두사). 시작 시 `run_{시각}.log`, **브랜치 진입마다 `{branch}_{시각}.log` 로 전환** — 파일당 한 브랜치. 머리에 브랜치 구분선 + 풀 claude 세션 uuid |
+| **`ml/logs/nodes_{시각}.jsonl`** (gitignored) | 노드 in/out 전체 레코드. 모든 노드를 `_logged_node` 로 래핑 → ① tee 로그에 `┌─[NODE→]`/`└─[NODE←] name [branch] (elapsed)` 압축 한 줄, ② jsonl 에 `{ts,branch,node,elapsed_s,in,out}` 머신 레코드(거대 문자열 컷). `interrupt()` 게이트는 `GraphInterrupt` 전파 → resume 전까지 `[NODE→]` 만 기록 |
 | Slack `#ais-pipeline` | 서술 로그 — 시작그리드·지식요약·판정 verdict·후보표·게이트 |
 | Google Sheets | 구조화 지표 5탭 |
 | LangSmith (`.env` 트레이싱) | 노드 span·라우팅·state·latency (관찰 전용) |
