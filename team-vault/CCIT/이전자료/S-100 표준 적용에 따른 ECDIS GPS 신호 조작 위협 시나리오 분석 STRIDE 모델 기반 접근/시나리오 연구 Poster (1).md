@@ -1,6 +1,6 @@
 ---
 source_file: 시나리오 연구 Poster (1).pdf
-last_synced: 2026-06-14 18:05
+last_synced: 2026-06-15 14:10
 tags: [notion-sync, attachment]
 ---
 
