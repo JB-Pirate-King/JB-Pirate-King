@@ -116,6 +116,69 @@ class _Tee:
 
 
 # ─────────────────────────────────────────────
+# 노드 in/out 로깅 — 모든 노드를 _logged_node 로 감싸 입력 state·출력 delta 기록
+#   ① 압축 한 줄 → tee 로그(ml/logs/{branch}.log) [NODE→]/[NODE←]
+#   ② 전체 레코드 → ml/logs/nodes_{ts}.jsonl (머신 파싱용, 큰 문자열만 컷)
+# ─────────────────────────────────────────────
+_NODE_LOG = {"f": None}   # nodes_{ts}.jsonl 핸들 (run 단위 1개)
+
+
+def _open_node_log(path):
+    _NODE_LOG["f"] = open(path, "a", encoding="utf-8", errors="replace")
+
+
+def _io_summary(obj, maxlen: int = 300) -> str:
+    """노드 in/out 압축 표현 — 긴 str/list/dict 를 잘라 한 줄 로그용으로."""
+    def s(v, ml):
+        if isinstance(v, str):
+            v1 = v.replace("\n", "⏎")
+            return v1 if len(v1) <= ml else v1[:ml] + f"…(+{len(v1)-ml})"
+        if isinstance(v, dict):
+            return "{" + ", ".join(f"{k}:{s(x, 80)}" for k, x in list(v.items())[:12]) + "}"
+        if isinstance(v, (list, tuple)):
+            head = ", ".join(s(x, 60) for x in list(v)[:8])
+            more = f"…+{len(v)-8}" if len(v) > 8 else ""
+            return f"[{head}{more}]"
+        return repr(v)
+    return s(obj, maxlen)
+
+
+def _trunc(v, maxlen: int = 8000):
+    """jsonl 전체기록용 — 거대 문자열(서브프로세스 출력 등)만 잘라 파일 폭주 방지."""
+    if isinstance(v, str) and len(v) > maxlen:
+        return v[:maxlen] + f"…(+{len(v)-maxlen}자 생략)"
+    if isinstance(v, dict):
+        return {k: _trunc(x, maxlen) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_trunc(x, maxlen) for x in v]
+    return v
+
+
+def _logged_node(name: str, fn):
+    """노드 in/out 로깅 래퍼. interrupt()(게이트)는 예외로 전파되므로 감싸지 않음
+    (try/except 로 삼키면 LangGraph 일시정지가 깨짐). 정상 반환만 [NODE←]/jsonl 기록."""
+    def wrapped(state: PipelineState) -> dict:
+        br = state.get("branch", "-")
+        print(f"┌─[NODE→] {name} [{br}] | in={_io_summary(state)}")
+        t0 = time.time()
+        out = fn(state)                        # interrupt 시 여기서 GraphInterrupt 전파 → 아래 생략
+        dt = time.time() - t0
+        print(f"└─[NODE←] {name} [{br}] ({dt:.1f}s) | out={_io_summary(out)}")
+        if _NODE_LOG["f"]:
+            try:
+                rec = {"ts": time.strftime("%H:%M:%S"), "branch": br, "node": name,
+                       "elapsed_s": round(dt, 2),
+                       "in": {k: _trunc(v) for k, v in state.items()},
+                       "out": {k: _trunc(v) for k, v in (out or {}).items()}}
+                _NODE_LOG["f"].write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                _NODE_LOG["f"].flush()
+            except Exception as e:
+                print(f"[nodelog] 기록 실패(무시): {e}")
+        return out
+    return wrapped
+
+
+# ─────────────────────────────────────────────
 # 도메인 지식 (team-vault Notion→md) — 브랜치 세션 시작 시 1회 주입
 # ─────────────────────────────────────────────
 # ML/보안 관련 문서만 (OpenCPN C++ 빌드 매뉴얼은 FE/판정과 무관 → 제외).
@@ -556,7 +619,7 @@ def n_readme(state: PipelineState) -> dict:
     # FP5/10·시나리오별 탐지율은 fe_stats 에 없어 FE JSON 에서 보강
     det5 = det10 = None
     d = {}
-    fe_json = steps.WORK_DIR / "feat_eng_iter01.json"
+    fe_json = steps.WORK_DIR / f"feat_eng_iter{state['run_num']:02d}.json"
     if fe_json.exists():
         try:
             d = json.loads(fe_json.read_text(encoding="utf-8"))
@@ -769,16 +832,16 @@ def build_graph(checkpointer=None):
                   ("gate_converge", n_gate_converge),
                   ("log_run_start", log_sheet("run_start")), ("log_fe", log_sheet("fe")),
                   ("log_run_done", log_sheet("run_done")), ("log_converge", log_sheet("converge"))]:
-        g.add_node(n, fn)
+        g.add_node(n, _logged_node(n, fn))
 
     # 판정 (코어 뒤)
-    g.add_node("j_branch", claude_judge("new_branch", lambda s: (s.get("branch", ""), {})))
-    g.add_node("j_base", claude_judge("baseline", lambda s: (s["baseline"]["out"], {"det": s["baseline"]["det"]})))
-    g.add_node("j_reco", claude_judge("reco", lambda s: (", ".join(s.get("candidates", [])), {"n": len(s.get("candidates", []))})))
-    g.add_node("j_fe", claude_judge("fe", lambda s: ("\n".join(s["r"].get("summary", [])), s["r"].get("fe_stats", {}))))
-    g.add_node("j_build", claude_judge("build", lambda s: ("\n".join(s.get("build_summary", [])), {})))
-    g.add_node("j_release", claude_judge("release", lambda s: (s["branch"], {"det": s["r"].get("det_str")})))
-    g.add_node("j_chain", claude_judge("chain", lambda s: (", ".join(s.get("current_extra", [])), {})))
+    g.add_node("j_branch", _logged_node("j_branch", claude_judge("new_branch", lambda s: (s.get("branch", ""), {}))))
+    g.add_node("j_base", _logged_node("j_base", claude_judge("baseline", lambda s: (s["baseline"]["out"], {"det": s["baseline"]["det"]}))))
+    g.add_node("j_reco", _logged_node("j_reco", claude_judge("reco", lambda s: (", ".join(s.get("candidates", [])), {"n": len(s.get("candidates", []))}))))
+    g.add_node("j_fe", _logged_node("j_fe", claude_judge("fe", lambda s: ("\n".join(s["r"].get("summary", [])), s["r"].get("fe_stats", {})))))
+    g.add_node("j_build", _logged_node("j_build", claude_judge("build", lambda s: ("\n".join(s.get("build_summary", [])), {}))))
+    g.add_node("j_release", _logged_node("j_release", claude_judge("release", lambda s: (s["branch"], {"det": s["r"].get("det_str")}))))
+    g.add_node("j_chain", _logged_node("j_chain", claude_judge("chain", lambda s: (", ".join(s.get("current_extra", [])), {}))))
 
     # 배선
     g.add_edge(START, "new_branch")
@@ -888,10 +951,12 @@ def main():
     # ── 영구 파일 로깅: stdout/stderr tee + Slack 서술 로그 ──
     # 시작 시 ml/logs/run_*.log, 브랜치 진입마다 ml/logs/{branch}_*.log 로 전환(_switch_log).
     Path("ml/logs").mkdir(parents=True, exist_ok=True)
-    _switch_log(Path("ml/logs") / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    _ts0 = time.strftime("%Y%m%d_%H%M%S")
+    _switch_log(Path("ml/logs") / f"run_{_ts0}.log")
+    _open_node_log(Path("ml/logs") / f"nodes_{_ts0}.jsonl")   # 노드 in/out 전체 레코드
     sys.stdout = _Tee(sys.stdout)
     sys.stderr = _Tee(sys.stderr)
-    print(f"[로그] {_LOG['path']}")
+    print(f"[로그] {_LOG['path']}  |  노드IO: ml/logs/nodes_{_ts0}.jsonl")
 
     steps._AUTO_APPROVE = args.auto_approve
     if args.no_judge:
