@@ -13,6 +13,7 @@
 - [프로젝트 컨텍스트·규칙](CLAUDE.md)
 - [ML 파이프라인 개요](ml/README.md)
 - [팀 자료 맵](team-vault/README.md)
+- [개발/자동화 도구 세팅](dev-tooling/README.md): Semgrep MCP(보안스캔)·agnix(설정린트)·n8n 커맨드센터·스킬(security-scan/config-lint/briefing). MCP 템플릿은 `.mcp.json.example`.
 
 ## 코드 진입점
 

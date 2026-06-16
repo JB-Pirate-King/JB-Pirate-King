@@ -79,6 +79,9 @@ build/
 ml/pipeline_config.json
 ml/google_credentials.json
 
+# 프로젝트 MCP 설정 — 실제 토큰 포함하므로 추적 금지(공개 레포). 템플릿은 .mcp.json.example 만 커밋.
+.mcp.json
+
 # caveman-compress backups
 *.original.md
 
