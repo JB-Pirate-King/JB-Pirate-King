@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -45,8 +46,15 @@ import ml.integrations.slack_bot as _sb
 import ml.integrations.sheets as _sh
 import ml.integrations.git_manager as git
 
-# 판정(judge)을 켤 노드 (전체). 비용 줄이려면 일부만 남긴다.
-JUDGE_ON = {"new_branch", "baseline", "reco", "fe", "build", "release", "chain"}
+# 판정(judge)을 LLM 으로 돌릴 노드 — **분석형만**.
+#   new_branch/release/chain 은 자명한 사실(브랜치/커밋/저장 성공)이라 LLM 무가치 → 패스스루
+#   (claude_judge 가 JUDGE_ON 밖 stage 는 LLM 없이 continue 즉답).
+#   build 는 빈 commit_files 가 예외 없이 통과할 수 있어 결정적 체크 노드(n_check_build)로 대체.
+#   남기는 건 진짜 추론이 필요한 baseline(약세진단)·reco(중복/유효성)·fe(채택/회귀 분석)뿐.
+JUDGE_ON = {"baseline", "reco", "fe"}
+
+# judge verdict=retry 의 단계별 재시도 상한 — 초과 시 continue 로 강등(플랩 방지).
+MAX_JUDGE_RETRY = 2
 
 # 노드별 판정 포인트 — 같은 템플릿이지만 단계 고유의 관점을 주입해
 # claude 가 그 단계에 맞는 기준으로 평가하게 한다 (일률 판정 방지).
@@ -241,6 +249,8 @@ class PipelineState(TypedDict, total=False):
     judge: dict             # 노드별 판정 결과
     adopted_any: bool
     terminate: bool
+    obj_hist: list            # 브랜치 내 reco 라운드별 best 목적gain (추세 조기수렴용)
+    retry_count: dict         # 단계별 judge retry 횟수 (MAX_JUDGE_RETRY 상한)
 
 
 # ─────────────────────────────────────────────
@@ -365,6 +375,16 @@ def claude_judge(stage: str, ctx_fn):
         v = _branch_claude(_judge_prompt(stage, text, extra)) or {
             "assessment": "분석 불가(claude 없음)", "verdict": "continue", "reason": "fallback"}
         verdict = v.get("verdict", "continue")
+        out = {"judge": {**state.get("judge", {}), stage: v}}
+        # retry 예산 — 같은 단계 retry 가 MAX_JUDGE_RETRY 초과면 continue 로 강등(무한 플랩 방지)
+        if verdict == "retry":
+            rc = dict(state.get("retry_count", {}))
+            n = rc.get(stage, 0) + 1
+            if n > MAX_JUDGE_RETRY:
+                RT.bot.log(f"⚠️ [{stage}] judge retry {MAX_JUDGE_RETRY}회 초과 — continue 강등", "warning")
+                verdict = "continue"
+            rc[stage] = n
+            out["retry_count"] = rc
         sug = (v.get("suggestion") or "").strip()
         has_sug = sug and sug.lower() not in ("없음", "none", "n/a", "-", "null", "없음.")
         RT.bot.log(
@@ -373,7 +393,8 @@ def claude_judge(stage: str, ctx_fn):
             + (f"\n  💡 {sug}" if has_sug else ""),
             "판정",
         )
-        return {"judge": {**state.get("judge", {}), stage: v}, "decision": verdict}
+        out["decision"] = verdict
+        return out
     return node
 
 
@@ -381,7 +402,8 @@ def _route_judge(continue_to: str, retry_to: str):
     """판정 verdict → continue_to / retry_to / user_stop(stop).
 
     retry 는 **직전 노드 재실행** — 예전엔 일률 fe_train 으로 보내
-    j_base retry 가 후보 0인 채 스캔에 진입하는 등 비논리적이었다."""
+    j_base retry 가 후보 0인 채 스캔에 진입하는 등 비논리적이었다.
+    (retry 횟수 상한은 claude_judge 가 MAX_JUDGE_RETRY 로 강등 처리.)"""
     def route(state: PipelineState) -> str:
         d = state.get("decision", "continue")
         if d == "stop":
@@ -392,32 +414,58 @@ def _route_judge(continue_to: str, retry_to: str):
     return route
 
 
+def n_check_build(state: PipelineState) -> dict:
+    """build 산출 결정적 검증 — claude judge 대체. 커밋 파일 없으면(부분 실패) stop.
+    (_fe_build_and_release 는 빈 commit_files 를 예외 없이 반환할 수 있어 명시 체크가 필요.)"""
+    ok = len(state.get("commit_files", [])) > 0
+    if not ok:
+        RT.bot.log("⚠️ [build] 커밋 산출 파일 0개 — 빌드 부분 실패로 간주 → stop", "warning")
+    return {"decision": "continue" if ok else "stop"}
+
+
 # ─────────────────────────────────────────────
 # Sheets 로깅 DRY 팩토리
 # ─────────────────────────────────────────────
+# Sheets API 는 그래프 임계경로에서 떼어 비동기 발사 — 노드는 즉시 리턴.
+# 단일 gspread 클라이언트 동시호출 경쟁 방지로 lock 직렬화. 관찰용이라 best-effort.
+_SHEET_LOCK = threading.Lock()
+
+
 def log_sheet(kind: str):
-    """kind: run_start|fe|run_done|converge. 동일 로깅 노드 복제 대신 하나로."""
+    """kind: run_start|fe|run_done|converge. 동일 로깅 노드 복제 대신 하나로.
+    Sheets 쓰기는 데몬 스레드로 발사하고 노드는 즉시 {} 반환(핫패스 비차단)."""
     def node(state: PipelineState) -> dict:
         s, r, a = RT.sheet, state.get("r", {}), RT.args
-        try:
-            if kind == "run_start":
-                s.log_run_start(state["branch"], a.model, a.epochs, a.max_mmsi,
-                                data_file=a.data_file)
-            elif kind == "fe":
-                fe = r.get("fe_stats", {})
-                s.log_fe(state["branch"], state["run_num"], "완료",
-                         model=a.model, fe_step=len(r.get("newly_adopted", [])),
-                         baseline_det=fe.get("baseline_det"), best_det=fe.get("det_rate"),
-                         n_features=r.get("n_feat"), adopted=r.get("newly_adopted"),
-                         all_features=r.get("full_extra"),
-                         threshold=fe.get("threshold"))
-            elif kind == "run_done":
-                s.log_run_done(state["branch"], a.model, success=True)
-            elif kind == "converge":
-                s.update_run_summary(notes="수렴 완료",
-                                     adopted=state.get("current_extra"))
-        except Exception as e:
-            print(f"[Sheets:{kind}] 로깅 실패(무시): {e}")
+        # 스레드에서 쓸 값은 호출 시점에 스냅샷(이후 state 변화와 무관하게).
+        branch = state.get("branch", "?")
+        run_num = state.get("run_num")
+        current_extra = state.get("current_extra")
+        fe = dict(r.get("fe_stats", {}))
+        newly_adopted = list(r.get("newly_adopted", []))
+        full_extra = list(r.get("full_extra", []))
+        n_feat = r.get("n_feat")
+
+        def _do():
+            with _SHEET_LOCK:
+                try:
+                    if kind == "run_start":
+                        s.log_run_start(branch, a.model, a.epochs, a.max_mmsi,
+                                        data_file=a.data_file)
+                    elif kind == "fe":
+                        s.log_fe(branch, run_num, "완료",
+                                 model=a.model, fe_step=len(newly_adopted),
+                                 baseline_det=fe.get("baseline_det"), best_det=fe.get("det_rate"),
+                                 n_features=n_feat, adopted=newly_adopted,
+                                 all_features=full_extra,
+                                 threshold=fe.get("threshold"))
+                    elif kind == "run_done":
+                        s.log_run_done(branch, a.model, success=True)
+                    elif kind == "converge":
+                        s.update_run_summary(notes="수렴 완료", adopted=current_extra)
+                except Exception as e:
+                    print(f"[Sheets:{kind}] 로깅 실패(무시): {e}")
+
+        threading.Thread(target=_do, daemon=True, name=f"sheet-{kind}").start()
         return {}
     return node
 
@@ -466,9 +514,11 @@ def n_new_branch(state: PipelineState) -> dict:
         "출발 피처": f"{len(state.get('current_extra', []))}개 (기채택)",
         "claude세션": RT.claude_sid[:8],
     })
-    # reco_round 는 브랜치 단위 리셋 — 각 브랜치가 invent_rounds 만큼 재추천 기회를 가짐
+    # reco_round·obj_hist·retry_count 는 브랜치 단위 리셋 — 각 브랜치가 invent_rounds 만큼
+    # 재추천 기회를 갖고, 추세/재시도 카운트가 이전 브랜치로 누설되지 않게 한다.
     return {"run_num": run_num, "branch": branch,
-            "iters": state.get("iters", 0) + 1, "reco_round": 1}
+            "iters": state.get("iters", 0) + 1, "reco_round": 1,
+            "obj_hist": [], "retry_count": {}}
 
 
 def n_preprocess(state: PipelineState) -> dict:
@@ -608,7 +658,12 @@ def n_fe_train(state: PipelineState) -> dict:
     steps.WORK_DIR.mkdir(parents=True, exist_ok=True)
     r = steps._fe_train_eval(RT.bot, RT.sheet, state["branch"], RT.args,
                              state["run_num"], state["current_extra"], steps.WORK_DIR, si)
-    return {"r": r, "first_iter": False}
+    # 이번 라운드 best 후보 목적gain 을 추세 히스토리에 누적(조기수렴 판단용).
+    hist = list(state.get("obj_hist", []))
+    bog = r.get("best_obj_gain")
+    if bog is not None:
+        hist.append(bog)
+    return {"r": r, "first_iter": False, "obj_hist": hist}
 
 
 def n_build(state: PipelineState) -> dict:
@@ -792,20 +847,32 @@ def route_after_preprocess(state: PipelineState) -> str:
 
 
 def route_after_fe(state: PipelineState) -> str:
-    """판정 verdict + 채택여부 결합 라우팅."""
+    """판정 verdict + 채택여부 결합 라우팅.
+
+    종료 경로 일원화: 미채택 상황의 'stop' 은 하드 user_stop 이 아니라 converge 게이트로
+    보낸다 (수렴 로깅/Sheets 를 거쳐 정상 종료). 하드 stop 은 '채택했는데 judge 가 불신'
+    하는 경우(과적합 의심)로 한정 — 두 종료 결정자(j_fe verdict ↔ converge)의 중복 제거."""
     d = state.get("decision", "continue")
-    if d == "stop":
-        return "user_stop"
+    r = state.get("r", {})
     if d == "retry":
         return "fe_baseline"
-    r = state.get("r", {})
     if r.get("ret", 0) != 0:
         return "fe_baseline"           # 실패 → 재진단/재시도
     if r.get("newly_adopted"):
-        return "gate_deploy"
-    # 수렴 판단에 횟수 기준: 이 브랜치에서 미채택이라도 invent_rounds 까지
-    # 다른 각도로 재추천 (라운드 비용은 baseline_cache 로 후보 학습만).
-    # 모든 라운드 소진 후에야 수렴 게이트로 — 단발 미채택 = 즉시 종료 방지.
+        # 채택 + judge stop = 채택 불신(winner's curse/과적합) → 하드 정지. 아니면 배포.
+        return "user_stop" if d == "stop" else "gate_deploy"
+    # ── 미채택 경로 ──
+    if d == "stop":                    # judge 가 수렴 권고 → converge 로 일원화
+        RT.bot.log("⛔ [fe] judge stop(미채택) — 수렴 게이트로", "피처개선")
+        return "gate_converge"
+    # 추세 조기수렴: 최근 2라운드 best 목적gain 이 모두 ≤0 이면 라운드 남아도 수렴
+    # (음수 2연속이면 회복 확률 낮음 — 낭비 fe_train 라운드 컷).
+    hist = state.get("obj_hist", [])
+    if len(hist) >= 2 and max(hist[-2:]) <= 0:
+        RT.bot.log(f"⛔ [fe] 최근 2라운드 목적gain ≤0 {hist[-2:]} — 추세 조기수렴", "피처개선")
+        return "gate_converge"
+    # 횟수 기준: 미채택이라도 invent_rounds 까지 다른 각도로 재추천
+    # (라운드 비용은 baseline_cache 로 후보 학습만). 단발 미채택 = 즉시 종료 방지.
     if (RT.args.invent and RT.args.invent > 0
             and state.get("reco_round", 1) < RT.args.invent_rounds):
         return "reco_again"
@@ -832,6 +899,22 @@ def route_gate_converge(state: PipelineState) -> str:
 # ─────────────────────────────────────────────
 # 그래프
 # ─────────────────────────────────────────────
+def _make_checkpointer(persist: bool):
+    """persist=True → SqliteSaver(크래시 후 resume). 불가/미설치 시 MemorySaver 폴백."""
+    if not persist:
+        return MemorySaver()
+    try:
+        import sqlite3
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        Path("ml/.pipeline_tmp").mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect("ml/.pipeline_tmp/checkpoints.db", check_same_thread=False)
+        print("[checkpoint] SqliteSaver 활성 — ml/.pipeline_tmp/checkpoints.db")
+        return SqliteSaver(conn)
+    except Exception as e:
+        print(f"[checkpoint] Sqlite 불가({e}) → MemorySaver 폴백")
+        return MemorySaver()
+
+
 def build_graph(checkpointer=None):
     g = StateGraph(PipelineState)
 
@@ -853,7 +936,7 @@ def build_graph(checkpointer=None):
     g.add_node("j_base", _logged_node("j_base", claude_judge("baseline", lambda s: (s["baseline"]["out"], {"det": s["baseline"]["det"]}))))
     g.add_node("j_reco", _logged_node("j_reco", claude_judge("reco", lambda s: (", ".join(s.get("candidates", [])), {"n": len(s.get("candidates", []))}))))
     g.add_node("j_fe", _logged_node("j_fe", claude_judge("fe", lambda s: ("\n".join(s["r"].get("summary", [])), s["r"].get("fe_stats", {})))))
-    g.add_node("j_build", _logged_node("j_build", claude_judge("build", lambda s: ("\n".join(s.get("build_summary", [])), {}))))
+    g.add_node("j_build", _logged_node("j_build", n_check_build))   # 결정적 체크(LLM 아님)
     g.add_node("j_release", _logged_node("j_release", claude_judge("release", lambda s: (s["branch"], {"det": s["r"].get("det_str")}))))
     g.add_node("j_chain", _logged_node("j_chain", claude_judge("chain", lambda s: (", ".join(s.get("current_extra", [])), {}))))
 
@@ -960,6 +1043,9 @@ def main():
     p.add_argument("--knowledge", action=argparse.BooleanOptionalAction, default=True,
                    help="team-vault 도메인 지식(ML IDS·공격 시나리오)을 브랜치 세션에 주입. "
                         "끄려면 --no_knowledge.")
+    p.add_argument("--persist", action="store_true",
+                   help="SqliteSaver 체크포인트(ml/.pipeline_tmp/checkpoints.db) — 게이트 대기중 "
+                        "크래시/재시작해도 재학습 없이 resume. 기본 off(MemorySaver, 인프로세스).")
     args = p.parse_args()
 
     # ── 영구 파일 로깅: stdout/stderr tee + Slack 서술 로그 ──
@@ -994,7 +1080,7 @@ def main():
         "current_extra": steps._load_fe_initial_extra(),
         "tried_feats": [], "adopted_any": False, "terminate": False,
     }
-    graph = build_graph()
+    graph = build_graph(checkpointer=_make_checkpointer(args.persist))
     # thread_id 를 run 마다 분리 — 고정값이면 LangSmith Threads 뷰에서 모든 run 이
     # 한 스레드의 턴으로 합쳐져 새 run 이 안 보이는 것처럼 보인다.
     thread_id = f"orchestrator-{time.strftime('%Y%m%d_%H%M%S')}"
