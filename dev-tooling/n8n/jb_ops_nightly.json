@@ -1,0 +1,41 @@
+{
+  "name": "JB - Ops Nightly",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "30 21 * * *" }
+          ]
+        }
+      },
+      "id": "sched-ops-nightly",
+      "name": "Schedule 21:30",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "command": "C:\\scripts\\ops_nightly.bat"
+      },
+      "id": "exec-ops-nightly",
+      "name": "Run ops_nightly.bat",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [260, 0]
+    }
+  ],
+  "connections": {
+    "Schedule 21:30": {
+      "main": [
+        [ { "node": "Run ops_nightly.bat", "type": "main", "index": 0 } ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "timezone": "Asia/Seoul",
+    "executionOrder": "v1"
+  }
+}

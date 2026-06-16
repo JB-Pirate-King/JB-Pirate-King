@@ -1,0 +1,42 @@
+{
+  "id": "jbsemgrepwk00001",
+  "name": "JB - Semgrep Weekly",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 9 * * 1" }
+          ]
+        }
+      },
+      "id": "sched-semgrep-weekly",
+      "name": "Schedule Mon 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "command": "C:\\scripts\\semgrep_scan.bat"
+      },
+      "id": "exec-semgrep-weekly",
+      "name": "Run semgrep_scan.bat",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [260, 0]
+    }
+  ],
+  "connections": {
+    "Schedule Mon 09:00": {
+      "main": [
+        [ { "node": "Run semgrep_scan.bat", "type": "main", "index": 0 } ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "timezone": "Asia/Seoul",
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "name": "JB - Notion Vault Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 9 * * *" },
+            { "field": "cronExpression", "expression": "0 18 * * *" }
+          ]
+        }
+      },
+      "id": "sched-notion-vault",
+      "name": "Schedule 09:00 + 18:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "command": "C:\\scripts\\notion_team_vault_sync.bat"
+      },
+      "id": "exec-notion-vault",
+      "name": "Run notion_team_vault_sync.bat",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [260, 0]
+    }
+  ],
+  "connections": {
+    "Schedule 09:00 + 18:00": {
+      "main": [
+        [ { "node": "Run notion_team_vault_sync.bat", "type": "main", "index": 0 } ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "timezone": "Asia/Seoul",
+    "executionOrder": "v1"
+  }
+}

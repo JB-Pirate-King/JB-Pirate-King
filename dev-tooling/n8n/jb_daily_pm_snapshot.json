@@ -1,0 +1,41 @@
+{
+  "name": "JB - Daily PM Snapshot",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 18 * * *" }
+          ]
+        }
+      },
+      "id": "sched-pm-snapshot",
+      "name": "Schedule 18:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "command": "C:\\scripts\\daily_pm_snapshot.bat"
+      },
+      "id": "exec-pm-snapshot",
+      "name": "Run daily_pm_snapshot.bat",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [260, 0]
+    }
+  ],
+  "connections": {
+    "Schedule 18:00": {
+      "main": [
+        [ { "node": "Run daily_pm_snapshot.bat", "type": "main", "index": 0 } ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "timezone": "Asia/Seoul",
+    "executionOrder": "v1"
+  }
+}
