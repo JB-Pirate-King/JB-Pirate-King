@@ -117,14 +117,28 @@ class _Tee:
 
 # ─────────────────────────────────────────────
 # 노드 in/out 로깅 — 모든 노드를 _logged_node 로 감싸 입력 state·출력 delta 기록
-#   ① 압축 한 줄 → tee 로그(ml/logs/{branch}.log) [NODE→]/[NODE←]
+#   ① 압축 한 줄 → tee 로그(ml/logs/{branch}.log) [NODE→]/[NODE←] (Slack 서술과 섞임)
 #   ② 전체 레코드 → ml/logs/nodes_{ts}.jsonl (머신 파싱용, 큰 문자열만 컷)
+#   ③ in/out 한 줄만 모은 실시간 스트림 → ml/logs/nodeio_{ts}.log (tail -f 용, 노드 IO만)
 # ─────────────────────────────────────────────
-_NODE_LOG = {"f": None}   # nodes_{ts}.jsonl 핸들 (run 단위 1개)
+_NODE_LOG = {"f": None, "live": None}   # f=jsonl 핸들, live=nodeio 스트림 핸들 (run 단위 1개)
 
 
-def _open_node_log(path):
-    _NODE_LOG["f"] = open(path, "a", encoding="utf-8", errors="replace")
+def _open_node_log(jsonl_path, live_path=None):
+    _NODE_LOG["f"] = open(jsonl_path, "a", encoding="utf-8", errors="replace")
+    if live_path is not None:
+        _NODE_LOG["live"] = open(live_path, "a", encoding="utf-8", errors="replace")
+
+
+def _node_line(line: str):
+    """[NODE→]/[NODE←] 한 줄을 stdout(tee)·전용 nodeio 스트림 양쪽에 즉시 기록."""
+    print(line)
+    if _NODE_LOG["live"]:
+        try:
+            _NODE_LOG["live"].write(line + "\n")
+            _NODE_LOG["live"].flush()
+        except Exception:
+            pass
 
 
 def _io_summary(obj, maxlen: int = 300) -> str:
@@ -159,11 +173,11 @@ def _logged_node(name: str, fn):
     (try/except 로 삼키면 LangGraph 일시정지가 깨짐). 정상 반환만 [NODE←]/jsonl 기록."""
     def wrapped(state: PipelineState) -> dict:
         br = state.get("branch", "-")
-        print(f"┌─[NODE→] {name} [{br}] | in={_io_summary(state)}")
+        _node_line(f"┌─[NODE→] {name} [{br}] | in={_io_summary(state)}")
         t0 = time.time()
         out = fn(state)                        # interrupt 시 여기서 GraphInterrupt 전파 → 아래 생략
         dt = time.time() - t0
-        print(f"└─[NODE←] {name} [{br}] ({dt:.1f}s) | out={_io_summary(out)}")
+        _node_line(f"└─[NODE←] {name} [{br}] ({dt:.1f}s) | out={_io_summary(out)}")
         if _NODE_LOG["f"]:
             try:
                 rec = {"ts": time.strftime("%H:%M:%S"), "branch": br, "node": name,
@@ -953,10 +967,11 @@ def main():
     Path("ml/logs").mkdir(parents=True, exist_ok=True)
     _ts0 = time.strftime("%Y%m%d_%H%M%S")
     _switch_log(Path("ml/logs") / f"run_{_ts0}.log")
-    _open_node_log(Path("ml/logs") / f"nodes_{_ts0}.jsonl")   # 노드 in/out 전체 레코드
+    _open_node_log(Path("ml/logs") / f"nodes_{_ts0}.jsonl",      # 노드 in/out 전체 레코드(jsonl)
+                   Path("ml/logs") / f"nodeio_{_ts0}.log")        # in/out 한 줄 실시간 스트림
     sys.stdout = _Tee(sys.stdout)
     sys.stderr = _Tee(sys.stderr)
-    print(f"[로그] {_LOG['path']}  |  노드IO: ml/logs/nodes_{_ts0}.jsonl")
+    print(f"[로그] {_LOG['path']}  |  노드IO: ml/logs/nodes_{_ts0}.jsonl  |  실시간: ml/logs/nodeio_{_ts0}.log")
 
     steps._AUTO_APPROVE = args.auto_approve
     if args.no_judge:
