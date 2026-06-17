@@ -1,29 +1,77 @@
-# JB-Pirate-King
+# JB-Pirate-King — LLM 위키 / 진입점 색인
 
 > AIS 선박 이상탐지 시스템 — OpenCPN 플러그인(C++) + ML 파이프라인(Python) + 로컬 서버.
-> 에이전트와 새 세션을 위한 정식 문서·코드 진입점 색인. 저장소 전체를 훑지 말고 여기서 시작한다.
+> 에이전트·신규 합류자는 저장소 전체를 훑지 말고 **이 색인에서 시작**한다. 이 파일이 LLM 위키의 단일 진입점이다.
+> 깊은 도메인 지식(위협·취약점·방법론)은 §6 지식베이스(team-vault)로, 프로젝트 규칙은 CLAUDE.md로 간다.
 
-## 먼저 (세션 시작)
+## 0. 세션 시작 (먼저)
 
-- [세션 시작 프로토콜](CLAUDE.md): 새 세션은 `python ml/automation/bootstrap.py` 를 먼저 실행해 현황·차기 작업·배포 대기를 파악한다 (skill: session-bootstrap).
-- [최근 커밋 맥락](ml/automation/context/commit_log.md): bootstrap가 매 세션 갱신하는 git 커밋 다이제스트. 없으면 `python ml/automation/commit_context.py`.
+- [세션 시작 프로토콜](CLAUDE.md): `python ml/automation/bootstrap.py` 실행 → 현황·차기 작업·배포 대기 파악 (skill: `session-bootstrap`). SessionStart 훅으로 자동 실행됨.
+- [최근 커밋 맥락](ml/automation/context/commit_log.md): bootstrap가 매 세션 갱신하는 git 다이제스트. 없으면 `python ml/automation/commit_context.py`.
 
-## 핵심 문서
+## 1. 디렉토리 지도 (폴더별 README)
 
-- [프로젝트 컨텍스트·규칙](CLAUDE.md)
+| 디렉토리 | 내용 | 진입 문서 |
+|---|---|---|
+| `ml/` | ML 파이프라인(학습·평가·FE·오케스트레이션) | [ml/README.md](ml/README.md) |
+| `ais_ids_pi/` | OpenCPN 플러그인(C++, ONNX 추론) | [ais_ids_pi/README.md](ais_ids_pi/README.md) |
+| `s-c/` | 로컬 서버 + GUI(Python, Docker) | [s-c/Readme.md](s-c/Readme.md) |
+| `aivdm_gen/` | 공격 시나리오 시뮬레이터(AIVDM 주입) | [aivdm_gen/README.md](aivdm_gen/README.md) |
+| `dev-tooling/` | 개발/자동화 도구 세팅(Semgrep·agnix·n8n) | [dev-tooling/README.md](dev-tooling/README.md) |
+| `team-vault/` | 지식베이스 LLM 위키(Notion/CCIT 미러, 읽기전용) | [team-vault/README.md](team-vault/README.md) |
+| `.claude/skills/` | 도메인 스킬 11개 | §4 |
+
+## 2. 핵심 문서
+
+- [프로젝트 컨텍스트·규칙·파이프라인 아키텍처](CLAUDE.md)
 - [ML 파이프라인 개요](ml/README.md)
-- [팀 자료 맵](team-vault/README.md)
-- [개발/자동화 도구 세팅](dev-tooling/README.md): Semgrep MCP(보안스캔)·agnix(설정린트)·n8n 커맨드센터·스킬(security-scan/config-lint/briefing). MCP 템플릿은 `.mcp.json.example`.
+- [지식베이스 위키 맵](team-vault/README.md) — 발표 마스터플랜(공식수치 freeze), 핵심개념 지식베이스 5섹션
+- [개발/자동화 도구](dev-tooling/README.md)
 
-## 코드 진입점
+## 3. 코드 진입점
 
-- ml/orchestrator.py — LangGraph 오케스트레이터 (control flow)
-- ml/pipeline_steps.py — 공용 스텝 라이브러리 (실행 로직)
-- ml/core/feature_engineer.py — 피처 엔지니어링 (Greedy 선택 + ONNX export)
-- ais_ids_pi/src/ais_ids.cpp — OpenCPN 플러그인 메인
+- `ml/orchestrator.py` — LangGraph 오케스트레이터 (control flow; reco + per-node judge + gates)
+- `ml/pipeline_steps.py` — 공용 스텝 라이브러리 (실행 로직)
+- `ml/core/feature_engineer.py` — 피처 엔지니어링 (Greedy 선택 + ONNX export)
+- `ais_ids_pi/src/ais_ids.cpp` — OpenCPN 플러그인 메인
 
-## 데이터·산출물 (로컬 D 드라이브, git 제외)
+## 4. 스킬 (.claude/skills) — description으로 자동 트리거
 
-- D:\ais_data\ — 원천/전처리 AIS 데이터
-- D:\ais_models\{name}\ — 학습된 모델·스케일러·threshold
-- D:\ais_output\ — 파이프라인 / FE 리포트
+- `session-bootstrap` — 세션 시작 시 프로젝트 현황 로드
+- `security-scan` — Semgrep SAST로 코드 보안 취약점 스캔
+- `config-lint` — agnix로 CLAUDE.md/SKILL.md/hooks/.mcp.json 린트
+- `briefing` — 커밋·PR·맥락에서 진행 보고서 생성
+- `token-usage` — Claude 토큰 사용량/누수 점검(ccusage)
+- `repomix-pack` — 코드 서브트리의 시그니처 맵 생성(토큰 절약)
+- `feature-engineering` — DCdetect FE 절차 레퍼런스
+- `orchestrator-internals` — 파이프라인 오케스트레이터 내부 레퍼런스
+- `plugin-build` — 모델 배포 + C++ 플러그인 빌드(네이티브 Linux)
+- `release-management` — 릴리스·버전 관리
+- `sheets-logging` — Google Sheets 5탭 로깅 스키마
+
+## 5. 운영·자동화 (n8n 커맨드센터)
+
+백그라운드 자동화 4개를 n8n(`localhost:5678`, pm2 상시구동) 단일 GUI로 통합 — on/off·이력·즉시실행.
+Notion Vault Sync(09/18시) · Daily PM Snapshot(18시) · Ops Nightly(21:30) · Semgrep Weekly(월 09시).
+상세·구조도(Mermaid): [dev-tooling/README.md](dev-tooling/README.md), [dev-tooling/n8n/](dev-tooling/n8n/README.md).
+
+## 6. 지식베이스 (team-vault, 깊은 도메인 지식)
+
+도메인·위협·취약점·ML방법론·아키텍처는 [team-vault/README.md](team-vault/README.md)의 위키 맵에서 시작.
+공식 수치는 발표 마스터플랜만 인용(FE Iter8, 20피처, FP=1% 91.9%; 구수치 인용 금지).
+
+## 7. 데이터·산출물 (로컬 D 드라이브, git 제외)
+
+- `D:\ais_data\` — 원천/전처리 AIS 데이터
+- `D:\ais_models\{name}\` — 학습된 모델·스케일러·threshold
+- `D:\ais_output\` — 파이프라인 / FE 리포트
+
+## 8. 토큰·비용
+
+- 사용량/누수 점검: skill `token-usage` 또는 `npx -y ccusage@latest [daily|blocks --active|session]`.
+- 최대 소비처 = 멀티에이전트 Workflow fan-out → 꼭 필요할 때만. 큰 파일은 repomix-pack/이 색인으로 좁혀 읽기.
+
+## 9. MCP 서버 (프로젝트)
+
+`.mcp.json.example` 템플릿 참조(실제 `.mcp.json`은 비밀키로 gitignore). obsidian · github ·
+google-sheets · context7 · sequential-thinking · semgrep(보안 SAST).

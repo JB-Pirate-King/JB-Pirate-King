@@ -2,6 +2,9 @@
 
 A system that detects anomalous behavior in ship AIS signals. It consists of an OpenCPN plugin, a local server, and an ML pipeline.
 
+> **LLM/agents start here:** [`llms.txt`](llms.txt) is the single navigation hub (wiki index) for the
+> whole project — directory map, docs, skills, code entry points, automation, and knowledge base.
+
 ---
 
 ## Components
@@ -44,7 +47,7 @@ python ml/core/feature_engineer.py --input D:/ais_data/preprocessed/ais_preproce
 The orchestrator auto-chains run branches (`dcdetect_001 → 002 → ...`), adopting one feature per
 run until convergence. See [`CLAUDE.md`](CLAUDE.md) for the full pipeline architecture, the
 `--max_runs` / `--build_plugin` flags, branch-chaining behavior, and the **LangGraph port**
-(`ml/orchestrator_lg.py`). More ML detail in [`ml/README.md`](ml/README.md).
+(`ml/orchestrator.py`). More ML detail in [`ml/README.md`](ml/README.md).
 
 ---
 
