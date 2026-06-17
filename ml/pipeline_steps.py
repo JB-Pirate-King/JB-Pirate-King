@@ -902,10 +902,12 @@ def _fe_train_eval(bot, sheet, branch, args, run_num, current_initial_extra, fe_
     det_str  = f"{det_rate:.1f}" if det_rate is not None else "?"
     n_feat_s = str(n_feat) if n_feat else "?"
     scaler_path = str(WORK_DIR / "model" / f"scaler_{args.model}.json")
+    # 이번 스캔의 최고 후보 목적gain (candidates 는 obj_gain 내림차순) — 추세 조기수렴용.
+    best_obj_gain = candidates[0][4] if candidates else None
     return {
         "ret": 0, "summary": summary, "fe_stats": fe_stats,
         "newly_adopted": newly_adopted, "full_extra": full_extra,
-        "det_rate": det_rate, "det_str": det_str,
+        "det_rate": det_rate, "det_str": det_str, "best_obj_gain": best_obj_gain,
         "n_feat": n_feat, "n_feat_s": n_feat_s, "scaler_path": scaler_path,
     }
 
