@@ -1,6 +1,6 @@
 ---
 name: change-report
-description: Detect code and GitHub changes and write a change report into Notion. Pulls local git diff+log and (if gh is authed) merged PRs/releases/issues, synthesizes a dated report, and publishes it as a Notion page (primary output), with a local CHANGELOG.md copy. Use when the user says "change report", "changelog", "what changed", "변경사항 정리", "릴리스 노트".
+description: Detect code and GitHub changes and write a change report into Notion. Pulls local git diff+log and (if gh is authed) merged PRs/releases/issues, optionally folds in meeting notes (회의록) to check decisions vs. actual code, synthesizes a dated report, and publishes it as a Notion page (primary output), with a local CHANGELOG.md copy. Use when the user says "change report", "changelog", "what changed", "변경사항 정리", "릴리스 노트", "회의록 보고서", "브리핑 보고서".
 ---
 
 # change-report — detect changes and write them up **into Notion**
@@ -14,6 +14,18 @@ Turns "what changed?" into a written artifact. Reads (never mutates) git + GitHu
 - **Notion publish is the intended action here** — the user wants every report on Notion. Do it without re-asking each run. BUT the first time in a session (or when the parent page is unknown), confirm WHICH Notion page/space to post under, then reuse it.
 - **Do the Notion write from the main context, not a subagent** (cavecrew/limited subagents have no MCP access).
 - Report prose: English (project convention). The spoken summary to the user: Korean.
+
+## Step 0 — Meeting notes (회의록), optional
+
+The roadmap wants reports to fold in "PR context **+ latest meeting notes** + files". Gather meeting notes when available so the report can check decisions against actual code.
+
+Source priority:
+1. **Path argument** — if the user passed a file/folder path (or names one), read those `.md` notes.
+2. **Fallback scan** — else glob `team-vault/자료/**/*회의록*.md` and take the most recent (by `last_synced` frontmatter or filename date). `team-vault/` is a read-only Notion mirror — read only, never write.
+
+From the notes, extract: decisions made, action items (owner + task), and any dated follow-ups. Hold these for Steps 2's `## 회의 맥락` and `## 정합성` sections.
+
+If no notes are found, print one line (`회의록 없음 — git/gh 변경만으로 보고서 생성`) and proceed; everything below is unchanged (backward compatible). Do not block on missing notes.
 
 ## Step 1 — Gather sources
 
@@ -43,6 +55,16 @@ Get the date from `git log -1 --format=%cd --date=short` (do not guess). Produce
 ## Summary
 <2–4 sentence plain-English overview: what changed and why it matters. No lists here.>
 
+## Meeting context      (omit unless Step 0 found notes)
+<source file + date>
+- <decision or action item from the notes, one per bullet>
+
+## Alignment            (omit unless Step 0 found notes)
+Meeting decisions vs. actual code changes this batch.
+- ✅ done: <decision> → <commit/PR that implements it>
+- ⬜ not done: <decision with no matching change>
+- ➕ unplanned: <code change not traceable to any decision>
+
 ## Code changes
 Grouped by area, one bullet per distinct change.
 - **orchestrator**: <what changed> (`file:func`, flags/nodes touched)
@@ -67,6 +89,7 @@ Grouped by area, one bullet per distinct change.
 
 **Format rules:**
 - Headline + Scope line are mandatory; everything else is section-gated by content.
+- `## Meeting context` + `## Alignment` appear only when Step 0 found notes; drop both otherwise (the report stays exactly as before).
 - Group Code changes by area: `orchestrator / pipeline_steps / feature_engineer / plugin / docs / config`. Drop empty areas.
 - Be concrete: name files (`ml/orchestrator.py`), functions/nodes (`_logged_node`, `fe_train`), flags (`--invent_rounds`). No filler, no praise, no hedging.
 - Past tense, English. One change per bullet. Newest report on top in CHANGELOG.md.
