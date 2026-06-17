@@ -6,10 +6,12 @@ NodeStyles(first/last/default 3종)로는 노드별 색이 불가능해 소스 �
 실행 (repo 루트에서):
     python -m ml.scripts.render_graph        # → ml/pipeline_langgraph.png 갱신
 
-색 분류:
-    초록  compute (실행 노드)        분홍  recommend (claude 피처 발명)
-    보라  judge (claude 판정)        노랑  gate (승인)
-    파랑  log (Sheets/README 기록)   빨강  user_stop (중단)
+색/테두리 분류 (테두리가 claude 사용 여부를 표시):
+    굵은 보라 테두리 = claude 호출 노드  →  prime(지식주입)·recommend(피처발명)·j_base/j_reco/j_fe(판정)
+    얇은 회색 테두리 = claude 미사용     →  나머지 전부(판정 패스스루·결정적 체크 포함)
+  채움색은 역할:
+    초록 compute · 분홍 recommend · 보라 judge(claude) · 회색 judge_pass/check(비claude)
+    노랑 gate · 파랑 log · 빨강 user_stop
 """
 import sys
 from pathlib import Path
@@ -18,23 +20,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ml.orchestrator import build_graph                     # noqa: E402
 from langchain_core.runnables.graph_mermaid import draw_mermaid_png  # noqa: E402
 
-# 노드 성격 분류 (build_graph 와 동기화)
+# 노드 성격 분류 (build_graph 와 동기화).
+# claude 호출 노드(prime·reco·judge_llm)는 STYLES 에서 굵은 보라 테두리로 표시 — 비claude 와 구분.
 GROUPS = {
-    "compute": ["new_branch", "preprocess", "fe_baseline", "reco_again",
-                "fe_train", "build", "release", "chain", "converge"],
-    "reco":    ["recommend"],
-    "judge":   ["j_branch", "j_base", "j_reco", "j_fe", "j_build", "j_release", "j_chain"],
-    "gate":    ["gate_deploy", "gate_release", "gate_converge"],
-    "log":     ["log_run_start", "log_fe", "log_run_done", "log_converge", "readme"],
-    "stop":    ["user_stop"],
+    # claude 미사용 compute
+    "compute":   ["new_branch", "preprocess", "fe_baseline", "reco_again",
+                  "fe_train", "build", "release", "chain", "converge"],
+    "prime":     ["prime"],                          # claude (도메인 지식 주입)
+    "reco":      ["recommend"],                      # claude (피처 발명, opus)
+    "judge_llm": ["j_base", "j_reco", "j_fe"],       # claude (실제 판정, sonnet) — 유일한 판정 노드
+    "gate":      ["gate_deploy", "gate_release", "gate_converge"],
+    "log":       ["log_run_start", "log_fe", "log_run_done", "log_converge"],
+    "readme":    ["readme"],                          # claude (README note 한 줄 작성)
+    "stop":      ["user_stop"],
 }
+# claude 호출 = 굵은 보라 테두리(stroke:#7c3aed,stroke-width:4px) / 비claude = 얇은 테두리.
+# 무조건 continue 였던 패스스루 판정(j_branch/j_release/j_chain)은 그래프에서 제거됨.
+_CLAUDE = "stroke:#7c3aed,stroke-width:4px"
 STYLES = {
-    "compute": "fill:#dcfce7,stroke:#16a34a,color:#000000,font-weight:bold",
-    "reco":    "fill:#fce7f3,stroke:#db2777,color:#000000,font-weight:bold",
-    "judge":   "fill:#ede9fe,stroke:#7c3aed,color:#000000,font-weight:bold",
-    "gate":    "fill:#fef3c7,stroke:#d97706,color:#000000,font-weight:bold",
-    "log":     "fill:#dbeafe,stroke:#2563eb,color:#000000,font-weight:bold",
-    "stop":    "fill:#fee2e2,stroke:#dc2626,color:#000000,font-weight:bold",
+    "compute":   "fill:#dcfce7,stroke:#16a34a,stroke-width:1px,color:#000000,font-weight:bold",
+    "prime":     f"fill:#dcfce7,{_CLAUDE},color:#000000,font-weight:bold",   # compute지만 claude
+    "reco":      f"fill:#fce7f3,{_CLAUDE},color:#000000,font-weight:bold",
+    "judge_llm": f"fill:#ede9fe,{_CLAUDE},color:#000000,font-weight:bold",
+    "gate":      "fill:#fef3c7,stroke:#d97706,stroke-width:1px,color:#000000,font-weight:bold",
+    "log":       "fill:#dbeafe,stroke:#2563eb,stroke-width:1px,color:#000000,font-weight:bold",
+    "readme":    f"fill:#dbeafe,{_CLAUDE},color:#000000,font-weight:bold",    # log지만 claude
+    "stop":      "fill:#fee2e2,stroke:#dc2626,stroke-width:1px,color:#000000,font-weight:bold",
 }
 
 

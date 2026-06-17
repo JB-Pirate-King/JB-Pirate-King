@@ -305,22 +305,32 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `ml/pipeli
   ```` ```json ```` are stripped (`_strip_code_fence`). Toggle per node via `JUDGE_ON` set;
   `--no_judge` disables all. **Judge demotion (cost cut 7→3 LLM calls/branch)**: `JUDGE_ON` is now
   `{"baseline", "reco", "fe"}` — only baseline (weak-scenario diagnosis), reco (candidate
-  dedup/validity), and fe (adoption/regression analysis) run a real `claude -p` judge.
-  `new_branch`/`release`/`chain` are pass-through (return `continue`, no LLM — their success is a
-  deterministic fact); `build` is replaced by a deterministic Python check node `n_check_build`
-  (`commit_files > 0` → `continue`, else `stop`), since an empty/partial build returns no exception.
+  dedup/validity), and fe (adoption/regression analysis) run a real `claude -p` judge (nodes
+  `j_base`/`j_reco`/`j_fe` — **the only judge nodes left**). Every other stage's success is a
+  deterministic fact, so its judge node is **removed entirely** and routing is wired straight off
+  the preceding compute node via conditional edges: the always-`continue` pass-throughs
+  `j_branch`/`j_release`/`j_chain` → `log_run_start → route_after_branch` (preprocess/fe_baseline/END),
+  `release → log_run_done` (direct), `chain → route_after_chain` (new_branch/END max_runs guard);
+  the deterministic build check `j_build` (was `n_check_build`) → `build → route_after_build`
+  (`commit_files > 0` → gate_release, else user_stop — empty `commit_files` returns no exception so
+  the check is still needed, just not as an LLM or a node). Net: judge LLM calls 7→3, judge nodes 7→3.
 - **judge retry budget** (`MAX_JUDGE_RETRY = 2`): `claude_judge` tracks per-stage retry counts in
   `state.retry_count` and downgrades a `retry` verdict to `continue` once a stage exceeds the limit,
   preventing flap loops that were previously bounded only by `recursion_limit`.
-- **per-branch claude session**: `n_new_branch` issues a uuid; knowledge priming creates the
-  session (`--session-id`), then judge/recommend/`claude_analyze` all `--resume` it — one
+- **per-branch claude session**: `n_new_branch` issues a uuid; the `prime` node creates the
+  session (`--session-id`), then judge/recommend/`readme`/`claude_analyze` all `--resume` it — one
   accumulated conversation per branch, isolated across branches. Models per call type:
-  `--claude_model` (default `sonnet`) for judge verdicts + knowledge summary,
+  `--claude_model` (default `sonnet`) for judge verdicts + knowledge summary + readme note,
   `--claude_model_heavy` (default `opus`) for feature invention + FE deep analysis
   (cross-model resume keeps context).
-- **knowledge priming** (`--knowledge`, default on): team-vault ML/security docs (4 files,
-  ~26K chars) seeded as the session's first turn; claude returns a Korean summary (attack types,
-  detection approach, feature ideas) shown in Slack. `--no-knowledge` to disable.
+- **knowledge priming = dedicated `prime` node** (`--knowledge`, default on): split out of
+  `n_new_branch` into its own node `n_prime` (`new_branch → prime → log_run_start`). It seeds the
+  branch session's first turn with team-vault ML/security docs (4 files, ~26K chars) via
+  `_prime_session`; claude returns a Korean summary (attack types, detection approach, feature
+  ideas) shown in Slack. `--no-knowledge` to disable. **Graph coloring** (`render_graph.py`): the
+  six claude-calling nodes (`prime`, `recommend`, `j_base`, `j_reco`, `j_fe`, `readme`) get a thick
+  purple border so cost points are scannable; non-claude nodes get a thin border. The only judge
+  nodes are the three purple-bordered LLM judges — `j_build` is gone (folded into `route_after_build`).
 - **adopted-feature persistence**: `dynamic_candidates.py` is overwritten every recommend round,
   so `n_chain` merges adopted `{name, desc, lambda_src}` into tracked
   `ml/config/adopted_features.py` (committed with fe_state); `feature_engineer` exec-loads it —

@@ -86,17 +86,26 @@
 
 ![LangGraph 파이프라인 구조](pipeline_langgraph.png)
 
-| 색 | 그룹 | 노드 | 역할 |
-|---|---|---|---|
-| 🟢 초록 | compute | new_branch · preprocess · fe_baseline · reco_again · fe_train · build · release · chain · converge | 실제 일하는 노드 — 브랜치/전처리/진단/FE/빌드/릴리즈/체인 |
-| 🩷 분홍 | reco | recommend | claude 피처 발명 (opus) — 약세 겨냥 새 lambda |
-| 🟣 보라 | judge | j_branch ~ j_chain (7) | 이 중 **실제 claude 판정은 j_base/j_reco/j_fe 3개**(sonnet) — continue/retry/stop 라우팅. j_branch/j_release/j_chain 은 pass-through(continue), j_build 는 결정론적 체크(`n_check_build`) |
-| 🟡 노랑 | gate | gate_deploy · gate_release · gate_converge | 사람 승인 (`interrupt()`/auto_approve) — 비가역 관문 |
-| 🔵 파랑 | log | log_run_start · log_fe · log_run_done · log_converge · readme | 기록 — Sheets + 루트 README 결과표 |
-| 🔴 빨강 | stop | user_stop | 중단 종착 — stop verdict/게이트 거부 수렴점 |
+**테두리 = claude 사용 여부** (한눈에 비용 지점 파악): **굵은 보라 테두리 = claude 호출 노드**
+(`prime` · `recommend` · `j_base` · `j_reco` · `j_fe` · `readme`), 얇은 테두리 = claude 미사용. 채움색은 역할.
+무조건 continue 였던 패스스루 판정(`j_branch`/`j_release`/`j_chain`)과 결정론적 체크(`j_build`)는
+노드 자체를 **제거** — 라우팅 함수가 직전 노드의 조건부 엣지에서 직접 분기한다. **판정 노드는
+claude 판정 3개(`j_base`/`j_reco`/`j_fe`)만 남는다.**
 
-> 읽는 법: **초록이 일하고 → 보라가 심사하고 → 노랑이 사람 허락 받고 → 파랑이 적는다.**
-> 분홍이 아이디어를 내고, 틀어지면 빨강으로. 매핑은 `ml/scripts/render_graph.py` 의 GROUPS/STYLES.
+| 색 | 그룹 | 노드 | claude | 역할 |
+|---|---|---|---|---|
+| 🟢 초록 | compute | new_branch · preprocess · fe_baseline · reco_again · fe_train · build · release · chain · converge | ✗ | 실제 일하는 노드 — 브랜치/전처리/진단/FE/빌드/릴리즈/체인 |
+| 🟢 초록+보라테두리 | prime | prime | ✔ | 브랜치 세션에 도메인 지식(team-vault) 1회 주입 (`--knowledge`). new_branch 에서 분리된 노드 |
+| 🩷 분홍+보라테두리 | reco | recommend | ✔ | claude 피처 발명 (opus) — 약세 겨냥 새 lambda |
+| 🟣 보라(굵은테두리) | judge_llm | j_base · j_reco · j_fe | ✔ | **유일한 판정 노드** — 실제 claude 판정 (sonnet), continue/retry/stop 라우팅 |
+| 🟡 노랑 | gate | gate_deploy · gate_release · gate_converge | ✗ | 사람 승인 (`interrupt()`/auto_approve) — 비가역 관문 |
+| 🔵 파랑 | log | log_run_start · log_fe · log_run_done · log_converge | ✗ | 기록 — Sheets |
+| 🔵 파랑+보라테두리 | readme | readme | ✔ | 루트 README 결과표 행 추가 — Note 한 줄을 브랜치 세션 claude 가 작성 |
+| 🔴 빨강 | stop | user_stop | ✗ | 중단 종착 — stop verdict/게이트 거부 수렴점 |
+
+> 읽는 법: **굵은 보라 테두리 6개가 claude(비용) 지점** — prime 시드 → recommend 발명 → j_base/reco/fe 판정 → readme note.
+> 채움색: 초록이 일하고 → 보라가 심사하고 → 노랑이 사람 허락 받고 → 파랑이 적는다. 분홍이 아이디어를 내고,
+> 회색 체크는 LLM 없이 통과, 틀어지면 빨강으로. 매핑은 `ml/scripts/render_graph.py` 의 GROUPS/STYLES.
 
 > 재생성 (노드 성격별 색상 — 초록 compute · 분홍 recommend · 보라 judge · 노랑 gate · 파랑 log · 빨강 stop):
 > ```bash
@@ -113,14 +122,13 @@ flowchart TD
     START([START]) --> new_branch
 
     subgraph BRANCH_INIT[브랜치 시작]
-        new_branch[new_branch<br/>브랜치 생성·세션발급] --> log_run_start[log_run_start<br/>Sheets]
-        log_run_start --> j_branch{{j_branch 판정}}
+        new_branch[new_branch<br/>브랜치 생성·세션발급] --> prime[prime<br/>도메인 지식 주입·claude]
+        prime --> log_run_start[log_run_start<br/>Sheets]
     end
 
-    j_branch -.->|preprocess| preprocess[preprocess<br/>raw→csv·첫브랜치만]
-    j_branch -.->|fe_baseline| fe_baseline
-    j_branch -.->|stop| user_stop
-    j_branch -.->|max_runs 초과| END1([END])
+    log_run_start -.->|preprocess·첫브랜치| preprocess[preprocess<br/>raw→csv]
+    log_run_start -.->|fe_baseline| fe_baseline
+    log_run_start -.->|max_runs 초과| END1([END])
     preprocess -.->|continue| fe_baseline
     preprocess -.->|terminate| END1
 
@@ -149,27 +157,19 @@ flowchart TD
 
     subgraph DEPLOY[배포 · 릴리즈]
         gate_deploy[/gate_deploy<br/>배포 승인/] -.->|approve| build[build<br/>C++ 패치·모델 복사]
-        build --> j_build{{j_build 판정}}
-        j_build -.->|continue| gate_release[/gate_release<br/>커밋·릴리즈 승인/]
+        build -.->|commit_files>0| gate_release[/gate_release<br/>커밋·릴리즈 승인/]
         gate_release -.->|approve| release[release<br/>git commit·gh release]
-        release --> j_release{{j_release 판정}}
-        j_release -.->|continue| log_run_done[log_run_done<br/>Sheets]
+        release --> log_run_done[log_run_done<br/>Sheets]
     end
     gate_deploy -.->|retry| fe_baseline
     gate_deploy -.->|stop| user_stop
-    j_build -.->|retry| build
-    j_build -.->|stop| user_stop
+    build -.->|커밋 0개| user_stop
     gate_release -.->|stop| user_stop
-    j_release -.->|retry| release
-    j_release -.->|stop| user_stop
 
-    log_run_done --> readme[readme<br/>루트 README 결과표 갱신]
+    log_run_done --> readme[readme<br/>루트 README 결과표 갱신·claude]
     readme --> chain[chain<br/>fe_state 저장·커밋]
-    chain --> j_chain{{j_chain 판정}}
-    j_chain -.->|continue·상한미달 사이클| new_branch
-    j_chain -.->|상한 도달| END4([END])
-    j_chain -.->|retry| chain
-    j_chain -.->|stop| user_stop
+    chain -.->|상한미달 사이클| new_branch
+    chain -.->|상한 도달| END4([END])
 
     gate_converge[/gate_converge<br/>수렴 종료 승인/] -.->|approve| converge[converge]
     gate_converge -.->|stop| user_stop
@@ -193,6 +193,7 @@ config:
 graph TD;
 	__start__([__start__]):::first
 	new_branch(new_branch)
+	prime(prime)
 	preprocess(preprocess)
 	fe_baseline(fe_baseline)
 	recommend(recommend)
@@ -211,17 +212,15 @@ graph TD;
 	log_fe(log_fe)
 	log_run_done(log_run_done)
 	log_converge(log_converge)
-	j_branch(j_branch)
 	j_base(j_base)
 	j_reco(j_reco)
 	j_fe(j_fe)
-	j_build(j_build)
-	j_release(j_release)
-	j_chain(j_chain)
 	__end__([__end__]):::last
 	__start__ --> new_branch;
-	build --> j_build;
-	chain --> j_chain;
+	build -.-> gate_release;
+	build -.-> user_stop;
+	chain -.  END  .-> __end__;
+	chain -.-> new_branch;
 	converge --> log_converge;
 	fe_baseline --> j_base;
 	fe_train --> log_fe;
@@ -235,17 +234,6 @@ graph TD;
 	j_base -.-> fe_baseline;
 	j_base -.-> recommend;
 	j_base -.-> user_stop;
-	j_branch -.  END  .-> __end__;
-	j_branch -.-> fe_baseline;
-	j_branch -.-> preprocess;
-	j_branch -.-> user_stop;
-	j_build -.-> build;
-	j_build -.-> gate_release;
-	j_build -.-> user_stop;
-	j_chain -.  END  .-> __end__;
-	j_chain -.-> chain;
-	j_chain -.-> new_branch;
-	j_chain -.-> user_stop;
 	j_fe -.-> fe_baseline;
 	j_fe -.-> gate_converge;
 	j_fe -.-> gate_deploy;
@@ -254,19 +242,19 @@ graph TD;
 	j_reco -.-> fe_train;
 	j_reco -.-> recommend;
 	j_reco -.-> user_stop;
-	j_release -.-> log_run_done;
-	j_release -.-> release;
-	j_release -.-> user_stop;
 	log_fe --> j_fe;
 	log_run_done --> readme;
-	log_run_start --> j_branch;
-	new_branch --> log_run_start;
+	log_run_start -.  END  .-> __end__;
+	log_run_start -.-> fe_baseline;
+	log_run_start -.-> preprocess;
+	new_branch --> prime;
 	preprocess -.  END  .-> __end__;
 	preprocess -.-> fe_baseline;
+	prime --> log_run_start;
 	readme --> chain;
 	reco_again --> recommend;
 	recommend --> j_reco;
-	release --> j_release;
+	release --> log_run_done;
 	log_converge --> __end__;
 	user_stop --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
@@ -288,6 +276,7 @@ graph TD;
 | 노드 | 함수 (코드 위치) | 하는 일 | 주요 state 출력 |
 |---|---|---|---|
 | `new_branch` | `n_new_branch` — orchestrator.py:236 | 다음 run 번호 계산(`get_next_run_num`) → 브랜치 생성(직전 브랜치 위에, 없으면 develop) → **claude 세션 uuid 발급** → 시작 로그 | `run_num`, `branch`, `iters` |
+| `prime` | `n_prime` (→`_prime_session`) | **claude 노드** — 브랜치 세션에 team-vault 도메인 지식 1회 시드(`--knowledge`). 이후 판정/추천/분석이 `--resume` 로 이 지식을 안고 동작. new_branch 에서 분리 | — |
 | `preprocess` | `n_preprocess` — orchestrator.py:252<br/>→ `stage_preprocess` pipeline_steps.py:301 | raw AIS → 파생피처 CSV (`core/preprocess.py`). **첫 브랜치만**, `--skip_preprocess` 면 생략 | `first_iter`, (`terminate`) |
 | `fe_baseline` | `n_fe_baseline` — orchestrator.py:261 | `feature_engineer --diagnose_only` → 현 피처셋 베이스 탐지율 + **약세 시나리오** 도출 | `baseline{det,weak,out}` |
 | `recommend` | `n_recommend` — orchestrator.py:301<br/>(`_reco_prompt`:286, `_validate_recos`:318, `_write_dynamic_candidates`:339) | 약세 진단을 claude 에 전달 → **새 lambda 피처 N개 발명**(`--invent`) → 더미시퀀스 exec 검증·dedup → `ml/dynamic_candidates.py` 기록 | `candidates`, `tried_feats` |
@@ -316,18 +305,22 @@ graph TD;
 
 `log_run_start` / `log_fe` / `log_run_done` / `log_converge` — `log_sheet(kind)` 팩토리(orchestrator.py:185) 1개로 생성.
 Sheets 쓰기는 **데몬 스레드**(락으로 직렬화)로 던지고 노드는 즉시 반환 — gspread 쓰기를 그래프 핫패스에서 뺐다.
+`log_run_start` 는 Sheets 후 곧장 `route_after_branch` 로 분기한다(브랜치 시작 판정 노드 제거됨).
 
 ### 판정 노드 (claude 판정)
 
-`j_branch · j_base · j_reco · j_fe · j_build · j_release · j_chain` — 각 compute 노드 뒤에 붙음.
+`j_base · j_reco · j_fe` — **유일한 판정 노드**, 각 compute 노드 뒤에 붙음.
 `claude_judge(stage, ctx_fn)` 팩토리(orchestrator.py:150)로 생성, `build_graph`(orchestrator.py:469) 안에서 `add_node`.
 claude 호출은 `_branch_claude`(orchestrator.py:123) → `_claude_json`(orchestrator.py:92).
 
-**실제 claude 판정은 `JUDGE_ON = {"baseline","reco","fe"}` 3개만** — 즉 `j_base`/`j_reco`/`j_fe`
-만 LLM 을 호출한다. `new_branch`/`release`/`chain`(`j_branch`/`j_release`/`j_chain`)은 그 단계의
-성공이 결정론적 사실이라 **LLM 없이 `{"decision":"continue"}` 만 반환**(pass-through). `build` 판정
-노드(`j_build`)는 claude 대신 결정론적 파이썬 체크 `n_check_build` — `commit_files > 0` 이면
-continue, 아니면 stop. 결과적으로 브랜치당 claude 판정 호출 7 → 3 으로 감소. `--no_judge` 로 전체 off.
+**실제 claude 판정은 `JUDGE_ON = {"baseline","reco","fe"}` 3개뿐** — `j_base`/`j_reco`/`j_fe` 만 LLM 호출.
+나머지 단계는 성공이 결정론적 사실 → **판정 노드를 두지 않고** 직전 노드의 조건부 엣지에서 라우팅 함수로 직결:
+- 무조건 continue 였던 패스스루 `j_branch`/`j_release`/`j_chain`: `log_run_start → route_after_branch`
+  (preprocess/fe_baseline/END), `release → log_run_done`(직결), `chain → route_after_chain`(new_branch/END).
+- 결정론적 체크였던 `j_build`: `build → route_after_build` — `commit_files > 0` 이면 gate_release, 아니면 user_stop
+  (빈 commit_files 가 예외 없이 통과할 수 있어 명시 검증은 필요하지만 LLM·노드는 불필요).
+
+결과적으로 브랜치당 claude 판정 호출 7 → 3, 판정 노드 7 → 3 으로 감소. `--no_judge` 로 전체 off.
 
 동작: 해당 노드 결과를 claude 에 주고 `{assessment, verdict, reason, suggestion}` JSON 받음 →
 `_route_judge`: **stop→user_stop / retry→직전 노드 재실행 / 그외→다음 노드**.
@@ -353,12 +346,13 @@ LLM 판정을 쓰지 않으므로 STAGE_FOCUS 대상이 아니다. claude 응답
 
 | 함수 (코드 위치) | 위치 | 분기 로직 |
 |---|---|---|
-| `route_after_branch_j` orchestrator.py:542 (→`route_after_branch`:418) | j_branch 뒤 | stop이면 user_stop, 아니면 max_runs 체크 → preprocess/fe_baseline/END |
+| `route_after_branch` orchestrator.py:418 | **log_run_start 뒤**(판정 노드 없음) | max_runs 체크 → 첫 브랜치면 preprocess / 아니면 fe_baseline / 초과면 END |
 | `route_after_preprocess` orchestrator.py:425 | preprocess 뒤 | terminate면 END, 아니면 fe_baseline |
-| `_route_judge(next, retry_to)` | 대부분 판정 | stop→user_stop / **retry→직전 노드 재실행** / else→next |
+| `_route_judge(next, retry_to)` | j_base/j_reco 판정 | stop→user_stop / **retry→직전 노드 재실행** / else→next |
+| `route_after_build` orchestrator.py:417 | **build 뒤**(판정 노드 없음) | commit_files>0 → gate_release / 아니면(부분 실패) user_stop |
 | `route_after_fe` orchestrator.py:429 | j_fe 뒤 | verdict + 채택여부 결합 (위 설명). 최근 2라운드 best 목적gain 모두 ≤0 이면 조기 수렴(→gate_converge); 채택 없음 stop 도 user_stop 아닌 gate_converge 로 |
 | `route_gate_deploy` / `route_gate_release` / `route_gate_converge` | 각 게이트 뒤 | approve→진행 / 그외→user_stop(deploy는 retry→fe_baseline) |
-| `route_after_chain` | j_chain 뒤 | stop/retry 우선 → `iters >= max_runs` 면 **빈 브랜치 안 만들고 END** → 아니면 new_branch (사이클) |
+| `route_after_chain` | **chain 뒤**(판정 노드 없음) | `iters >= max_runs` 면 **빈 브랜치 안 만들고 END** → 아니면 new_branch (사이클) |
 | `build_graph` | — | 전체 노드·엣지 배선 (그래프 정의) |
 
 ---
@@ -385,7 +379,7 @@ LLM 판정을 쓰지 않으므로 STAGE_FOCUS 대상이 아니다. claude 응답
 
 ## 6. 사이클 & 종료
 
-- **사이클**: `release → log_run_done → chain → j_chain → new_branch` (다음 브랜치 시작).
+- **사이클**: `release → log_run_done → readme → chain → new_branch` (다음 브랜치 시작; chain 뒤 max_runs 가드).
   `recursion_limit = max(80, max_runs × 25)`, `--max_runs`(기본 50)로 무한루프 방지.
 - **수렴 종료 (횟수 기준)**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`
   으로 다른 각도 재추천 — **브랜치당 `--invent_rounds`(기본 3) 라운드 소진 후에야**
@@ -417,8 +411,8 @@ LLM 판정을 쓰지 않으므로 STAGE_FOCUS 대상이 아니다. claude 응답
 
 노드별 모델 배치 (기본값). 원칙: **판정·요약·한줄노트 = sonnet** (잦고 가벼움) /
 **발명·심층분석 = opus** (추론 가치). 전부 같은 브랜치 세션을 모델만 바꿔 resume.
-(`j_branch`/`j_build`/`j_release`/`j_chain` 은 더 이상 claude 를 호출하지 않는다 — pass-through
-또는 결정론적 체크. 위 "판정 노드" 절 참조.)
+(패스스루 판정 `j_branch`/`j_release`/`j_chain` 과 결정론적 체크 `j_build` 는 노드째 제거됐고
+claude 를 호출하지 않는다 — 위 "판정 노드" 절 참조.)
 
 | claude 호출 노드 | 하는 일 | 모델 | 플래그 |
 |---|---|---|---|

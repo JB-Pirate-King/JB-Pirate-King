@@ -46,11 +46,12 @@ import ml.integrations.slack_bot as _sb
 import ml.integrations.sheets as _sh
 import ml.integrations.git_manager as git
 
-# 판정(judge)을 LLM 으로 돌릴 노드 — **분석형만**.
-#   new_branch/release/chain 은 자명한 사실(브랜치/커밋/저장 성공)이라 LLM 무가치 → 패스스루
-#   (claude_judge 가 JUDGE_ON 밖 stage 는 LLM 없이 continue 즉답).
-#   build 는 빈 commit_files 가 예외 없이 통과할 수 있어 결정적 체크 노드(n_check_build)로 대체.
-#   남기는 건 진짜 추론이 필요한 baseline(약세진단)·reco(중복/유효성)·fe(채택/회귀 분석)뿐.
+# 판정(judge)을 LLM 으로 돌릴 노드 — **분석형만**. 남기는 건 진짜 추론이 필요한
+#   baseline(약세진단)·reco(중복/유효성)·fe(채택/회귀 분석)뿐 → 판정 노드 j_base/j_reco/j_fe.
+#   new_branch/release/chain 은 자명한 사실(브랜치/커밋/저장 성공)이라 LLM 도 노드도 무가치 →
+#   판정 노드 제거, 직전 노드에서 조건부 엣지로 직결.
+#   build 는 빈 commit_files 가 예외 없이 통과할 수 있어 결정적 검증이 필요하지만 LLM 은 불필요 →
+#   라우팅 함수 route_after_build 로 직결(commit_files>0 → gate_release, else user_stop).
 JUDGE_ON = {"baseline", "reco", "fe"}
 
 # judge verdict=retry 의 단계별 재시도 상한 — 초과 시 continue 로 강등(플랩 방지).
@@ -414,13 +415,14 @@ def _route_judge(continue_to: str, retry_to: str):
     return route
 
 
-def n_check_build(state: PipelineState) -> dict:
-    """build 산출 결정적 검증 — claude judge 대체. 커밋 파일 없으면(부분 실패) stop.
+def route_after_build(state: PipelineState) -> str:
+    """build 산출 결정적 검증 — claude judge 도 노드도 불필요, 라우팅 함수로 직결.
+    커밋 파일 있으면 릴리즈 게이트, 없으면(부분 실패) user_stop.
     (_fe_build_and_release 는 빈 commit_files 를 예외 없이 반환할 수 있어 명시 체크가 필요.)"""
-    ok = len(state.get("commit_files", [])) > 0
-    if not ok:
-        RT.bot.log("⚠️ [build] 커밋 산출 파일 0개 — 빌드 부분 실패로 간주 → stop", "warning")
-    return {"decision": "continue" if ok else "stop"}
+    if len(state.get("commit_files", [])) > 0:
+        return "gate_release"
+    RT.bot.log("⚠️ [build] 커밋 산출 파일 0개 — 빌드 부분 실패로 간주 → stop", "warning")
+    return "user_stop"
 
 
 # ─────────────────────────────────────────────
@@ -506,7 +508,7 @@ def n_new_branch(state: PipelineState) -> dict:
     _switch_log(Path("ml/logs") / f"{branch}_{time.strftime('%Y%m%d_%H%M%S')}.log")
     # 로그 파일에 브랜치 구분선 + 풀 세션 uuid (stdout tee 로 기록됨)
     print(f"\n{'='*70}\n===== {branch} 시작 — claude session {RT.claude_sid} =====\n{'='*70}")
-    _prime_session(RT.knowledge)        # 도메인 지식 시드 (--knowledge, team-vault)
+    # 도메인 지식 시드는 별도 노드(n_prime)로 분리 — new_branch → prime → log_run_start.
     RT.bot.log_run_start(branch, {
         "모델": RT.args.model, "epochs": RT.args.epochs, "max_mmsi": RT.args.max_mmsi,
         "데이터": RT.args.data_file, "base_dir": RT.args.base_dir,
@@ -519,6 +521,14 @@ def n_new_branch(state: PipelineState) -> dict:
     return {"run_num": run_num, "branch": branch,
             "iters": state.get("iters", 0) + 1, "reco_round": 1,
             "obj_hist": [], "retry_count": {}}
+
+
+def n_prime(state: PipelineState) -> dict:
+    """브랜치 claude 세션에 도메인 지식(team-vault) 1회 시드 — new_branch 직후 별도 노드.
+    이후 판정/추천/분석이 --resume 로 이 지식을 안고 동작한다. --no_knowledge 면 무동작.
+    상태 변경 없음(세션 시드는 RT 부수효과) → {} 반환."""
+    _prime_session(RT.knowledge)
+    return {}
 
 
 def n_preprocess(state: PipelineState) -> dict:
@@ -829,13 +839,8 @@ def route_after_branch(state: PipelineState) -> str:
 
 def route_after_chain(state: PipelineState) -> str:
     """체인 후 라우팅 — 다음 브랜치를 **생성하기 전에** max_runs 가드.
-    판정 verdict 우선(stop/retry), 그다음 상한 도달 시 빈 브랜치를 만들지 않고 종료.
-    (전엔 new_branch 가 빈 브랜치를 만든 뒤 route_after_branch 가 END 처리해 낭비 브랜치가 생겼다.)"""
-    d = state.get("decision", "continue")
-    if d == "stop":
-        return "user_stop"
-    if d == "retry":
-        return "chain"   # 직전 노드 재실행 (fe_state 저장은 멱등)
+    상한 도달 시 빈 브랜치를 만들지 않고 종료, 아니면 다음 브랜치 사이클.
+    (j_chain 판정 노드는 무조건 continue 라 제거 — 여기서 곧장 분기한다.)"""
     if state.get("iters", 0) >= RT.args.max_runs:
         RT.bot.log(f"⚠️ 안전 상한 {RT.args.max_runs} 도달 — 체이닝 종료", "warning")
         return "END"
@@ -919,7 +924,7 @@ def build_graph(checkpointer=None):
     g = StateGraph(PipelineState)
 
     # 코어
-    for n, fn in [("new_branch", n_new_branch), ("preprocess", n_preprocess),
+    for n, fn in [("new_branch", n_new_branch), ("prime", n_prime), ("preprocess", n_preprocess),
                   ("fe_baseline", n_fe_baseline), ("recommend", n_recommend),
                   ("reco_again", n_reco_again), ("fe_train", n_fe_train),
                   ("build", n_build), ("release", n_release), ("readme", n_readme),
@@ -932,21 +937,19 @@ def build_graph(checkpointer=None):
         g.add_node(n, _logged_node(n, fn))
 
     # 판정 (코어 뒤)
-    g.add_node("j_branch", _logged_node("j_branch", claude_judge("new_branch", lambda s: (s.get("branch", ""), {}))))
+    # 실제 claude 판정은 baseline/reco/fe 3개뿐(JUDGE_ON). 무조건 continue 였던 패스스루
+    # 판정(j_branch/j_release/j_chain)은 노드를 두지 않고 직결 — 라우팅은 조건부 엣지로 직접 건다.
     g.add_node("j_base", _logged_node("j_base", claude_judge("baseline", lambda s: (s["baseline"]["out"], {"det": s["baseline"]["det"]}))))
     g.add_node("j_reco", _logged_node("j_reco", claude_judge("reco", lambda s: (", ".join(s.get("candidates", [])), {"n": len(s.get("candidates", []))}))))
     g.add_node("j_fe", _logged_node("j_fe", claude_judge("fe", lambda s: ("\n".join(s["r"].get("summary", [])), s["r"].get("fe_stats", {})))))
-    g.add_node("j_build", _logged_node("j_build", n_check_build))   # 결정적 체크(LLM 아님)
-    g.add_node("j_release", _logged_node("j_release", claude_judge("release", lambda s: (s["branch"], {"det": s["r"].get("det_str")}))))
-    g.add_node("j_chain", _logged_node("j_chain", claude_judge("chain", lambda s: (", ".join(s.get("current_extra", [])), {}))))
 
     # 배선
     g.add_edge(START, "new_branch")
-    g.add_edge("new_branch", "log_run_start")
-    g.add_edge("log_run_start", "j_branch")
-    g.add_conditional_edges("j_branch", route_after_branch_j,
-                            {"preprocess": "preprocess", "fe_baseline": "fe_baseline",
-                             "user_stop": "user_stop", "END": END})
+    g.add_edge("new_branch", "prime")
+    g.add_edge("prime", "log_run_start")
+    # log_run_start 후 곧장 분기(첫 브랜치만 preprocess, max_runs 가드) — 판정 노드 없음.
+    g.add_conditional_edges("log_run_start", route_after_branch,
+                            {"preprocess": "preprocess", "fe_baseline": "fe_baseline", "END": END})
     g.add_conditional_edges("preprocess", route_after_preprocess,
                             {"fe_baseline": "fe_baseline", "END": END})
 
@@ -967,20 +970,17 @@ def build_graph(checkpointer=None):
 
     g.add_conditional_edges("gate_deploy", route_gate_deploy,
                             {"build": "build", "fe_baseline": "fe_baseline", "user_stop": "user_stop"})
-    g.add_edge("build", "j_build")
-    g.add_conditional_edges("j_build", _route_judge("gate_release", retry_to="build"),
-                            {"gate_release": "gate_release", "build": "build", "user_stop": "user_stop"})
+    # build 후 곧장 결정적 검증 분기 (commit_files>0) — 판정 노드 없음.
+    g.add_conditional_edges("build", route_after_build,
+                            {"gate_release": "gate_release", "user_stop": "user_stop"})
     g.add_conditional_edges("gate_release", route_gate_release,
                             {"release": "release", "user_stop": "user_stop"})
-    g.add_edge("release", "j_release")
-    g.add_conditional_edges("j_release", _route_judge("log_run_done", retry_to="release"),
-                            {"log_run_done": "log_run_done", "release": "release", "user_stop": "user_stop"})
+    g.add_edge("release", "log_run_done")   # 판정 없이 직결 (j_release 제거)
     g.add_edge("log_run_done", "readme")
     g.add_edge("readme", "chain")
-    g.add_edge("chain", "j_chain")
-    g.add_conditional_edges("j_chain", route_after_chain,
-                            {"new_branch": "new_branch", "chain": "chain",
-                             "user_stop": "user_stop", "END": END})
+    # 체인 후 곧장 분기(max_runs 가드 → END, 아니면 다음 브랜치) — 판정 노드 없음.
+    g.add_conditional_edges("chain", route_after_chain,
+                            {"new_branch": "new_branch", "END": END})
 
     g.add_conditional_edges("gate_converge", route_gate_converge,
                             {"converge": "converge", "user_stop": "user_stop"})
@@ -989,13 +989,6 @@ def build_graph(checkpointer=None):
     g.add_edge("user_stop", END)
 
     return g.compile(checkpointer=checkpointer or MemorySaver())
-
-
-def route_after_branch_j(state: PipelineState) -> str:
-    """new_branch 판정 verdict 먼저(stop), 그다음 max_runs/전처리 분기."""
-    if state.get("decision") == "stop":
-        return "user_stop"
-    return route_after_branch(state)
 
 
 # ─────────────────────────────────────────────
