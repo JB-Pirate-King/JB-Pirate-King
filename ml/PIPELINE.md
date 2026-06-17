@@ -10,8 +10,9 @@
 - **1 run = 1 git 브랜치 = 피처 1개 채택 시도** (`dcdetect_001`, `_002`, …).
 - 채택에 성공하면 **체인**(그래프 사이클)으로 다음 브랜치를 시작하고, 더 이상
   목적점수 이득이 없으면 **수렴**하여 종료한다.
-- 각 compute 노드 뒤에는 **판정(judge)** 노드가 붙어 claude 가 `continue / retry / stop`
-  으로 라우팅한다 (LLM-as-judge).
+- 각 compute 노드 뒤에는 **판정(judge)** 노드가 붙는다. 단 **실제 claude 판정은
+  baseline/reco/fe 3개만**(`JUDGE_ON`) `continue / retry / stop` 으로 라우팅(LLM-as-judge);
+  나머지는 LLM 없이 pass-through(`continue`)이거나 결정론적 파이썬 체크다.
 - 비가역 단계(배포·커밋·수렴)에는 **게이트**(`interrupt()` 또는 `--auto_approve`)가 있다.
 - claude 호출(추천·판정·분석)은 **브랜치당 세션 1개**를 공유. 모델은 역할별 분리 —
   판정/지식요약 `--claude_model`(기본 sonnet), 피처발명/상세분석 `--claude_model_heavy`(기본 opus).
@@ -89,7 +90,7 @@
 |---|---|---|---|
 | 🟢 초록 | compute | new_branch · preprocess · fe_baseline · reco_again · fe_train · build · release · chain · converge | 실제 일하는 노드 — 브랜치/전처리/진단/FE/빌드/릴리즈/체인 |
 | 🩷 분홍 | reco | recommend | claude 피처 발명 (opus) — 약세 겨냥 새 lambda |
-| 🟣 보라 | judge | j_branch ~ j_chain (7) | claude 판정 (sonnet) — continue/retry/stop 라우팅 |
+| 🟣 보라 | judge | j_branch ~ j_chain (7) | 이 중 **실제 claude 판정은 j_base/j_reco/j_fe 3개**(sonnet) — continue/retry/stop 라우팅. j_branch/j_release/j_chain 은 pass-through(continue), j_build 는 결정론적 체크(`n_check_build`) |
 | 🟡 노랑 | gate | gate_deploy · gate_release · gate_converge | 사람 승인 (`interrupt()`/auto_approve) — 비가역 관문 |
 | 🔵 파랑 | log | log_run_start · log_fe · log_run_done · log_converge · readme | 기록 — Sheets + 루트 README 결과표 |
 | 🔴 빨강 | stop | user_stop | 중단 종착 — stop verdict/게이트 거부 수렴점 |
@@ -314,24 +315,37 @@ graph TD;
 ### 로그 노드 (Google Sheets)
 
 `log_run_start` / `log_fe` / `log_run_done` / `log_converge` — `log_sheet(kind)` 팩토리(orchestrator.py:185) 1개로 생성.
+Sheets 쓰기는 **데몬 스레드**(락으로 직렬화)로 던지고 노드는 즉시 반환 — gspread 쓰기를 그래프 핫패스에서 뺐다.
 
 ### 판정 노드 (claude 판정)
 
 `j_branch · j_base · j_reco · j_fe · j_build · j_release · j_chain` — 각 compute 노드 뒤에 붙음.
 `claude_judge(stage, ctx_fn)` 팩토리(orchestrator.py:150)로 생성, `build_graph`(orchestrator.py:469) 안에서 `add_node`.
 claude 호출은 `_branch_claude`(orchestrator.py:123) → `_claude_json`(orchestrator.py:92).
-`JUDGE_ON` 에 든 stage 만 동작(`--no_judge` 로 전체 off).
+
+**실제 claude 판정은 `JUDGE_ON = {"baseline","reco","fe"}` 3개만** — 즉 `j_base`/`j_reco`/`j_fe`
+만 LLM 을 호출한다. `new_branch`/`release`/`chain`(`j_branch`/`j_release`/`j_chain`)은 그 단계의
+성공이 결정론적 사실이라 **LLM 없이 `{"decision":"continue"}` 만 반환**(pass-through). `build` 판정
+노드(`j_build`)는 claude 대신 결정론적 파이썬 체크 `n_check_build` — `commit_files > 0` 이면
+continue, 아니면 stop. 결과적으로 브랜치당 claude 판정 호출 7 → 3 으로 감소. `--no_judge` 로 전체 off.
 
 동작: 해당 노드 결과를 claude 에 주고 `{assessment, verdict, reason, suggestion}` JSON 받음 →
 `_route_judge`: **stop→user_stop / retry→직전 노드 재실행 / 그외→다음 노드**.
 
+**retry 예산** — `MAX_JUDGE_RETRY = 2`. `claude_judge` 가 stage별 retry 횟수를
+`state.retry_count` 에 누적, 상한 초과 시 `retry` verdict 을 `continue` 로 강등 →
+recursion_limit 으로만 막히던 flap 루프를 차단.
+
 프롬프트(`_judge_prompt`)는 공통 템플릿에 **stage별 판정 포인트**(`STAGE_FOCUS`)를 주입한다 —
-baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 파일·피처수 일치하나" 처럼
-단계 고유 기준으로 평가(일률 판정 방지). claude 응답이 ```json 펜스로 와도 `_strip_code_fence`
-로 벗겨 파싱한다.
+baseline은 "FE 출발점으로 타당한가" 처럼 단계 고유 기준으로 평가(일률 판정 방지). build 는
+LLM 판정을 쓰지 않으므로 STAGE_FOCUS 대상이 아니다. claude 응답이 ```json 펜스로 와도
+`_strip_code_fence` 로 벗겨 파싱한다.
 
 > `j_fe` 만 예외 — `route_after_fe` 가 판정 verdict + **채택여부**를 결합해 분기
 > (채택O→gate_deploy / 채택X→reco_again 또는 gate_converge / 실패→fe_baseline).
+> 또한 최근 2라운드 best 목적gain 이 모두 ≤0 이면 라운드가 남아도 조기 수렴(→gate_converge),
+> **채택 없음 stop verdict 은 hard user_stop 이 아니라 gate_converge** 로 보낸다(정상 수렴 로깅/Sheets).
+> hard user_stop 은 이제 *채택은 됐으나* 판정이 불신(winner's-curse/overfitting)하는 경우다.
 
 ---
 
@@ -342,7 +356,7 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 | `route_after_branch_j` orchestrator.py:542 (→`route_after_branch`:418) | j_branch 뒤 | stop이면 user_stop, 아니면 max_runs 체크 → preprocess/fe_baseline/END |
 | `route_after_preprocess` orchestrator.py:425 | preprocess 뒤 | terminate면 END, 아니면 fe_baseline |
 | `_route_judge(next, retry_to)` | 대부분 판정 | stop→user_stop / **retry→직전 노드 재실행** / else→next |
-| `route_after_fe` orchestrator.py:429 | j_fe 뒤 | verdict + 채택여부 결합 (위 설명) |
+| `route_after_fe` orchestrator.py:429 | j_fe 뒤 | verdict + 채택여부 결합 (위 설명). 최근 2라운드 best 목적gain 모두 ≤0 이면 조기 수렴(→gate_converge); 채택 없음 stop 도 user_stop 아닌 gate_converge 로 |
 | `route_gate_deploy` / `route_gate_release` / `route_gate_converge` | 각 게이트 뒤 | approve→진행 / 그외→user_stop(deploy는 retry→fe_baseline) |
 | `route_after_chain` | j_chain 뒤 | stop/retry 우선 → `iters >= max_runs` 면 **빈 브랜치 안 만들고 END** → 아니면 new_branch (사이클) |
 | `build_graph` | — | 전체 노드·엣지 배선 (그래프 정의) |
@@ -364,6 +378,8 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 | `commit_files`, `build_summary` | 빌드 산출·요약 |
 | `decision`, `judge` | 판정/게이트 결정·노드별 판정 결과 |
 | `adopted_any`, `terminate` | 채택 발생 여부·종료 플래그 |
+| `obj_hist` | 브랜치 내 라운드별 best 목적gain 이력 — 추세 조기수렴 판단(브랜치마다 리셋) |
+| `retry_count` | 단계별 judge retry 횟수 — `MAX_JUDGE_RETRY` 상한(브랜치마다 리셋) |
 
 ---
 
@@ -374,12 +390,17 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 - **수렴 종료 (횟수 기준)**: 어떤 후보도 목적점수 +`min_gain`(기본 3.0) 못 넘으면 `reco_again`
   으로 다른 각도 재추천 — **브랜치당 `--invent_rounds`(기본 3) 라운드 소진 후에야**
   `gate_converge → converge → END`. 단발 미채택 = 즉시 종료가 아님.
+- **수렴 종료 (추세 기준)**: 최근 2라운드 best 목적gain(`obj_hist`)이 모두 ≤0 이면 라운드가
+  남아 있어도 조기 수렴 — `route_after_fe` 가 횟수 규칙과 별개로 `gate_converge` 로 보낸다.
 - **베이스라인 캐시**: `fe_baseline`(diagnose) 결과 JSON 을 `fe_train` 이 `--baseline_cache` 로
   재사용 — 같은 피처셋이면 베이스라인 재학습 생략 (브랜치당 1회 학습). 재추천 라운드 비용은
   후보 N개 학습만.
 - **세션 격리**: 브랜치마다 새 claude 세션(uuid). 브랜치 내 노드는 맥락 공유, 브랜치 간엔 격리.
 - **thread_id**: run 마다 `orchestrator-{시각}` 발급 (stdout/로그에 출력) — LangSmith Threads 뷰에서
-  run 별로 분리되고, SqliteSaver 도입 시 크래시 재개 키로 쓴다. (고정값이면 전 run 이 한 스레드로 합쳐짐)
+  run 별로 분리되고, `--persist`(SqliteSaver) 시 크래시 재개 키로 쓴다. (고정값이면 전 run 이 한 스레드로 합쳐짐)
+- **체크포인터**: 기본 `MemorySaver`(인프로세스). `--persist` 면 `SqliteSaver`
+  (`ml/.pipeline_tmp/checkpoints.db`) — 게이트 승인 대기 중 크래시/재시작해도 재학습 없이 resume.
+  `langgraph-checkpoint-sqlite` 미설치 시 경고 후 `MemorySaver` 폴백.
 - **develop 복구**: `main()` 의 `finally` 에서 항상 `git checkout develop`.
 
 ---
@@ -396,16 +417,14 @@ baseline은 "FE 출발점으로 타당한가", build는 "패치 마커·모델 �
 
 노드별 모델 배치 (기본값). 원칙: **판정·요약·한줄노트 = sonnet** (잦고 가벼움) /
 **발명·심층분석 = opus** (추론 가치). 전부 같은 브랜치 세션을 모델만 바꿔 resume.
+(`j_branch`/`j_build`/`j_release`/`j_chain` 은 더 이상 claude 를 호출하지 않는다 — pass-through
+또는 결정론적 체크. 위 "판정 노드" 절 참조.)
 
 | claude 호출 노드 | 하는 일 | 모델 | 플래그 |
 |---|---|---|---|
-| `j_branch` | 브랜치 생성 점검 verdict | Sonnet 4.6 | `--claude_model` |
-| `j_base` | 베이스라인 진단 verdict | Sonnet 4.6 | 〃 |
+| `j_base` | 베이스라인 진단 verdict | Sonnet 4.6 | `--claude_model` |
 | `j_reco` | 추천 후보 타당성 verdict | Sonnet 4.6 | 〃 |
 | `j_fe` | FE 채택 결과 verdict (라우팅 결합) | Sonnet 4.6 | 〃 |
-| `j_build` | 빌드 산출 점검 verdict | Sonnet 4.6 | 〃 |
-| `j_release` | 릴리즈 점검 verdict | Sonnet 4.6 | 〃 |
-| `j_chain` | 체인 상태 점검 verdict | Sonnet 4.6 | 〃 |
 | 지식주입+요약 (`_prime_session`) | team-vault 시드 + 한국어 요약 | Sonnet 4.6 | 〃 |
 | `readme` | 루트 README Run Results Note 한 줄 | Sonnet 4.6 | 〃 |
 | **`recommend`** | **새 피처 lambda 발명** | **Opus 4.8** | `--claude_model_heavy` |
@@ -432,6 +451,7 @@ feature_engineer 가 시작 시 로드. 없으면 다음 run 의 `--initial_extr
 |---|---|
 | **`ml/logs/`** (gitignored) | stdout/stderr tee + 모든 Slack 메시지 text(`[HH:MM:SS][브랜치]` 접두사). 시작 시 `run_{시각}.log`, **브랜치 진입마다 `{branch}_{시각}.log` 로 전환** — 파일당 한 브랜치. 머리에 브랜치 구분선 + 풀 claude 세션 uuid |
 | **`ml/logs/nodes_{시각}.jsonl`** (gitignored) | 노드 in/out 전체 레코드. 모든 노드를 `_logged_node` 로 래핑 → ① tee 로그에 `┌─[NODE→]`/`└─[NODE←] name [branch] (elapsed)` 압축 한 줄, ② jsonl 에 `{ts,branch,node,elapsed_s,in,out}` 머신 레코드(거대 문자열 컷). `interrupt()` 게이트는 `GraphInterrupt` 전파 → resume 전까지 `[NODE→]` 만 기록 |
+| **`ml/logs/nodeio_{시각}.log`** (gitignored) | ③ 실시간 스트림 — `┌─[NODE→]`/`└─[NODE←]` 한 줄**만** 모음(Slack 서술·jsonl blob 없음). `_node_line()` 이 줄마다 flush → `tail -f` 로 노드 경계 라이브 관찰 |
 | Slack `#ais-pipeline` | 서술 로그 — 시작그리드·지식요약·판정 verdict·후보표·게이트 |
 | Google Sheets | 구조화 지표 5탭 |
 | LangSmith (`.env` 트레이싱) | 노드 span·라우팅·state·latency (관찰 전용) |
@@ -456,6 +476,7 @@ python -m ml.orchestrator --model dcdetect --epochs 5 --max_mmsi 3000 \
 #   --knowledge/--no-knowledge  team-vault 지식 주입 (기본 on)
 #   --max_runs N              브랜치 체인 안전 상한 (기본 50)
 #   --build_plugin            WSL tar.gz 빌드 (기본 off, 정식 빌드는 native Linux)
+#   --persist                 SqliteSaver 체크포인트 (크래시 후 resume, 기본 off; 미설치 시 MemorySaver 폴백)
 ```
 
 > ⚠️ Slack 버튼 승인(`interrupt()` 게이트)은 SocketMode **인바운드**가 필요하다.

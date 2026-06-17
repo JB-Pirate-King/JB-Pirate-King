@@ -294,11 +294,19 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `ml/pipeli
   `ml/dynamic_candidates.py` (gitignored) → `feature_engineer` loads + scans them. Convergence
   (no adoption) re-recommends from a different angle up to `--invent_rounds`. `--invent` defaults
   to **5** and is the ONLY candidate source — `CANDIDATE_FEATURES` is empty (no static pool).
-- **per-node claude judge** (`claude_judge` factory): each compute node is followed by a judge
-  node that runs `claude -p --output-format json` → `{assessment, verdict: continue|retry|stop, ...}`
-  → routing. Per-stage judging criteria injected via `STAGE_FOCUS`; model replies fenced in
+- **per-node claude judge** (`claude_judge` factory): a judge node that runs
+  `claude -p --output-format json` → `{assessment, verdict: continue|retry|stop, ...}` → routing.
+  Per-stage judging criteria injected via `STAGE_FOCUS`; model replies fenced in
   ```` ```json ```` are stripped (`_strip_code_fence`). Toggle per node via `JUDGE_ON` set;
-  `--no_judge` disables all.
+  `--no_judge` disables all. **Judge demotion (cost cut 7→3 LLM calls/branch)**: `JUDGE_ON` is now
+  `{"baseline", "reco", "fe"}` — only baseline (weak-scenario diagnosis), reco (candidate
+  dedup/validity), and fe (adoption/regression analysis) run a real `claude -p` judge.
+  `new_branch`/`release`/`chain` are pass-through (return `continue`, no LLM — their success is a
+  deterministic fact); `build` is replaced by a deterministic Python check node `n_check_build`
+  (`commit_files > 0` → `continue`, else `stop`), since an empty/partial build returns no exception.
+- **judge retry budget** (`MAX_JUDGE_RETRY = 2`): `claude_judge` tracks per-stage retry counts in
+  `state.retry_count` and downgrades a `retry` verdict to `continue` once a stage exceeds the limit,
+  preventing flap loops that were previously bounded only by `recursion_limit`.
 - **per-branch claude session**: `n_new_branch` issues a uuid; knowledge priming creates the
   session (`--session-id`), then judge/recommend/`claude_analyze` all `--resume` it — one
   accumulated conversation per branch, isolated across branches. Models per call type:
@@ -317,23 +325,42 @@ live in `ml/pipeline_steps.py` (shared step library). Design diagram: `ml/pipeli
   `run_{ts}.log`; each branch entry switches to its own `{branch}_{ts}.log`
   headed by a separator with the full claude session uuid.
 - **node in/out logging** (`_logged_node`): every graph node (compute + judge) is
-  wrapped to record its input `state` and output delta. Two sinks: ① compressed
+  wrapped to record its input `state` and output delta. Three sinks: ① compressed
   `┌─[NODE→]`/`└─[NODE←] name [branch] (elapsed)` one-liners into the tee log,
   ② full machine-parsable records into `ml/logs/nodes_{ts}.jsonl` (run-scoped, big
-  strings truncated). `interrupt()` gates propagate `GraphInterrupt` through the
-  wrapper, so only `[NODE→]` is logged until resume re-runs the node.
+  strings truncated), ③ a dedicated real-time stream `ml/logs/nodeio_{ts}.log` carrying
+  ONLY the `┌─[NODE→]`/`└─[NODE←]` one-liners (no Slack narration, not the bulky jsonl),
+  per-line flushed via `_node_line()` so `tail -f` gives a live node-boundary view.
+  `_open_node_log(jsonl, live)` opens both handles; the startup banner prints all three
+  paths. `interrupt()` gates propagate `GraphInterrupt` through the wrapper, so only
+  `[NODE→]` is logged until resume re-runs the node.
 - **release artifact archive**: `stage_release` copies the model files to `ml/deploy/{branch}/`
   and commits them to the run branch (tar.gz copied but git-ignored).
 - **interrupt() gates**: deploy / release / converge are independent `interrupt()` nodes. Because
   gates sit at node boundaries, a crash while awaiting Slack approval resumes **without retraining**.
-- **Sheets**: `log_sheet(kind)` DRY factory (`run_start|fe|run_done|converge`).
+- **Sheets**: `log_sheet(kind)` DRY factory (`run_start|fe|run_done|converge`). Each logging node
+  fires its gspread write on a **daemon thread** (serialized by `_SHEET_LOCK`) and returns `{}`
+  immediately — Sheets API latency is off the graph hot path (was a multi-second block).
+- **early convergence (trend)**: `_fe_train_eval` returns `best_obj_gain` (best candidate objective
+  gain this scan); `n_fe_train` accumulates it into `state.obj_hist`; `route_after_fe` converges
+  early (→ converge gate) when the last two rounds' best objective gain are both ≤ 0, instead of
+  always exhausting `--invent_rounds`.
+- **unified termination**: `route_after_fe` routes a *no-adoption* `stop` verdict to the converge
+  gate (proper convergence logging/Sheets), **not** a hard `user_stop`. A hard `user_stop` now means
+  an *adopted* feature the judge distrusts (winner's-curse/overfitting) — removing the prior
+  j_fe-verdict ↔ converge-gate double-decider.
 - **Chaining = graph cycle**: `release → chain → new_branch`. Convergence → `converge → END`.
   `--max_runs` is a state-counter guard; `recursion_limit = max_runs × 25`.
-- **Checkpointer**: `MemorySaver` (in-process). Swap to `SqliteSaver` for cross-restart resume.
+- **State**: `PipelineState` includes `obj_hist` (per-branch round objective-gain history) and
+  `retry_count` (per-stage judge-retry tally) — both reset per branch in `n_new_branch`.
+- **Checkpointer**: `MemorySaver` (in-process) by default. `--persist` builds a `SqliteSaver`
+  (`ml/.pipeline_tmp/checkpoints.db`) for cross-restart resume (a crash while awaiting an
+  interrupt gate resumes without retraining); falls back to `MemorySaver` with a warning if
+  `langgraph-checkpoint-sqlite` is not installed (`pip install langgraph-checkpoint-sqlite`).
 - **Runner**: `run_pipeline` polls `__interrupt__`, gets the Slack decision via `bot.wait_approval`,
   resumes with `Command(resume=decision)`.
 - **Launch**: `python -m ml.orchestrator` (same flags as before + `--invent`, `--invent_rounds`,
-  `--no_judge`, `--claude_model`, `--claude_model_heavy`, `--knowledge/--no-knowledge`).
+  `--no_judge`, `--claude_model`, `--claude_model_heavy`, `--knowledge/--no-knowledge`, `--persist`).
 - **LangSmith tracing**: `orchestrator.py` auto-loads repo-root `.env` (gitignored) at import —
   set `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT` there and every
   node run/route is traced to smith.langchain.com with no code changes.
@@ -382,6 +409,7 @@ orchestrator.py defaults:
 - `--scan_ratio`: `1.0` (candidate-scan training subsample ratio, e.g. `0.4`. Baseline + all candidates train on the same seeded subsample for fair ranking; the adopted best is retrained on **full** data. ~2–3× faster scan, best pick usually unchanged.)
 - `--n_anom`: unset → equals `max_mmsi` (anomaly sequences per scenario; larger = less sampling noise in detection rates)
 - `--overall_tol`: `1.0` (adoption regression guard — reject a candidate whose objective rose but whose overall FP=1% detection drops > this many pp)
+- `--persist`: off (when set, uses a `SqliteSaver` checkpointer at `ml/.pipeline_tmp/checkpoints.db` for cross-restart resume; falls back to `MemorySaver` with a warning if `langgraph-checkpoint-sqlite` is missing)
 
 ### Objective function (stability)
 
