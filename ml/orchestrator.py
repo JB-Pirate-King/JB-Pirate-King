@@ -319,11 +319,26 @@ def _branch_claude(prompt: str, timeout: int = 120, heavy: bool = False) -> Opti
     return out
 
 
+def _prev_run_log_tail(max_lines: int = 150, max_chars: int = 12000) -> str:
+    """직전 동일모델 런의 nodeio 로그 tail — 이전 채택/수렴/탐지율 맥락.
+    현재 런 로그가 최신이므로 [-2]가 직전 런. 첫 런이면 빈 문자열."""
+    try:
+        logs = sorted(Path("ml/logs").glob(f"nodeio_{RT.args.model}_*.log"))
+        if len(logs) < 2:
+            return ""
+        lines = logs[-2].read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = "\n".join(lines[-max_lines:])
+        return tail[-max_chars:]
+    except Exception:
+        return ""
+
+
 def _prime_session(knowledge: str):
-    """브랜치 세션을 도메인 지식으로 시드 — 첫 호출(--session-id)로 지식을 넣어두면
-    이후 판정/추천이 --resume 로 그 지식을 알고 판정·발명한다.
+    """브랜치 세션을 도메인 지식 + 직전 런 로그로 시드 — 첫 호출(--session-id)로 넣어두면
+    이후 판정/추천이 --resume 로 그 맥락을 알고 판정·발명한다.
     JSON 파싱 불필요(응답 무시)하므로 _claude_json 대신 직접 호출."""
-    if not (knowledge and RT.claude_sid):
+    prev = _prev_run_log_tail()
+    if not ((knowledge or prev) and RT.claude_sid):
         return
     prompt = (
         "You are joining an AIS anomaly-detection ML pipeline as its analyst and feature engineer. "
@@ -333,6 +348,12 @@ def _prime_session(knowledge: str):
         "you will use: main attack types, detection approach, and 1-2 concrete feature ideas.\n\n"
         "=== PROJECT KNOWLEDGE ===\n" + knowledge
     )
+    if prev:
+        prompt += (
+            "\n\n=== 직전 런 로그 (tail · 같은 모델 이전 실험의 노드 IO) ===\n"
+            "이전 런에서 무엇을 채택/기각했고 어느 시나리오가 약했는지 파악해, 같은 실패를 반복하지 말고 "
+            "다른 각도의 피처를 제안하라.\n" + prev
+        )
     cmd = ["claude", "-p", prompt, "--session-id", RT.claude_sid]
     model = getattr(RT.args, "claude_model", None)
     if model:
@@ -1045,12 +1066,13 @@ def main():
     # 시작 시 ml/logs/run_*.log, 브랜치 진입마다 ml/logs/{branch}_*.log 로 전환(_switch_log).
     Path("ml/logs").mkdir(parents=True, exist_ok=True)
     _ts0 = time.strftime("%Y%m%d_%H%M%S")
-    _switch_log(Path("ml/logs") / f"run_{_ts0}.log")
-    _open_node_log(Path("ml/logs") / f"nodes_{_ts0}.jsonl",      # 노드 in/out 전체 레코드(jsonl)
-                   Path("ml/logs") / f"nodeio_{_ts0}.log")        # in/out 한 줄 실시간 스트림
+    _m = args.model                                              # 파일명에 모델명 삽입(식별)
+    _switch_log(Path("ml/logs") / f"run_{_m}_{_ts0}.log")
+    _open_node_log(Path("ml/logs") / f"nodes_{_m}_{_ts0}.jsonl",  # 노드 in/out 전체 레코드(jsonl)
+                   Path("ml/logs") / f"nodeio_{_m}_{_ts0}.log")   # in/out 한 줄 실시간 스트림
     sys.stdout = _Tee(sys.stdout)
     sys.stderr = _Tee(sys.stderr)
-    print(f"[로그] {_LOG['path']}  |  노드IO: ml/logs/nodes_{_ts0}.jsonl  |  실시간: ml/logs/nodeio_{_ts0}.log")
+    print(f"[로그] {_LOG['path']}  |  노드IO: ml/logs/nodes_{_m}_{_ts0}.jsonl  |  실시간: ml/logs/nodeio_{_m}_{_ts0}.log")
 
     steps._AUTO_APPROVE = args.auto_approve
     if args.no_judge:
