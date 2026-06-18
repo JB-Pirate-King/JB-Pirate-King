@@ -13,11 +13,55 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 <!-- RUN_RESULTS:BEGIN -->
 | Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
 |---|---|---|---|---|---|---|---|---|
+| dcdetect_001 | 2026-06-19 | `anchor_motion` | 66.1%→78.0% (+11.8pp) | 91.4% | 93.9% | 0.002540 | 13 | anchor_motion(정박 중 이동 모순 포착) 채택으로 FP=1% 탐지율 66.1%→78.0% (+11.9pp). |
 <!-- RUN_RESULTS:END -->
 
 ### Per-run detail
 
 <!-- RUN_DETAILS:BEGIN -->
+<details>
+<summary><b>dcdetect_001</b> — <code>anchor_motion</code> · FP=1% 66.1%→78.0% · 2026-06-19</summary>
+
+- `anchor_motion` — 정박/계류 상태(status 1,5)인데 이동거리 큼 — 정박이동·status 위장 직접 포착
+- 🤖 anchor_motion(정박 중 이동 모순 포착) 채택으로 FP=1% 탐지율 66.1%→78.0% (+11.9pp).
+
+| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |
+|---|---|---|---|---|
+| FN4-status | 0.0% | 29.3% | 52.2% | ⚠️ weak |
+| D1-LowSlow | 0.0% | 0.0% | 0.0% | ⚠️ weak |
+| 정박이동 | 9.0% | 63.0% | 90.7% | ⚠️ weak |
+| FN3-COG경계 | 36.8% | 78.7% | 90.9% | ⚠️ weak |
+| D4-Mimicry | 41.5% | 96.0% | 99.4% | ⚠️ weak |
+| COG/HDG불일치 | 50.7% | 74.5% | 80.2% |  |
+| 속도이상 | 62.1% | 96.5% | 99.3% |  |
+| E4-Contextual | 65.2% | 97.8% | 100.0% |  |
+| D3-GradDrift | 69.5% | 99.9% | 100.0% |  |
+| FN2-속도단계 | 73.0% | 100.0% | 100.0% |  |
+| F7-LSTMBeat | 74.9% | 100.0% | 100.0% |  |
+| 위치점프 | 78.5% | 100.0% | 100.0% |  |
+| G2-SpeedBurst | 84.9% | 100.0% | 100.0% |  |
+| G3-PhantomHDG | 86.0% | 98.6% | 99.5% |  |
+| F6-AISGap | 92.3% | 100.0% | 100.0% |  |
+| F2-Intermit | 97.0% | 100.0% | 100.0% |  |
+| D2-Temporal | 97.7% | 100.0% | 100.0% |  |
+| F5-MultiCoord | 98.6% | 100.0% | 100.0% |  |
+| G7-MMSISpoof | 99.3% | 100.0% | 100.0% |  |
+| G1-CircularLoop | 99.8% | 100.0% | 100.0% |  |
+| F4-TimeSkew | 99.9% | 100.0% | 100.0% |  |
+| G4-StatusFlicker | 100.0% | 100.0% | 100.0% |  |
+| FN1-dt점프 | 100.0% | 100.0% | 100.0% |  |
+| E1-Smooth | 100.0% | 100.0% | 100.0% |  |
+| E2-Desync | 100.0% | 100.0% | 100.0% |  |
+| E3-WinEdge | 100.0% | 100.0% | 100.0% |  |
+| E5-Shadow | 100.0% | 100.0% | 100.0% |  |
+| F1-FeatSmooth | 100.0% | 100.0% | 100.0% |  |
+| F3-TrajStitch | 100.0% | 100.0% | 100.0% |  |
+| G5-ZigzagAccel | 100.0% | 100.0% | 100.0% |  |
+| G6-LandRoute | 100.0% | 100.0% | 100.0% |  |
+
+</details>
+
+
 <!-- RUN_DETAILS:END -->
 
 ---
