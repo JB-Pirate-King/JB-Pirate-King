@@ -13,12 +13,55 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 <!-- RUN_RESULTS:BEGIN -->
 | Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
 |---|---|---|---|---|---|---|---|---|
+| dcdetect_002 | 2026-06-19 | `kinematic_speed_gap` | 78.7%→78.7% (+0.0pp) | 91.7% | 94.0% | 0.000983 | 14 | kinematic_speed_gap(속도-위치 정합성) 채택, 14피처 FP=1% 78.7% · FP=5% 91.7% · FP=10% 94.0% |
 | dcdetect_001 | 2026-06-19 | `anchor_motion` | 66.1%→78.0% (+11.8pp) | 91.4% | 93.9% | 0.002540 | 13 | anchor_motion(정박 중 이동 모순 포착) 채택으로 FP=1% 탐지율 66.1%→78.0% (+11.9pp). |
 <!-- RUN_RESULTS:END -->
 
 ### Per-run detail
 
 <!-- RUN_DETAILS:BEGIN -->
+<details>
+<summary><b>dcdetect_002</b> — <code>kinematic_speed_gap</code> · FP=1% 78.7%→78.7% · 2026-06-19</summary>
+
+- `kinematic_speed_gap` — 거리/시간으로 계산한 실제속도와 보고 sog의 괴리 — 위장이 sog만 조작하고 위치는 못 맞출 때 커짐
+- 🤖 kinematic_speed_gap(속도-위치 정합성) 채택, 14피처 FP=1% 78.7% · FP=5% 91.7% · FP=10% 94.0%
+
+| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |
+|---|---|---|---|---|
+| FN4-status | 0.0% | 12.0% | 27.5% | ⚠️ weak |
+| D1-LowSlow | 0.0% | 0.9% | 10.5% | ⚠️ weak |
+| D3-GradDrift | 30.7% | 92.9% | 99.5% | ⚠️ weak |
+| 정박이동 | 33.7% | 88.0% | 99.2% | ⚠️ weak |
+| E4-Contextual | 49.7% | 77.8% | 91.4% | ⚠️ weak |
+| COG/HDG불일치 | 50.0% | 81.5% | 88.2% | ⚠️ weak |
+| FN2-속도단계 | 53.7% | 100.0% | 100.0% |  |
+| 속도이상 | 55.0% | 94.1% | 98.4% |  |
+| 위치점프 | 63.1% | 99.0% | 100.0% |  |
+| FN3-COG경계 | 69.8% | 98.4% | 100.0% |  |
+| D2-Temporal | 81.7% | 98.3% | 99.7% |  |
+| G2-SpeedBurst | 87.6% | 99.9% | 100.0% |  |
+| G6-LandRoute | 88.5% | 100.0% | 100.0% |  |
+| F7-LSTMBeat | 93.3% | 100.0% | 100.0% |  |
+| G3-PhantomHDG | 95.4% | 99.7% | 100.0% |  |
+| G1-CircularLoop | 96.1% | 100.0% | 100.0% |  |
+| G5-ZigzagAccel | 96.2% | 100.0% | 100.0% |  |
+| D4-Mimicry | 96.4% | 99.9% | 100.0% |  |
+| F2-Intermit | 98.7% | 100.0% | 100.0% |  |
+| G7-MMSISpoof | 99.9% | 100.0% | 100.0% |  |
+| G4-StatusFlicker | 99.9% | 100.0% | 100.0% |  |
+| F6-AISGap | 100.0% | 100.0% | 100.0% |  |
+| FN1-dt점프 | 100.0% | 100.0% | 100.0% |  |
+| E1-Smooth | 100.0% | 100.0% | 100.0% |  |
+| E2-Desync | 100.0% | 100.0% | 100.0% |  |
+| E3-WinEdge | 100.0% | 100.0% | 100.0% |  |
+| E5-Shadow | 100.0% | 100.0% | 100.0% |  |
+| F1-FeatSmooth | 100.0% | 100.0% | 100.0% |  |
+| F3-TrajStitch | 100.0% | 100.0% | 100.0% |  |
+| F4-TimeSkew | 100.0% | 100.0% | 100.0% |  |
+| F5-MultiCoord | 100.0% | 100.0% | 100.0% |  |
+
+</details>
+
 <details>
 <summary><b>dcdetect_001</b> — <code>anchor_motion</code> · FP=1% 66.1%→78.0% · 2026-06-19</summary>
 
@@ -60,8 +103,6 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 | G6-LandRoute | 100.0% | 100.0% | 100.0% |  |
 
 </details>
-
-
 <!-- RUN_DETAILS:END -->
 
 ---
