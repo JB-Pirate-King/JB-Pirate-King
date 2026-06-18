@@ -12,7 +12,8 @@
     "speed_consistency",
     "lat_speed",
     "lon_speed",
-    "anchor_motion"
+    "anchor_motion",
+    "kinematic_speed_gap"
   ],
   "min": [
     0.0,
@@ -27,6 +28,7 @@
     0.0,
     -6.7e-05,
     -7.6e-05,
+    0.0,
     0.0
   ],
   "max": [
@@ -42,6 +44,7 @@
     1.9115,
     6.4e-05,
     7.3e-05,
-    0.0209
+    0.0209,
+    23.68799910738363
   ]
 }
