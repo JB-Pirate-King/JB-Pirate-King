@@ -13,6 +13,7 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 <!-- RUN_RESULTS:BEGIN -->
 | Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
 |---|---|---|---|---|---|---|---|---|
+| dcdetect_003 | 2026-06-19 | `heading_micro_jitter` | 79.9%→81.2% (+1.3pp) | 91.1% | 93.4% | 0.000950 | 15 | - |
 | dcdetect_002 | 2026-06-19 | `kinematic_speed_gap` | 78.7%→78.7% (+0.0pp) | 91.7% | 94.0% | 0.000983 | 14 | kinematic_speed_gap(속도-위치 정합성) 채택, 14피처 FP=1% 78.7% · FP=5% 91.7% · FP=10% 94.0% |
 | dcdetect_001 | 2026-06-19 | `anchor_motion` | 66.1%→78.0% (+11.8pp) | 91.4% | 93.9% | 0.002540 | 13 | anchor_motion(정박 중 이동 모순 포착) 채택으로 FP=1% 탐지율 66.1%→78.0% (+11.9pp). |
 <!-- RUN_RESULTS:END -->
@@ -20,6 +21,47 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 ### Per-run detail
 
 <!-- RUN_DETAILS:BEGIN -->
+<details>
+<summary><b>dcdetect_003</b> — <code>heading_micro_jitter</code> · FP=1% 79.9%→81.2% · 2026-06-19</summary>
+
+- `heading_micro_jitter` — sog_change가 작은데 heading만 미세 변동 — 매끄러운 정상모방(Mimicry) 속 기수방향 떨림 노출
+
+| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |
+|---|---|---|---|---|
+| FN4-status | 0.0% | 11.7% | 26.0% | ⚠️ weak |
+| D1-LowSlow | 0.0% | 0.0% | 0.9% | ⚠️ weak |
+| FN2-속도단계 | 24.5% | 71.2% | 92.3% | ⚠️ weak |
+| 정박이동 | 47.7% | 92.1% | 98.1% | ⚠️ weak |
+| E4-Contextual | 50.8% | 79.9% | 93.2% |  |
+| COG/HDG불일치 | 57.3% | 81.8% | 87.2% |  |
+| 속도이상 | 61.2% | 94.4% | 97.4% |  |
+| D3-GradDrift | 64.0% | 99.4% | 100.0% |  |
+| FN3-COG경계 | 65.6% | 94.3% | 99.1% |  |
+| 위치점프 | 86.6% | 100.0% | 100.0% |  |
+| G2-SpeedBurst | 90.0% | 100.0% | 100.0% |  |
+| G6-LandRoute | 90.9% | 100.0% | 100.0% |  |
+| G1-CircularLoop | 94.1% | 100.0% | 100.0% |  |
+| F7-LSTMBeat | 94.7% | 100.0% | 100.0% |  |
+| G3-PhantomHDG | 95.5% | 99.8% | 100.0% |  |
+| D2-Temporal | 97.1% | 100.0% | 100.0% |  |
+| F2-Intermit | 98.8% | 100.0% | 100.0% |  |
+| G5-ZigzagAccel | 98.9% | 100.0% | 100.0% |  |
+| D4-Mimicry | 99.4% | 100.0% | 100.0% |  |
+| F3-TrajStitch | 99.4% | 100.0% | 100.0% |  |
+| G4-StatusFlicker | 99.9% | 100.0% | 100.0% |  |
+| G7-MMSISpoof | 100.0% | 100.0% | 100.0% |  |
+| FN1-dt점프 | 100.0% | 100.0% | 100.0% |  |
+| E1-Smooth | 100.0% | 100.0% | 100.0% |  |
+| E2-Desync | 100.0% | 100.0% | 100.0% |  |
+| E3-WinEdge | 100.0% | 100.0% | 100.0% |  |
+| E5-Shadow | 100.0% | 100.0% | 100.0% |  |
+| F1-FeatSmooth | 100.0% | 100.0% | 100.0% |  |
+| F4-TimeSkew | 100.0% | 100.0% | 100.0% |  |
+| F5-MultiCoord | 100.0% | 100.0% | 100.0% |  |
+| F6-AISGap | 100.0% | 100.0% | 100.0% |  |
+
+</details>
+
 <details>
 <summary><b>dcdetect_002</b> — <code>kinematic_speed_gap</code> · FP=1% 78.7%→78.7% · 2026-06-19</summary>
 
