@@ -1,6 +1,7 @@
 {
   "initial_extra": [
     "anchor_motion",
-    "kinematic_speed_gap"
+    "kinematic_speed_gap",
+    "heading_micro_jitter"
   ]
 }
