@@ -182,6 +182,7 @@ void ais_ids::to_snapshot(AISTarget &target)
         // 추가 파생 피처 계산 (patch_plugin.py 자동 생성)
         // [UNKNOWN FEATURE: anchor_motion]
         // [UNKNOWN FEATURE: kinematic_speed_gap]
+        // [UNKNOWN FEATURE: heading_micro_jitter]
         // [AUTO:extra_feats_end]
 
         // [AUTO:push_calls_begin]
