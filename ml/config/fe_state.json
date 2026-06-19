@@ -1,5 +1,6 @@
 {
   "initial_extra": [
-    "sog_accel"
+    "sog_accel",
+    "pos_sog_ratio"
   ]
 }
