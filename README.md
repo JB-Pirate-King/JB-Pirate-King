@@ -13,11 +13,55 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 <!-- RUN_RESULTS:BEGIN -->
 | Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
 |---|---|---|---|---|---|---|---|---|
+| lstm_001 | 2026-06-19 | `sog_accel` | 26.9%→35.0% (+8.1pp) | 79.0% | 88.2% | 0.006155 | 13 | lstm_001: sog_accel(가속도) 채택으로 FP=1% 탐지율 26.9%→35.0%(+8.1pp) 달성 |
 <!-- RUN_RESULTS:END -->
 
 ### Per-run detail
 
 <!-- RUN_DETAILS:BEGIN -->
+<details>
+<summary><b>lstm_001</b> — <code>sog_accel</code> · FP=1% 26.9%→35.0% · 2026-06-19</summary>
+
+- `sog_accel` — 속도변화량/시간간격 = 가속도 — 순간 속도급증/단계적 위장 포착
+- 🤖 lstm_001: sog_accel(가속도) 채택으로 FP=1% 탐지율 26.9%→35.0%(+8.1pp) 달성
+
+| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |
+|---|---|---|---|---|
+| FN3-COG경계 | 0.0% | 0.4% | 27.0% | ⚠️ weak |
+| FN4-status | 0.0% | 0.1% | 0.5% | ⚠️ weak |
+| F1-FeatSmooth | 0.0% | 69.9% | 100.0% | ⚠️ weak |
+| F3-TrajStitch | 0.0% | 54.4% | 94.4% | ⚠️ weak |
+| F7-LSTMBeat | 0.0% | 11.8% | 76.4% | ⚠️ weak |
+| D1-LowSlow | 0.1% | 1.5% | 2.0% | ⚠️ weak |
+| G4-StatusFlicker | 0.3% | 91.7% | 99.8% | ⚠️ weak |
+| D3-GradDrift | 0.4% | 95.4% | 100.0% | ⚠️ weak |
+| F5-MultiCoord | 0.6% | 81.7% | 99.7% | ⚠️ weak |
+| G2-SpeedBurst | 0.8% | 100.0% | 100.0% | ⚠️ weak |
+| D4-Mimicry | 1.1% | 85.4% | 100.0% | ⚠️ weak |
+| COG/HDG불일치 | 1.4% | 43.2% | 66.4% | ⚠️ weak |
+| 정박이동 | 3.0% | 34.9% | 67.3% | ⚠️ weak |
+| E1-Smooth | 3.0% | 83.3% | 99.6% | ⚠️ weak |
+| E5-Shadow | 3.3% | 100.0% | 100.0% | ⚠️ weak |
+| G3-PhantomHDG | 3.8% | 99.4% | 100.0% | ⚠️ weak |
+| 속도이상 | 8.6% | 97.3% | 100.0% | ⚠️ weak |
+| E4-Contextual | 17.3% | 100.0% | 100.0% | ⚠️ weak |
+| G6-LandRoute | 31.5% | 100.0% | 100.0% | ⚠️ weak |
+| E2-Desync | 38.1% | 99.3% | 100.0% | ⚠️ weak |
+| F6-AISGap | 40.3% | 98.1% | 100.0% | ⚠️ weak |
+| D2-Temporal | 84.7% | 100.0% | 100.0% |  |
+| 위치점프 | 85.8% | 100.0% | 100.0% |  |
+| F2-Intermit | 88.0% | 99.9% | 100.0% |  |
+| G7-MMSISpoof | 89.0% | 100.0% | 100.0% |  |
+| G1-CircularLoop | 92.5% | 100.0% | 100.0% |  |
+| E3-WinEdge | 94.5% | 100.0% | 100.0% |  |
+| G5-ZigzagAccel | 97.6% | 100.0% | 100.0% |  |
+| F4-TimeSkew | 99.7% | 100.0% | 100.0% |  |
+| FN1-dt점프 | 100.0% | 100.0% | 100.0% |  |
+| FN2-속도단계 | 100.0% | 100.0% | 100.0% |  |
+
+</details>
+
+
 <!-- RUN_DETAILS:END -->
 
 ---
