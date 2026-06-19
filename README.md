@@ -13,12 +13,55 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 <!-- RUN_RESULTS:BEGIN -->
 | Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
 |---|---|---|---|---|---|---|---|---|
+| lstm_002 | 2026-06-19 | `pos_sog_ratio` | 34.1%→38.7% (+4.6pp) | 77.3% | 87.5% | 0.005723 | 14 | pos_sog_ratio(보고SOG↔실이동속도 괴리) 채택, FP=1% 34.1%→38.7%(+4.6pp), 피처 14개 |
 | lstm_001 | 2026-06-19 | `sog_accel` | 26.9%→35.0% (+8.1pp) | 79.0% | 88.2% | 0.006155 | 13 | lstm_001: sog_accel(가속도) 채택으로 FP=1% 탐지율 26.9%→35.0%(+8.1pp) 달성 |
 <!-- RUN_RESULTS:END -->
 
 ### Per-run detail
 
 <!-- RUN_DETAILS:BEGIN -->
+<details>
+<summary><b>lstm_002</b> — <code>pos_sog_ratio</code> · FP=1% 34.1%→38.7% · 2026-06-19</summary>
+
+- `pos_sog_ratio` — 위치기반 이동속도크기 / 보고 SOG — 저속 위장 시 보고속도와 실제이동 불일치
+- 🤖 pos_sog_ratio(보고SOG↔실이동속도 괴리) 채택, FP=1% 34.1%→38.7%(+4.6pp), 피처 14개
+
+| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |
+|---|---|---|---|---|
+| FN3-COG경계 | 0.0% | 0.5% | 13.7% | ⚠️ weak |
+| FN4-status | 0.0% | 0.1% | 0.9% | ⚠️ weak |
+| F3-TrajStitch | 0.0% | 47.0% | 96.0% | ⚠️ weak |
+| F7-LSTMBeat | 0.0% | 9.5% | 80.0% | ⚠️ weak |
+| D1-LowSlow | 0.1% | 1.0% | 1.8% | ⚠️ weak |
+| F1-FeatSmooth | 0.2% | 81.6% | 100.0% | ⚠️ weak |
+| G4-StatusFlicker | 0.5% | 88.1% | 100.0% | ⚠️ weak |
+| D3-GradDrift | 0.8% | 89.0% | 100.0% | ⚠️ weak |
+| G2-SpeedBurst | 0.9% | 98.8% | 100.0% | ⚠️ weak |
+| COG/HDG불일치 | 1.0% | 25.7% | 57.2% | ⚠️ weak |
+| 정박이동 | 2.6% | 27.5% | 63.3% | ⚠️ weak |
+| F5-MultiCoord | 3.1% | 80.3% | 99.9% | ⚠️ weak |
+| D4-Mimicry | 3.6% | 80.2% | 100.0% | ⚠️ weak |
+| G3-PhantomHDG | 4.1% | 98.3% | 100.0% | ⚠️ weak |
+| E1-Smooth | 7.6% | 80.8% | 99.8% | ⚠️ weak |
+| 속도이상 | 7.8% | 93.2% | 100.0% | ⚠️ weak |
+| G6-LandRoute | 35.2% | 100.0% | 100.0% | ⚠️ weak |
+| F6-AISGap | 39.3% | 94.6% | 100.0% | ⚠️ weak |
+| E5-Shadow | 42.2% | 100.0% | 100.0% | ⚠️ weak |
+| E2-Desync | 45.7% | 99.1% | 100.0% | ⚠️ weak |
+| E4-Contextual | 63.5% | 99.8% | 100.0% |  |
+| 위치점프 | 82.6% | 100.0% | 100.0% |  |
+| G1-CircularLoop | 89.6% | 100.0% | 100.0% |  |
+| G7-MMSISpoof | 90.7% | 100.0% | 100.0% |  |
+| F2-Intermit | 93.3% | 100.0% | 100.0% |  |
+| E3-WinEdge | 93.9% | 100.0% | 100.0% |  |
+| D2-Temporal | 95.2% | 100.0% | 100.0% |  |
+| G5-ZigzagAccel | 96.1% | 100.0% | 100.0% |  |
+| F4-TimeSkew | 99.8% | 100.0% | 100.0% |  |
+| FN1-dt점프 | 100.0% | 100.0% | 100.0% |  |
+| FN2-속도단계 | 100.0% | 100.0% | 100.0% |  |
+
+</details>
+
 <details>
 <summary><b>lstm_001</b> — <code>sog_accel</code> · FP=1% 26.9%→35.0% · 2026-06-19</summary>
 
@@ -60,8 +103,6 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 | FN2-속도단계 | 100.0% | 100.0% | 100.0% |  |
 
 </details>
-
-
 <!-- RUN_DETAILS:END -->
 
 ---
