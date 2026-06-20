@@ -354,12 +354,14 @@ def _prime_session(knowledge: str):
             "이전 런에서 무엇을 채택/기각했고 어느 시나리오가 약했는지 파악해, 같은 실패를 반복하지 말고 "
             "다른 각도의 피처를 제안하라.\n" + prev
         )
-    cmd = ["claude", "-p", prompt, "--session-id", RT.claude_sid]
+    # 프롬프트는 stdin 으로 전달 — knowledge(26K) + 직전런 tail 이 합쳐지면 Windows 명령줄
+    # 길이 한계(~32K, WinError 206)를 넘으므로 arg 가 아닌 stdin 으로 넣는다.
+    cmd = ["claude", "-p", "--session-id", RT.claude_sid]
     model = getattr(RT.args, "claude_model", None)
     if model:
         cmd += ["--model", model]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=240)
         RT.claude_started = True   # 세션 생성됨 → 이후는 resume
         summary = r.stdout.strip() if r.returncode == 0 else ""
@@ -464,8 +466,10 @@ def log_sheet(kind: str):
         run_num = state.get("run_num")
         current_extra = state.get("current_extra")
         fe = dict(r.get("fe_stats", {}))
-        newly_adopted = list(r.get("newly_adopted", []))
-        full_extra = list(r.get("full_extra", []))
+        # FE crash 시 r 의 값들이 None 일 수 있음(키는 존재) → `or []` 로 방어.
+        # (log_fe 가 여기서 죽으면 route_after_fe 의 ret!=0 재시도 분기까지 못 감.)
+        newly_adopted = list(r.get("newly_adopted") or [])
+        full_extra = list(r.get("full_extra") or [])
         n_feat = r.get("n_feat")
 
         def _do():
@@ -656,8 +660,14 @@ def _persist_adopted(names: list) -> bool:
             print(f"[채택영속화] 기존 파일 파싱 실패(새로 작성): {e}")
     added = False
     for n in names:
+        if n in entries:
+            continue
         c = RT.last_cands.get(n)
-        if not c or n in entries:
+        if not c:
+            # lambda_src 소스는 last_cands 에만 있음(dynamic_candidates 는 exec 된 함수라 재구성 불가).
+            # 여기서 못 찾으면 adopted_features.py 에 안 남아 다음 브랜치 --initial_extra 가 KeyError.
+            print(f"[채택영속화] ⚠️ '{n}' 의 lambda_src 를 last_cands 에서 못 찾음 — "
+                  f"adopted_features.py 미저장(다음 브랜치 KeyError 위험). last_cands keys={list(RT.last_cands)[:8]}")
             continue
         entries[n] = (f'    "{n}": ({json.dumps(c.get("desc", ""), ensure_ascii=False)}, '
                       f'{c["lambda_src"]}),')

@@ -220,6 +220,15 @@ def augment_seq(seq: list, extra_names: list) -> list:
 def augment_seqs(seqs: list, extra_names: list) -> list:
     if not extra_names:
         return seqs
+    # adopted_features.py 영속화 누락 등으로 풀에 없는 피처가 오면 KeyError 로 죽지 말고
+    # 경고 후 제외하고 일관 진행(차원은 필터된 extra_names 기준으로 맞춰짐).
+    missing = [n for n in extra_names if n not in CANDIDATE_FEATURES]
+    if missing:
+        print(f"[augment] ⚠️ 미등록 피처 {missing} 제외 — adopted_features.py 영속화 누락 의심. "
+              f"이 피처 없이 진행.")
+        extra_names = [n for n in extra_names if n in CANDIDATE_FEATURES]
+        if not extra_names:
+            return seqs
     return [augment_seq(seq, extra_names) for seq in seqs]
 
 
