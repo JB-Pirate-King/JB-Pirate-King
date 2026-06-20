@@ -1,6 +1,7 @@
 {
   "initial_extra": [
     "dt_irregularity",
-    "speed_consistency_min"
+    "speed_consistency_min",
+    "cog_change_reversal"
   ]
 }
