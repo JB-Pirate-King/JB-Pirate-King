@@ -10,7 +10,7 @@
 #include <algorithm>
 
 // [AUTO:feat_block_begin]
-// 피처 순서 (14개):
+// 피처 순서 (15개):
 //   0  sog                     속력 (knots)
 //   1  cog                     진행 방향 (도)
 //   2  heading                 선수 방향 (도)
@@ -25,7 +25,8 @@
 //  11  lon_speed               경도 방향 변화율 (도/초)
 //  12  dt_irregularity         dt_irregularity
 //  13  speed_consistency_min   speed_consistency_min
-#define ML_FEATURE_COUNT 14
+//  14  cog_change_reversal     cog_change_reversal
+#define ML_FEATURE_COUNT 15
 // [AUTO:feat_block_end]
 #define ML_SEQ_LEN       10
 #define ML_SEQ_LEN_SHORT  5
