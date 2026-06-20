@@ -13,6 +13,7 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 <!-- RUN_RESULTS:BEGIN -->
 | Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
 |---|---|---|---|---|---|---|---|---|
+| tcn_003 | 2026-06-21 | `cog_change_reversal` | 56.1%→66.0% (+9.9pp) | 81.9% | 86.2% | 0.000007 | 15 | cog_change_reversal(COG-HDG 부호반전 강도) 채택으로 탐지율 56.1%→66.0%(+9.9pp) 달성. |
 | tcn_002 | 2026-06-21 | `speed_consistency_min` | 50.2%→57.1% (+6.9pp) | 73.8% | 83.3% | 0.000004 | 14 | speed_consistency_min(윈도우 내 속도일관성 최솟값) 채택으로 FP=1% 탐지율 50.2%→57.1%(+6.9pp) 달성 |
 | tcn_001 | 2026-06-20 | `dt_irregularity` | 18.9%→46.1% (+27.2pp) | 73.1% | 83.2% | 0.000002 | 13 | dt_irregularity(수신간격 불규칙성) 채택으로 FP=1% 탐지율 18.9%→46.1%(+27.2pp) 달성. |
 <!-- RUN_RESULTS:END -->
@@ -20,6 +21,48 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 ### Per-run detail
 
 <!-- RUN_DETAILS:BEGIN -->
+<details>
+<summary><b>tcn_003</b> — <code>cog_change_reversal</code> · FP=1% 56.1%→66.0% · 2026-06-21</summary>
+
+- `cog_change_reversal` — 연속 COG-HDG 변화의 부호 반전 강도(지그재그) — 인위적 왕복/봇 패턴 포착
+- 🤖 cog_change_reversal(COG-HDG 부호반전 강도) 채택으로 탐지율 56.1%→66.0%(+9.9pp) 달성.
+
+| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |
+|---|---|---|---|---|
+| G6-LandRoute | 0.4% | 7.2% | 16.2% | ⚠️ weak |
+| F4-TimeSkew | 13.7% | 50.5% | 74.1% | ⚠️ weak |
+| D1-LowSlow | 16.6% | 36.0% | 48.8% | ⚠️ weak |
+| FN4-status | 22.2% | 47.6% | 59.6% | ⚠️ weak |
+| FN2-속도단계 | 26.3% | 63.9% | 73.9% | ⚠️ weak |
+| 속도이상 | 47.9% | 74.0% | 80.8% | ⚠️ weak |
+| E4-Contextual | 48.1% | 67.2% | 76.5% | ⚠️ weak |
+| 위치점프 | 50.5% | 89.0% | 95.9% |  |
+| FN3-COG경계 | 58.2% | 78.2% | 81.7% |  |
+| G2-SpeedBurst | 58.5% | 77.2% | 82.0% |  |
+| G1-CircularLoop | 59.3% | 91.4% | 96.6% |  |
+| COG/HDG불일치 | 59.6% | 77.9% | 82.4% |  |
+| F5-MultiCoord | 61.5% | 88.6% | 90.4% |  |
+| F6-AISGap | 61.9% | 80.8% | 83.5% |  |
+| D4-Mimicry | 65.8% | 80.2% | 84.4% |  |
+| 정박이동 | 69.5% | 88.0% | 93.1% |  |
+| FN1-dt점프 | 70.9% | 98.5% | 100.0% |  |
+| E3-WinEdge | 73.9% | 86.1% | 88.8% |  |
+| F7-LSTMBeat | 77.0% | 87.2% | 87.8% |  |
+| E2-Desync | 79.6% | 86.6% | 89.6% |  |
+| E5-Shadow | 80.4% | 100.0% | 100.0% |  |
+| D3-GradDrift | 84.2% | 98.2% | 99.6% |  |
+| D2-Temporal | 84.5% | 93.9% | 96.3% |  |
+| F1-FeatSmooth | 91.1% | 93.1% | 94.0% |  |
+| F2-Intermit | 92.3% | 96.4% | 96.8% |  |
+| F3-TrajStitch | 97.5% | 100.0% | 100.0% |  |
+| G4-StatusFlicker | 98.7% | 100.0% | 100.0% |  |
+| G3-PhantomHDG | 98.8% | 99.8% | 99.9% |  |
+| G5-ZigzagAccel | 99.0% | 100.0% | 100.0% |  |
+| G7-MMSISpoof | 99.6% | 99.9% | 99.9% |  |
+| E1-Smooth | 99.9% | 100.0% | 100.0% |  |
+
+</details>
+
 <details>
 <summary><b>tcn_002</b> — <code>speed_consistency_min</code> · FP=1% 50.2%→57.1% · 2026-06-21</summary>
 
