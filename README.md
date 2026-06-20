@@ -13,12 +13,55 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 <!-- RUN_RESULTS:BEGIN -->
 | Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
 |---|---|---|---|---|---|---|---|---|
+| tcn_002 | 2026-06-21 | `speed_consistency_min` | 50.2%→57.1% (+6.9pp) | 73.8% | 83.3% | 0.000004 | 14 | speed_consistency_min(윈도우 내 속도일관성 최솟값) 채택으로 FP=1% 탐지율 50.2%→57.1%(+6.9pp) 달성 |
 | tcn_001 | 2026-06-20 | `dt_irregularity` | 18.9%→46.1% (+27.2pp) | 73.1% | 83.2% | 0.000002 | 13 | dt_irregularity(수신간격 불규칙성) 채택으로 FP=1% 탐지율 18.9%→46.1%(+27.2pp) 달성. |
 <!-- RUN_RESULTS:END -->
 
 ### Per-run detail
 
 <!-- RUN_DETAILS:BEGIN -->
+<details>
+<summary><b>tcn_002</b> — <code>speed_consistency_min</code> · FP=1% 50.2%→57.1% · 2026-06-21</summary>
+
+- `speed_consistency_min` — 윈도우 내 속도일관성 최솟값 — 구간 중 가장 모순적인 순간을 포착해 맥락기반 위장 탐지
+- 🤖 speed_consistency_min(윈도우 내 속도일관성 최솟값) 채택으로 FP=1% 탐지율 50.2%→57.1%(+6.9pp) 달성
+
+| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |
+|---|---|---|---|---|
+| FN4-status | 0.0% | 0.4% | 6.8% | ⚠️ weak |
+| D1-LowSlow | 1.3% | 19.8% | 33.6% | ⚠️ weak |
+| 속도이상 | 10.4% | 33.6% | 55.0% | ⚠️ weak |
+| G2-SpeedBurst | 15.0% | 41.4% | 63.9% | ⚠️ weak |
+| F7-LSTMBeat | 24.0% | 41.7% | 55.9% | ⚠️ weak |
+| F3-TrajStitch | 26.2% | 62.0% | 83.2% | ⚠️ weak |
+| D2-Temporal | 33.0% | 71.3% | 85.8% | ⚠️ weak |
+| F5-MultiCoord | 35.9% | 60.1% | 78.0% | ⚠️ weak |
+| E3-WinEdge | 36.1% | 54.6% | 72.2% | ⚠️ weak |
+| 위치점프 | 41.2% | 77.5% | 92.2% | ⚠️ weak |
+| F6-AISGap | 44.2% | 78.3% | 93.0% | ⚠️ weak |
+| FN3-COG경계 | 45.4% | 72.2% | 80.7% | ⚠️ weak |
+| 정박이동 | 45.5% | 60.7% | 72.9% | ⚠️ weak |
+| E2-Desync | 46.0% | 73.7% | 84.8% | ⚠️ weak |
+| G5-ZigzagAccel | 48.0% | 76.9% | 89.7% | ⚠️ weak |
+| E5-Shadow | 48.8% | 76.6% | 93.5% | ⚠️ weak |
+| F1-FeatSmooth | 51.2% | 64.8% | 85.4% |  |
+| COG/HDG불일치 | 63.9% | 77.6% | 84.7% |  |
+| G3-PhantomHDG | 73.2% | 94.1% | 98.3% |  |
+| E4-Contextual | 75.1% | 82.3% | 85.0% |  |
+| FN2-속도단계 | 76.6% | 89.2% | 100.0% |  |
+| F4-TimeSkew | 78.1% | 99.7% | 99.9% |  |
+| E1-Smooth | 81.4% | 97.5% | 99.7% |  |
+| F2-Intermit | 85.8% | 88.7% | 91.7% |  |
+| D4-Mimicry | 90.7% | 95.6% | 97.8% |  |
+| G7-MMSISpoof | 96.0% | 98.6% | 99.4% |  |
+| D3-GradDrift | 98.6% | 100.0% | 100.0% |  |
+| G4-StatusFlicker | 99.4% | 99.8% | 99.9% |  |
+| G6-LandRoute | 99.6% | 100.0% | 100.0% |  |
+| FN1-dt점프 | 100.0% | 100.0% | 100.0% |  |
+| G1-CircularLoop | 100.0% | 100.0% | 100.0% |  |
+
+</details>
+
 <details>
 <summary><b>tcn_001</b> — <code>dt_irregularity</code> · FP=1% 18.9%→46.1% · 2026-06-20</summary>
 
@@ -60,8 +103,6 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 | G4-StatusFlicker | 98.1% | 99.9% | 100.0% |  |
 
 </details>
-
-
 <!-- RUN_DETAILS:END -->
 
 ---
