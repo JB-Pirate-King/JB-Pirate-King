@@ -12,7 +12,8 @@
     "speed_consistency",
     "lat_speed",
     "lon_speed",
-    "dt_irregularity"
+    "dt_irregularity",
+    "speed_consistency_min"
   ],
   "min": [
     0.0,
@@ -27,6 +28,7 @@
     0.0,
     -6.7e-05,
     -7.6e-05,
+    0.0,
     0.0
   ],
   "max": [
@@ -42,6 +44,7 @@
     1.9115,
     6.4e-05,
     7.3e-05,
-    2.056497175141243
+    2.056497175141243,
+    1.0425
   ]
 }

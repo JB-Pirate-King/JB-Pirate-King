@@ -181,6 +181,7 @@ void ais_ids::to_snapshot(AISTarget &target)
         // [AUTO:extra_feats_begin]
         // 추가 파생 피처 계산 (patch_plugin.py 자동 생성)
         // [UNKNOWN FEATURE: dt_irregularity]
+        // [UNKNOWN FEATURE: speed_consistency_min]
         // [AUTO:extra_feats_end]
 
         // [AUTO:push_calls_begin]
