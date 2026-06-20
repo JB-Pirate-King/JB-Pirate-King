@@ -1,6 +1,6 @@
 ---
 source_file: 방법론 연구 Poster (1).pdf
-last_synced: 2026-06-19 10:06
+last_synced: 2026-06-20 10:05
 tags: [notion-sync, attachment]
 ---
 

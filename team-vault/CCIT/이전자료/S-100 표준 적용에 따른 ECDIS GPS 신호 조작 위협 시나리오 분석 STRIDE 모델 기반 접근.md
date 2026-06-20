@@ -1,6 +1,6 @@
 ---
 notion_url: https://www.notion.so/322be080983081339238d0c1495b6a19
-last_synced: 2026-06-19 10:06
+last_synced: 2026-06-20 10:05
 tags: [notion-sync]
 ---
 
