@@ -1157,9 +1157,15 @@ def main():
                 json.dump({"best_extra": list(best_extra), "best_det": base_h["det"],
                            "baseline_det": base_h["det"], "scenario_fp1": scen},
                           jf, ensure_ascii=False, indent=2)
-        print(f"\n[수렴] 신규 채택 0 — 동일 피처셋({best['n_feat']}개) 재학습/순열중요도/"
-              f"export 생략 (탐지율 {base_h['det']:.1f}%)")
-        return
+        # 채택0 수렴: export_dir 가 지정되면 베이스(현 피처셋) 모델도 배포물로 남긴다.
+        # conv1d 처럼 기본 피처만으로 강한 모델이 채택0 이라고 배포물 0 이 되는 걸 방지.
+        if not args.export_dir:
+            print(f"\n[수렴] 신규 채택 0 — 동일 피처셋({best['n_feat']}개) 재학습/순열중요도/"
+                  f"export 생략 (탐지율 {base_h['det']:.1f}%)")
+            return
+        print(f"\n[수렴] 신규 채택 0 — 단 --export_dir 지정 → 베이스 피처셋"
+              f"({best['n_feat']}개) 모델을 배포물로 export 진행 (탐지율 {base_h['det']:.1f}%)")
+        # 이하로 진행: best_extra(=현 피처셋)로 재학습→중요도→최종평가→export
 
     print(f"\n[피처 중요도] 최적 피처셋({best['n_feat']}개)으로 재학습 중...")
     tensor_best, scaler_best = prepare_tensor(train_seqs, best_extra)
