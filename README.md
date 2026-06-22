@@ -13,11 +13,55 @@ per-scenario detection rates. The Note is written by claude resuming the branch 
 <!-- RUN_RESULTS:BEGIN -->
 | Run | Date | Adopted | FP=1% (base→final) | FP=5% | FP=10% | Threshold | Feats | Note |
 |---|---|---|---|---|---|---|---|---|
+| dcdetect_004 | 2026-06-23 | `status_expected_speed_dev` | 81.9%→83.2% (+1.3pp) | 92.0% | 93.9% | 0.000657 | 16 | status 기대속도 위반량 피처 채택으로 FP=1% 탐지율 81.9%→83.2%(+1.3pp), 16피처. |
 <!-- RUN_RESULTS:END -->
 
 ### Per-run detail
 
 <!-- RUN_DETAILS:BEGIN -->
+<details>
+<summary><b>dcdetect_004</b> — <code>status_expected_speed_dev</code> · FP=1% 81.9%→83.2% · 2026-06-23</summary>
+
+- `status_expected_speed_dev` — status가 함의하는 기대속도(정박/계류 status 1,5,6→0, 그 외 항행→약5kn)와 실제 sog의 연속 편차 — 모든 행에서 값이 살아있는 dense 신호라 status 단독 위조(FN4) 시 잔차가 끊김없이 커짐
+- 🤖 status 기대속도 위반량 피처 채택으로 FP=1% 탐지율 81.9%→83.2%(+1.3pp), 16피처.
+
+| Scenario (attack type) | FP=1% | FP=5% | FP=10% | |
+|---|---|---|---|---|
+| D1-LowSlow | 0.0% | 0.1% | 3.0% | ⚠️ weak |
+| 정박이동 | 7.8% | 64.9% | 84.2% | ⚠️ weak |
+| FN4-status | 12.2% | 37.0% | 46.8% | ⚠️ weak |
+| D3-GradDrift | 14.3% | 82.5% | 97.0% | ⚠️ weak |
+| COG/HDG불일치 | 61.2% | 84.1% | 86.8% |  |
+| 속도이상 | 72.6% | 96.8% | 99.1% |  |
+| F4-TimeSkew | 75.0% | 100.0% | 100.0% |  |
+| 위치점프 | 75.4% | 98.4% | 99.9% |  |
+| E4-Contextual | 78.9% | 88.9% | 95.3% |  |
+| FN3-COG경계 | 85.3% | 99.2% | 100.0% |  |
+| G3-PhantomHDG | 96.3% | 99.8% | 100.0% |  |
+| G1-CircularLoop | 99.4% | 100.0% | 100.0% |  |
+| D2-Temporal | 100.0% | 100.0% | 100.0% |  |
+| D4-Mimicry | 100.0% | 100.0% | 100.0% |  |
+| FN1-dt점프 | 100.0% | 100.0% | 100.0% |  |
+| FN2-속도단계 | 100.0% | 100.0% | 100.0% |  |
+| E1-Smooth | 100.0% | 100.0% | 100.0% |  |
+| E2-Desync | 100.0% | 100.0% | 100.0% |  |
+| E3-WinEdge | 100.0% | 100.0% | 100.0% |  |
+| E5-Shadow | 100.0% | 100.0% | 100.0% |  |
+| F1-FeatSmooth | 100.0% | 100.0% | 100.0% |  |
+| F2-Intermit | 100.0% | 100.0% | 100.0% |  |
+| F3-TrajStitch | 100.0% | 100.0% | 100.0% |  |
+| F5-MultiCoord | 100.0% | 100.0% | 100.0% |  |
+| F6-AISGap | 100.0% | 100.0% | 100.0% |  |
+| F7-LSTMBeat | 100.0% | 100.0% | 100.0% |  |
+| G2-SpeedBurst | 100.0% | 100.0% | 100.0% |  |
+| G4-StatusFlicker | 100.0% | 100.0% | 100.0% |  |
+| G5-ZigzagAccel | 100.0% | 100.0% | 100.0% |  |
+| G6-LandRoute | 100.0% | 100.0% | 100.0% |  |
+| G7-MMSISpoof | 100.0% | 100.0% | 100.0% |  |
+
+</details>
+
+
 <!-- RUN_DETAILS:END -->
 
 ---
