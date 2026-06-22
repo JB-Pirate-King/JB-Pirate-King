@@ -1,6 +1,6 @@
 ---
 source_file: NMEA0183_Protocol.pdf
-last_synced: 2026-06-22 01:05
+last_synced: 2026-06-22 10:06
 tags: [notion-sync, attachment]
 ---
 
