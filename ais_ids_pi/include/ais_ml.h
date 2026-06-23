@@ -81,7 +81,10 @@ public:
                      float cog_hdg_diff, float sog_change,
                      float cog_hdg_change,
                      float speed_consistency,
-                     float lat_speed, float lon_speed);
+                     float lat_speed, float lon_speed,
+                     float anchor_motion, float kinematic_speed_gap,
+                     float heading_micro_jitter,
+                     float status_expected_speed_dev);
     // [AUTO:push_decl_end]
 
     // ── 이상 탐지 (단일/앙상블 자동 분기) ───────────────────────

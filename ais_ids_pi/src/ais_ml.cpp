@@ -170,7 +170,10 @@ void AIS_ML::PushFeature(int mmsi,
                           float cog_hdg_diff, float sog_change,
                           float cog_hdg_change,
                           float speed_consistency,
-                          float lat_speed, float lon_speed)
+                          float lat_speed, float lon_speed,
+                          float anchor_motion, float kinematic_speed_gap,
+                          float heading_micro_jitter,
+                          float status_expected_speed_dev)
 {
     std::array<float, ML_FEATURE_COUNT> feat = {
         sog, cog, heading, status,
@@ -178,7 +181,9 @@ void AIS_ML::PushFeature(int mmsi,
         cog_hdg_diff, sog_change,
         cog_hdg_change,
         speed_consistency,
-        lat_speed, lon_speed
+        lat_speed, lon_speed,
+        anchor_motion, kinematic_speed_gap,
+        heading_micro_jitter, status_expected_speed_dev
     };
     auto &seq = m_sequences[mmsi];
     seq.push_back(feat);

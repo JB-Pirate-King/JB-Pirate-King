@@ -179,11 +179,23 @@ void ais_ids::to_snapshot(AISTarget &target)
         float lon_speed = (dt > 0.0f) ? (float)((cur.lon - prev.lon) / dt) : 0.0f;
 
         // [AUTO:extra_feats_begin]
-        // 추가 파생 피처 계산 (patch_plugin.py 자동 생성)
-        // [UNKNOWN FEATURE: anchor_motion]
-        // [UNKNOWN FEATURE: kinematic_speed_gap]
-        // [UNKNOWN FEATURE: heading_micro_jitter]
-        // [UNKNOWN FEATURE: status_expected_speed_dev]
+        // 추가 파생 피처 계산 (dcdetect_004 채택 4피처 — 수동 패치)
+        // anchor_motion: 정박/계류 status(1,5)인데 이동거리 큼
+        float anchor_motion =
+            (cur.navStatus == 1 || cur.navStatus == 5) ? dist_km : 0.0f;
+        // kinematic_speed_gap: 거리/시간 실제속도와 보고 sog 괴리
+        float kinematic_speed_gap =
+            std::abs(dist_km / std::max(dt, 1e-6f) - (float)cur.sog);
+        // heading_micro_jitter: sog_change 작은데 heading 미세 변동
+        float heading_micro_jitter =
+            std::abs((float)cur.hdg - (float)prev.hdg) / (1.0f + std::abs(sog_change));
+        // status_expected_speed_dev: status 함의 기대속도(정박/계류 1,5,6→0, 그 외→5kn)와 sog 편차
+        float status_expected_speed_dev;
+        {
+            int st = (int)cur.navStatus;
+            float exp_sp = (st == 1 || st == 5 || st == 6) ? 0.0f : 5.0f;
+            status_expected_speed_dev = std::abs((float)cur.sog - exp_sp);
+        }
         // [AUTO:extra_feats_end]
 
         // [AUTO:push_calls_begin]
@@ -196,7 +208,9 @@ void ais_ids::to_snapshot(AISTarget &target)
                 cog_hdg_diff, sog_change,
                 cog_hdg_change,
                 speed_consistency,
-                lat_speed, lon_speed);
+                lat_speed, lon_speed,
+                anchor_motion, kinematic_speed_gap,
+                heading_micro_jitter, status_expected_speed_dev);
 
         if (ais_ml_short->IsLoaded())
             ais_ml_short->PushFeature(target.mmsi,
@@ -206,7 +220,9 @@ void ais_ids::to_snapshot(AISTarget &target)
                 cog_hdg_diff, sog_change,
                 cog_hdg_change,
                 speed_consistency,
-                lat_speed, lon_speed);
+                lat_speed, lon_speed,
+                anchor_motion, kinematic_speed_gap,
+                heading_micro_jitter, status_expected_speed_dev);
         // [AUTO:push_calls_end]
     }
 }
