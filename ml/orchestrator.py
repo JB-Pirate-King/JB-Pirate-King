@@ -79,6 +79,10 @@ DYNAMIC_CAND_PATH = "ml/dynamic_candidates.py"
 # 덮어써지므로, 채택분은 여기로 옮겨 보존해야 다음 run 의 --initial_extra 계산이 가능.
 ADOPTED_FEATS_PATH = "ml/config/adopted_features.py"
 
+# 채택 피처의 C++ 표현식 영속 파일 (git 추적). patch_plugin 이 import 시 병합해
+# EXTRA_FEAT_CPP 에 없는 동적 피처도 C++ 자동 생성 → 플러그인 빌드 완전 자동화.
+ADOPTED_CPP_PATH = "ml/config/adopted_features_cpp.py"
+
 
 class _Runtime:
     bot = None
@@ -264,7 +268,7 @@ def _claude_json(prompt: str, timeout: int = 120,
 
     session 지정 시 브랜치 세션에 묶음: 첫 호출(first=True)은 --session-id 로
     세션 생성, 이후는 --resume 로 같은 대화를 이어가 맥락이 누적된다."""
-    cmd = ["claude", "-p", prompt, "--output-format", "json"]
+    cmd = [steps.claude_exe(), "-p", prompt, "--output-format", "json"]
     if model:
         cmd += ["--model", model]
     if session:
@@ -356,7 +360,7 @@ def _prime_session(knowledge: str):
         )
     # 프롬프트는 stdin 으로 전달 — knowledge(26K) + 직전런 tail 이 합쳐지면 Windows 명령줄
     # 길이 한계(~32K, WinError 206)를 넘으므로 arg 가 아닌 stdin 으로 넣는다.
-    cmd = ["claude", "-p", "--session-id", RT.claude_sid]
+    cmd = [steps.claude_exe(), "-p", "--session-id", RT.claude_sid]
     model = getattr(RT.args, "claude_model", None)
     if model:
         cmd += ["--model", model]
@@ -599,10 +603,18 @@ def _reco_prompt(weak: str, tried: list, base_det) -> str:
         f"Weak scenarios: {weak}\n\n"
         "Output ONLY a JSON array (no prose). Each element (write `desc` in KOREAN — it is shown in Slack):\n"
         '{"name":"snake_case","desc":"한줄 설명","lambda_src":"lambda seq,t: ...",'
-        '"target_scenario":"target"}\n'
+        '"cpp_expr":"<C++ expression>","target_scenario":"target"}\n'
         'Column access seq[t][_B["sog"]]. BASE 12: sog,cog,heading,status,dt,dist_km,'
         "cog_hdg_diff,sog_change,cog_hdg_change,speed_consistency,lat_speed,lon_speed. "
-        "Guard previous row seq[t-1] with `if t>0 else 0.0`; guard zero-division with max(x,1e-6). Pure function."
+        "Guard previous row seq[t-1] with `if t>0 else 0.0`; guard zero-division with max(x,1e-6). Pure function.\n"
+        "`cpp_expr`: the SAME computation as one C++ float expression for the OpenCPN plugin "
+        "(deployed inference). Available C++ vars at the current row: (float)cur.sog,(float)cur.cog,"
+        "(float)cur.hdg,(float)cur.navStatus,dt,dist_km,cog_hdg_diff,sog_change,cog_hdg_change,"
+        "speed_consistency,lat_speed,lon_speed; previous row: (float)prev.sog,(float)prev.cog,"
+        "(float)prev.hdg,(float)prev.navStatus,prev.lat,prev.lon. Helpers: std::abs,std::max,std::min,"
+        "std::sqrt,std::sin,std::cos,M_PI. Use ternary `?:` for conditionals, std::max(x,1e-6f) for "
+        "zero-division, float literals (5.0f). It must MATCH lambda_src numerically. Example: "
+        '`std::abs(dist_km / std::max(dt,1e-6f) - (float)cur.sog)`.'
     )
 
 
@@ -677,6 +689,43 @@ def _persist_adopted(names: list) -> bool:
     body = ["# 채택된 동적 피처 lambda 영속 보관 — orchestrator n_chain 이 채택 시 병합 기록.",
             "# feature_engineer 가 시작 시 exec 로드 (initial_extra 계산에 필수). git 추적.",
             "ADOPTED_FEATURES = {"] + list(entries.values()) + ["}"]
+    p.write_text("\n".join(body) + "\n", encoding="utf-8")
+    return added
+
+
+def _persist_adopted_cpp(names: list) -> bool:
+    """채택 피처의 C++ 표현식을 ADOPTED_CPP_PATH 에 병합 저장.
+    patch_plugin 이 import 시 읽어 EXTRA_FEAT_CPP 에 병합 → 동적 피처 C++ 자동 생성.
+    cpp_expr 가 없으면 미저장 → patch_plugin --strict 가 빌드를 막아 깨진 산출물 방지."""
+    p = Path(ADOPTED_CPP_PATH)
+    existing: dict = {}
+    if p.exists():
+        try:
+            ns: dict = {}
+            exec(p.read_text(encoding="utf-8"), ns)
+            existing = dict(ns.get("ADOPTED_CPP", {}))
+        except Exception as e:
+            print(f"[CPP영속화] 기존 파싱 실패(새로 작성): {e}")
+    added = False
+    for n in names:
+        if n in existing:
+            continue
+        c = RT.last_cands.get(n)
+        if not c or not c.get("cpp_expr"):
+            print(f"[CPP영속화] ⚠️ '{n}' cpp_expr 없음 — patch_plugin EXTRA_FEAT_CPP 수동 등록 필요"
+                  " (strict 빌드가 차단함).")
+            continue
+        existing[n] = (c.get("desc", ""), c["cpp_expr"])
+        added = True
+    if not existing:
+        return False
+    body = ["# 채택 동적 피처 C++ 표현식 — orchestrator n_chain 기록, patch_plugin 이 병합.",
+            "# {name: (desc, cpp_expr)} → patch_plugin 이 'float <name> = (<cpp_expr>);' 로 생성.",
+            "ADOPTED_CPP = {"]
+    for k, (d, e) in existing.items():
+        body.append(f"    {json.dumps(k)}: ({json.dumps(d, ensure_ascii=False)}, "
+                    f"{json.dumps(e, ensure_ascii=False)}),")
+    body.append("}")
     p.write_text("\n".join(body) + "\n", encoding="utf-8")
     return added
 
@@ -816,8 +865,11 @@ def n_chain(state: PipelineState) -> dict:
     # 채택 피처 lambda 영속화 — 안 하면 다음 run 의 dynamic_candidates 덮어쓰기로
     # lambda 유실 → feature_engineer KeyError (initial_extra 계산 불가).
     commit_files = [steps.FE_STATE_FILE]
-    if _persist_adopted(state["r"].get("newly_adopted", [])):
+    newly = state["r"].get("newly_adopted", [])
+    if _persist_adopted(newly):
         commit_files.append(ADOPTED_FEATS_PATH)
+    if _persist_adopted_cpp(newly):   # C++ 표현식 영속화 → patch_plugin 자동 생성
+        commit_files.append(ADOPTED_CPP_PATH)
     git.commit_results(commit_files,
                        f"chore(fe): {state['branch']} fe_state 갱신 ({len(full_extra)}피처)",
                        branch=state["branch"])

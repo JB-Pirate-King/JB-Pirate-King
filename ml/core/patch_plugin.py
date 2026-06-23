@@ -317,7 +317,35 @@ def patch_file(path: str, begin: str, end: str, new_content: str, dry_run: bool,
         print(f"  ✓  {label}")
 
 
+def _merge_adopted_cpp(root: str):
+    """ml/config/adopted_features_cpp.py 의 ADOPTED_CPP 를 EXTRA_FEAT_CPP 에 병합.
+    orchestrator 가 채택 시 기록한 동적 피처 C++ 표현식을 읽어, 수기 등록 없이도
+    C++ 자동 생성. (수기 EXTRA_FEAT_CPP 정의가 있으면 그쪽 우선)"""
+    p = Path(root) / "ml" / "config" / "adopted_features_cpp.py"
+    if not p.exists():
+        return
+    try:
+        ns: dict = {}
+        exec(p.read_text(encoding="utf-8"), ns)
+        merged = []
+        for name, val in ns.get("ADOPTED_CPP", {}).items():
+            if name in EXTRA_FEAT_CPP:
+                continue   # 수기 정의 우선
+            desc, expr = (val[0], val[1]) if isinstance(val, (list, tuple)) else ("", str(val))
+            EXTRA_FEAT_CPP[name] = (
+                desc or name,
+                f"        float {name} = ({expr});",
+                f"float {name}",
+            )
+            merged.append(name)
+        if merged:
+            print(f"[patch_plugin] adopted_features_cpp 병합: {merged}")
+    except Exception as e:
+        print(f"[patch_plugin] adopted_features_cpp 로드 실패(무시): {e}", file=sys.stderr)
+
+
 def run(scaler_path: str, dry_run: bool, root: str = ".", strict: bool = False):
+    _merge_adopted_cpp(root)   # 동적 채택 피처 C++ 병합 (수기 미등록분 자동 생성)
     # 피처 목록 로드
     with open(scaler_path, encoding="utf-8") as f:
         data = json.load(f)
