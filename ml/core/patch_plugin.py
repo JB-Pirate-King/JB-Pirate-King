@@ -317,7 +317,7 @@ def patch_file(path: str, begin: str, end: str, new_content: str, dry_run: bool,
         print(f"  ✓  {label}")
 
 
-def run(scaler_path: str, dry_run: bool, root: str = "."):
+def run(scaler_path: str, dry_run: bool, root: str = ".", strict: bool = False):
     # 피처 목록 로드
     with open(scaler_path, encoding="utf-8") as f:
         data = json.load(f)
@@ -329,6 +329,21 @@ def run(scaler_path: str, dry_run: bool, root: str = "."):
         print(f"  추가 피처: {extra}")
     else:
         print("  추가 피처 없음 — 베이스 12개 원복")
+
+    # ── 미등록 피처 검사: EXTRA_FEAT_CPP 에 C++ 정의가 없으면 입력이 0 으로
+    #    채워져 추론이 망가진다(조용한 손상). 시끄럽게 경고하고, strict 면 중단. ──
+    unknown = [f for f in extra if f not in EXTRA_FEAT_CPP]
+    if unknown:
+        msg = (
+            f"미등록 피처 {unknown} — EXTRA_FEAT_CPP 에 C++ 정의 없음.\n"
+            "  → 플러그인이 해당 입력을 0 으로 채워 추론이 망가짐(배포 불가).\n"
+            "  → ml/core/patch_plugin.py 의 EXTRA_FEAT_CPP 에 (desc, C++계산식, param_decl) 추가 필요."
+        )
+        if strict:
+            raise ValueError("[patch_plugin] " + msg)
+        print("\n" + "!"*64, file=sys.stderr)
+        print("⚠️  [patch_plugin] " + msg, file=sys.stderr)
+        print("!"*64 + "\n", file=sys.stderr)
 
     h_path   = str(Path(root) / "ais_ids_pi/include/ais_ml.h")
     cpp_path = str(Path(root) / "ais_ids_pi/src/ais_ml.cpp")
@@ -357,10 +372,12 @@ def main():
                     help="파일을 수정하지 않고 변경 내용만 출력")
     ap.add_argument("--root", default=".",
                     help="레포 루트 경로 (기본: 현재 디렉터리)")
+    ap.add_argument("--strict", action="store_true",
+                    help="미등록 피처(EXTRA_FEAT_CPP 부재)가 있으면 패치하지 않고 중단")
     args = ap.parse_args()
 
     try:
-        run(args.scaler, args.dry_run, args.root)
+        run(args.scaler, args.dry_run, args.root, args.strict)
     except Exception as e:
         print(f"[patch_plugin] 오류: {e}", file=sys.stderr)
         sys.exit(1)

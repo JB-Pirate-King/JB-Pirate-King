@@ -623,6 +623,27 @@ python ml/core/patch_plugin.py --scaler D:/ais_models/dcdetect/scaler_dcdetect.j
 - `ais_ml.cpp`: `[AUTO:push_impl]`
 - `ais_ids.cpp`: `[AUTO:extra_feats]`, `[AUTO:push_calls]`
 
+**Dynamic-feature C++ codegen (`EXTRA_FEAT_CPP`)**: `patch_plugin.py` translates each extra
+feature to C++ via the static `EXTRA_FEAT_CPP` dict (name → desc, compute code, param decl).
+A dynamically-invented FE feature that is **not** in this dict → previously emitted
+`// [UNKNOWN FEATURE]` and the plugin **silently zero-filled** that input → broken inference.
+Now `--strict` (used by `stage_build_plugin` and `local-build-package.sh`) **aborts** the
+patch/build when any feature is unregistered, so a broken plugin is never built/released.
+**When a new feature is adopted, add its C++ to `EXTRA_FEAT_CPP`** (the 4 dcdetect_004
+features — anchor_motion / kinematic_speed_gap / heading_micro_jitter /
+status_expected_speed_dev — are already registered).
+
+**Tarball is import-ready (`package-postprocess.sh`)**: CPack TGZ omits two things OpenCPN
+needs. `ais_ids_pi/package-postprocess.sh` (called by both `local-build-package.sh` and
+`ml/build_plugin_wsl.sh`) fixes them after `make package`:
+- injects `metadata.xml` at the tarball root → else OpenCPN **Import Plugin** fails with
+  "Error extracting metadata from tarball";
+- restores the onnxruntime soname symlink chain (`.so → .so.MAJOR → .so.X.Y.Z`) → else
+  `dlopen` fails with "libonnxruntime.so.1: cannot open shared object file".
+`local-build-package.sh` also re-patches C++ from `data/scaler.json` (strict) right before
+building, so the bundled model and the C++ feature set always match. Install = download the
+one `*.tar.gz`, OpenCPN → Plugins → **Import Plugin**, restart.
+
 ---
 
 ## Plugin Build & Deploy (native Linux ONLY)

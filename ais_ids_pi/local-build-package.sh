@@ -2,6 +2,15 @@ export OCPN_TARGET=noble
 export BUILD_GTK3=true
 export WX_VER=32
 export LOCAL_DEPLOY=true
+
+# 빌드 전 C++ 를 배포 scaler(data/scaler.json) 피처에 맞춰 재패치.
+# 미등록 피처가 있으면(--strict) 여기서 중단 → 입력 0 채움으로 망가진
+# 플러그인이 빌드/릴리즈되는 것을 원천 차단. (C++-모델 불일치도 동시 해소)
+if [ -f data/scaler.json ]; then
+    python3 ../ml/core/patch_plugin.py --root .. --scaler data/scaler.json --strict \
+        || { echo "❌ patch_plugin 실패(미등록 피처?) — 빌드 중단" >&2; exit 1; }
+fi
+
 # this removes old xml files from the build directory
 rm *.xml
 rm -rf build

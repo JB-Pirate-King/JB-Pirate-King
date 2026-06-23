@@ -33,6 +33,25 @@ from ml.core.constants import BASE_FEATURES   # 단일 출처 (ml/core/constants
 # claude_analyze 가 이 값으로 --resume 해서 판정/추천/지식주입과 같은 세션에 누적된다.
 _CLAUDE_SID = None
 
+
+def claude_exe() -> str:
+    """claude CLI 실행 파일 경로 resolve.
+
+    백그라운드 런(run_in_background)의 셸 PATH 에 `~/.local/bin` 이 빠져
+    bare "claude" 가 FileNotFoundError → 모든 judge/recommend 가 조용히
+    fallback(채택 0 수렴)하는 사고를 막는다. shutil.which 우선,
+    실패 시 Windows/Unix 표준 설치 경로를 직접 확인, 그래도 없으면 "claude".
+    """
+    found = shutil.which("claude")
+    if found:
+        return found
+    home = Path.home()
+    for cand in (home / ".local" / "bin" / "claude.exe",
+                 home / ".local" / "bin" / "claude"):
+        if cand.exists():
+            return str(cand)
+    return "claude"
+
 # feature_engineer.py 의 INITIAL_EXTRA 와 동기화
 FE_INITIAL_EXTRA = ["accel", "heading_rate", "vec_sog_diff", "heading_change"]
 
@@ -220,7 +239,7 @@ def claude_analyze(stage: str, out: str, success: bool, elapsed: float,
         )
         timeout = 120
 
-    cmd = ["claude", "-p", prompt, "--output-format", "text"]
+    cmd = [claude_exe(), "-p", prompt, "--output-format", "text"]
     if model:
         cmd += ["--model", model]
     if _CLAUDE_SID:
@@ -370,10 +389,11 @@ def stage_build_plugin(bot, args, scaler_path: str) -> list[str]:
         sys.executable, "ml/core/patch_plugin.py",
         "--scaler", scaler_path,
         "--root", ".",
+        "--strict",   # 미등록 피처(EXTRA_FEAT_CPP 부재)면 패치 중단 → 0채움 깨진 플러그인 방지
     ])
     if ret != 0:
         bot.log(
-            f"❌ patch_plugin 실패 (플러그인 빌드 생략)\n{out[-300:]}",
+            f"❌ patch_plugin 실패 (미등록 피처? 플러그인 빌드 생략)\n{out[-300:]}",
             "플러그인빌드",
         )
         return []
