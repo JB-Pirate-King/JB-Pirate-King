@@ -11,6 +11,15 @@ cd build
 cmake -DCMAKE_BUILD_TYPE=Debug ..
 make -j$(($(nproc) / 2))
 make package
+
+# tar.gz 보정: metadata.xml 주입 + onnxruntime soname 링크 복원
+# (OpenCPN Import + dlopen 이 그대로 동작하도록)
+PKG_TARBALL=$(ls *.tar.gz 2>/dev/null | sort -V | tail -1)
+PKG_META=$(ls *.xml 2>/dev/null | sort -V | tail -1)
+if [[ -n "$PKG_TARBALL" ]]; then
+    bash ../package-postprocess.sh "$PKG_TARBALL" "$PKG_META"
+fi
+
 chmod a+x cloudsmith-upload.sh
 ./cloudsmith-upload.sh
 

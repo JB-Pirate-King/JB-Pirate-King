@@ -75,6 +75,11 @@ if [[ -z "$TARBALL" ]]; then
     exit 1
 fi
 
+# tar.gz 보정: metadata.xml 주입 + onnxruntime soname 링크 복원
+# (OpenCPN Import + dlopen 이 그대로 동작하도록)
+META_XML=$(ls "$BUILD_DIR"/*.xml 2>/dev/null | sort -V | tail -1)
+bash "$BUILD_SRC/package-postprocess.sh" "$TARBALL" "$META_XML"
+
 TARBALL_NAME=$(basename "$TARBALL")
 cp "$TARBALL" "$DIST_DIR/$TARBALL_NAME"
 echo "[WSL Build] 완료: $DIST_DIR/$TARBALL_NAME"
