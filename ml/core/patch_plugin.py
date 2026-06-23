@@ -143,6 +143,33 @@ EXTRA_FEAT_CPP: dict = {
         "        float status_motion_flag = ((int)cur.navStatus == 0 && cur.sog < 0.5f) ? 1.0f : 0.0f;",
         "float status_motion_flag",
     ),
+    # ── dcdetect_004 채택 피처 (WSL 빌드 검증 완료) ──────────────────
+    "anchor_motion": (
+        "정박/계류(status 1,5)인데 이동거리 큼 — 정박이동·status 위장 포착",
+        "        float anchor_motion = (cur.navStatus == 1 || cur.navStatus == 5) ? dist_km : 0.0f;",
+        "float anchor_motion",
+    ),
+    "kinematic_speed_gap": (
+        "거리/시간 실제속도와 보고 sog 괴리 — 위치 못 맞추는 sog 조작 포착",
+        "        float kinematic_speed_gap = std::abs(dist_km / std::max(dt, 1e-6f) - (float)cur.sog);",
+        "float kinematic_speed_gap",
+    ),
+    "heading_micro_jitter": (
+        "sog_change 작은데 heading 미세 변동 — 정상모방 속 기수 떨림 노출",
+        "        float heading_micro_jitter = std::abs((float)cur.hdg - (float)prev.hdg) / (1.0f + std::abs(sog_change));",
+        "float heading_micro_jitter",
+    ),
+    "status_expected_speed_dev": (
+        "status 함의 기대속도(정박/계류 1,5,6→0, 그 외→약5kn)와 sog 편차 — dense 신호",
+        """\
+        float status_expected_speed_dev;
+        {
+            int _st = (int)cur.navStatus;
+            float _exp = (_st == 1 || _st == 5 || _st == 6) ? 0.0f : 5.0f;
+            status_expected_speed_dev = std::abs((float)cur.sog - _exp);
+        }""",
+        "float status_expected_speed_dev",
+    ),
 }
 
 
