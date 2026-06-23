@@ -245,6 +245,8 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
 
     // ── 규칙 기반: 단일 메시지 내부 모순 검사 ────────────────
     // (이전 기록 없어도 탐지 가능)
+    // [dcdetect_004] 규칙기반 탐지 비활성화 — ML 단독 운용. 되살리려면 #if 0 → #if 1.
+#if 0
 
     // 1. 선종별 최대 속도 초과 (N/A 값 102.3kn 제외)
     if (latest.sog < 102.2) {
@@ -335,6 +337,7 @@ wxString ais_ids::detect_anomaly_ais(int mmsi)
                 "[규칙] SOG=0 실제이동 (MMSI: %d) (SOG: %.2f kn, 이동: %.3f km)",
                 mmsi, latest.sog, dist_km);
     }
+#endif  // 규칙기반 탐지 비활성화 끝
 
     // ── 8a. ML 조기 탐지 (seq5) ────────────────────────────────────
     // seq10이 쌓이기 전 seq5 모델로 먼저 판단
