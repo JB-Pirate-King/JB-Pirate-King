@@ -21,6 +21,9 @@ python ml/automation/bootstrap.py --distribute
 # 출력된 지시에 따라 Sheets/Drive/Notion MCP 작업 수행
 ```
 
+**2. 문서 컨텍스트 (MANDATORY):** 새 세션은 사용자 요청을 처리하기 전에 **반드시 `read-docs`
+스킬을 실행**해 전체 프로젝트 문서 컨텍스트를 확보한다. 요청의 경중과 무관하게 매 세션 1회 실행한다.
+
 **세션 중 자주 참조:**
 - 상태 파일: `D:\ais_output\ens24_v2\state.json`
 - 인수인계: `C:\ObsidianVault\운영\실험\ens24_run_2026-06-04.md`

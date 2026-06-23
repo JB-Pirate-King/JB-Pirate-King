@@ -335,6 +335,40 @@ class PipelineSheets:
             notes
         ])
 
+    def export_branch_csv(self, model: str, branch: str, out_dir) -> list:
+        """4개 고정 탭(실행요약/상세로그/시나리오결과/피처중요도)에서 해당 branch 행만
+        뽑아 CSV 로 저장 — 릴리즈 에셋용. 저장된 파일 경로 리스트 반환(데이터 없는 탭은 건너뜀)."""
+        import csv
+        from pathlib import Path
+        # gh release asset 은 한글 파일명에서 업로드 URL 이 깨짐(404) → 영문 슬러그 사용.
+        en = {"실행요약": "summary", "상세로그": "detail",
+              "시나리오결과": "scenario", "피처중요도": "importance"}
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for base in FIXED_TABS:
+            title = f"{model}_{base}"
+            try:
+                ws = self.master.worksheet(title)
+            except gspread.WorksheetNotFound:
+                continue
+            rows = ws.get_all_values()
+            if not rows:
+                continue
+            header = rows[0]
+            bi = header.index("branch") if "branch" in header else None
+            kept = [header] + [
+                r for r in rows[1:]
+                if bi is not None and len(r) > bi and r[bi] == branch
+            ]
+            if len(kept) <= 1:        # 헤더만 — 이 브랜치 데이터 없음
+                continue
+            p = out / f"sheet_{en.get(base, base)}_{branch}.csv"
+            with open(p, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerows(kept)
+            paths.append(str(p))
+        return paths
+
 
 def from_config(config_path: str = "ml/config/pipeline_config.json") -> "PipelineSheets":
     with open(config_path, encoding="utf-8") as f:

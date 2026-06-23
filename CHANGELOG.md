@@ -1,5 +1,32 @@
 # Changelog
 
+# 변경 보고서 — 2026-06-18
+
+> 세션 시작 시 `/read-docs` 자동실행 추가 + 비지도 모델 4종 FE sweep (dcdetect 최고 FP=1% 87.2%).
+> 범위: 미커밋 워킹트리(CLAUDE.md) + 실험 sweep · develop 신규 커밋 0 · 머지 PR 0 (#67 이후)
+
+## 요약
+직전 보고(prime 노드 분리, `e3c719b`) 이후 develop 코드 변경은 없고 운영 측 작업이 주를 이뤘다. 새 세션이 항상 프로젝트 문서를 먼저 파악하도록 CLAUDE.md 세션 시작 프로토콜에 `/read-docs` 무조건 실행을 박았다. 정리된 파이프라인으로 비지도 이상탐지 모델 4종(dcdetect/conv1d/lstm/tcn)에 동일 조건 자동 피처탐색을 순차 실행해 검출 성능을 비교했고(tcn 진행 중), 실험 산출물이 상위 저장소에 자동 push되도록 upstream 리모트 연동을 복구했다.
+
+## 코드 변경
+- **docs/config**: `CLAUDE.md` — 세션 시작 시 `/read-docs` 무조건 호출을 프로토콜로 추가(`## 🔁 세션 시작 프로토콜` + `### Skill-driven workflow` 2곳). read-docs 는 병렬 fan-out 스킬이라 SessionStart hook 으로 invoke 불가 → CLAUDE.md 지시 방식 채택. 비용 경고·경량화 여지 주석 포함 (미커밋).
+
+## 릴리즈 (org, prerelease)
+- `run/dcdetect_001`~`run/dcdetect_004` — FE 채택 체이닝, 모델 3파일(onnx/scaler/threshold) 첨부.
+- `run/lstm_001` — lstm iter001.
+- upstream 미설정으로 직전에 실패하던 릴리즈가, 리모트 연동 복구 후 런이 브랜치+릴리즈를 org 에 자동 생성하도록 정상화됨.
+
+## 지표 (FE sweep, 3년 균형 데이터, epochs 10, FP=1% 기준)
+- dcdetect (대조학습): 66.1% → **87.2%** (피처 4개 자동 채택, 총 16개) ← 최고
+- conv1d (합성곱 오토인코더): **82.2%** (채택 0, 기본 12피처로 이미 강함)
+- lstm (순환 오토인코더): 26.9% → 27.6% (채택 1, 13개 — 이 데이터·설정에서 부진)
+- tcn (팽창 합성곱): 진행 중
+
+## 영향 문서 / 후속
+- [ ] CLAUDE.md read-docs 자동화 — tcn sweep 종료 후 커밋 필요
+- [ ] tcn sweep 완료 후 4모델 확정 비교표
+- [ ] FP=1% 검출 천장 — 입력 피처 포화 관측, 채널별 가중 손실 / status별 서브임계값 검토
+
 # 변경 보고서 — 2026-06-17
 
 > 오케스트레이터 judge 비용/수렴 개편(브랜치당 LLM 7→3) + Claude Code 스킬 3종 신규/확장.
