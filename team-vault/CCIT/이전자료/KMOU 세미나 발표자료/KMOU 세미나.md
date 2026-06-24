@@ -1,6 +1,6 @@
 ---
 source_file: KMOU 세미나.pdf
-last_synced: 2026-06-23 10:04
+last_synced: 2026-06-24 01:05
 tags: [notion-sync, attachment]
 ---
 

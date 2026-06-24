@@ -1,6 +1,6 @@
 ---
 source_file: _Writing_WISA_2025_Poster_Design_and_Analysis_of_Dynamic_Flooding_Attack_Scenarios_Based_on_the_NMEA_Protocol.pdf
-last_synced: 2026-06-23 10:05
+last_synced: 2026-06-24 01:05
 tags: [notion-sync, attachment]
 ---
 
