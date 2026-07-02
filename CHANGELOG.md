@@ -1,5 +1,56 @@
 # Changelog
 
+# 변경 보고서 — 2026-06-23
+
+> 다중 모델 FE sweep 완료(tcn 3iter·lstm 2iter·conv1d 베이스라인) + 릴리즈 관측성 전면 강화(FP/시나리오/중요도 표·로그·CSV 에셋).
+> Scope: `e247807..d7b3524` · 9 commits · 1 merged PR (#68) · 7 new prerelease tags
+
+## Summary
+
+Since the 2026-06-18 report, three lines of work landed in parallel. Release observability was significantly improved: GitHub release notes now include full FP=1/5/10% detection tables, per-scenario detection rates with weakness flags, and permutation-importance rankings; run logs and per-branch Google Sheets CSVs are automatically attached as release assets. Two bugs in the FE pipeline were fixed: a `KeyError` crash in adopted-feature persistence that took down `tcn_002` was hardened at three defence points, and zero-adoption convergence now correctly exports the baseline model (enabling the `conv1d_001` release). The multi-model FE sweep completed: tcn converged at 3 iterations (FP=1% 66.0%, +47.1pp), lstm at 2 iterations (FP=1% 38.7%, +11.8pp), conv1d exported a strong 12-feature baseline (FP=1% 84.0%), and dcdetect advanced to iter004 (FP=1% 83.2%, 16 features).
+
+## Code changes
+
+- **pipeline_steps**: `_release_notes()` now reads `feat_eng_iter{NN}.json` and builds a full markdown table (FP=1/5/10%, baseline→final ±pp, threshold, per-scenario ⚠️ <50%, permutation-importance); was a single FP≈1% line (`ml/pipeline_steps.py:_release_notes`, `332d33f`).
+- **pipeline_steps**: `stage_release` now attaches run logs + per-branch Google Sheets CSVs as release assets via `gh release upload --clobber`; core model files go inline on `release create` so a failed extra-asset upload cannot sink the whole release (`ml/pipeline_steps.py:stage_release`, `332d33f`).
+- **sheets**: Added `export_branch_csv(model, branch, out_dir)` — exports 4 fixed tabs filtered to one branch's rows as CSV with English file slugs (Korean filenames caused 404 on `gh` asset upload) (`ml/integrations/sheets.py`, `332d33f`).
+- **orchestrator**: Run-level log filenames now carry model name; `n_prime` seeds the branch session with the previous same-model run's `nodeio` tail to avoid repeating dead-ends (`ml/orchestrator.py`, `332d33f`).
+- **feature_engineer**: On zero-adoption convergence with `--export_dir` set, the baseline model is now retrained and exported instead of skipping — unblocked `conv1d_001` release (`ml/core/feature_engineer.py`, `b751686`).
+- **feature_engineer / orchestrator**: Hardened adopted-feature persistence chain at three points to prevent `KeyError` crash; root cause was `tcn_001` adopted feature failing to persist → `tcn_002` crashed (`ml/orchestrator.py`, `ml/core/feature_engineer.py`, `72f892f`).
+- **plugin (ais_ids_pi)**: Auto-patched to 16-feature set for dcdetect iter004; model files updated in `ais_ids_pi/data/` (`e106de2`).
+- **docs/config**: `ml/config/fe_state.json` updated to 4 adopted features; README Run Results table updated with dcdetect_004 results (`0ef3d48`, `9503731`).
+
+## Merged PRs
+
+- #68 feat(release): 릴리즈 노트 상세화(FP1/5/10·시나리오·중요도) + 로그·시트 에셋, 세션 read-docs — enriches release artifacts and fixes zero-adoption export + TCN chain crash.
+
+## Releases
+
+- `run/dcdetect_004` (2026-06-22, prerelease) — dcdetect 16 features; FP=1% **83.2%** / FP=5% 92.0% / FP=10% 93.9%; prebuilt plugin tar.gz included.
+- `run/conv1d_001` (2026-06-21, prerelease) — conv1d 12 base features; FP=1% **84.0%** (zero-adoption convergence; standalone export via new fallback path).
+- `run/tcn_003` (2026-06-20, prerelease) — TCN 15 features; FP=1% **66.0%** / FP=5% 81.9%; adopted `cog_change_reversal`.
+- `run/tcn_002` (2026-06-20, prerelease) — TCN 14 features; FP=1% 57.1%; adopted `speed_consistency_min`.
+- `run/tcn_001` (2026-06-20, prerelease) — TCN 13 features; FP=1% 46.1%; adopted `dt_irregularity` (+27.2pp).
+- `run/lstm_002` (2026-06-19, prerelease) — LSTM 14 features; FP=1% 38.7%; adopted `pos_sog_ratio`.
+
+## Metrics
+
+| Model | Features | FP=1% | FP=5% | FP=10% |
+|---|---|---|---|---|
+| dcdetect | 16 | 83.2% | 92.0% | 93.9% |
+| conv1d | 12 | 84.0% | 93.9% | 97.5% |
+| tcn | 15 | 66.0% | 81.9% | 86.2% |
+| lstm | 14 | 38.7% | 77.3% | 87.5% |
+
+Persistent weak scenarios (FP=1% < 20% across all models): FN4-status, D1-LowSlow.
+
+## Affected docs / follow-ups
+
+- [ ] Run `/sync-docs` — 4-model sweep final comparison table not yet in living docs.
+- [ ] FN4-status / D1-LowSlow — persistent weak coverage across all 4 models; consider status-aware loss weighting or sub-threshold tuning.
+
+---
+
 # 변경 보고서 — 2026-06-18
 
 > 세션 시작 시 `/read-docs` 자동실행 추가 + 비지도 모델 4종 FE sweep (dcdetect 최고 FP=1% 87.2%).
